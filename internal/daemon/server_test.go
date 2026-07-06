@@ -142,6 +142,72 @@ func TestPeerGroupsIncludesSupplementaryGroups(t *testing.T) {
 	}
 }
 
+func TestCleanupFinishedBareLeaseReleasesDeadProcess(t *testing.T) {
+	server := testServer(t)
+	cgroupPath := filepath.Join(server.Cfg.CgroupRoot, "lease_done")
+	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	lease := model.Lease{
+		ID:         "lease_done",
+		GPU:        2,
+		Mode:       model.ModeBare,
+		Holder:     "alice",
+		RootPID:    12345,
+		CgroupPath: cgroupPath,
+		CreatedAt:  time.Now().Add(-time.Minute),
+		ExpiresAt:  time.Now().Add(time.Hour),
+		Active:     true,
+	}
+	if err := server.Store.AddLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	server.cleanupFinishedBareLeases()
+	status, err := server.Store.Status(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Leases) != 0 {
+		t.Fatalf("expected finished lease to be released, got %+v", status.Leases)
+	}
+}
+
+func TestCleanupFinishedBareLeaseKeepsNonEmptyCgroup(t *testing.T) {
+	server := testServer(t)
+	cgroupPath := filepath.Join(server.Cfg.CgroupRoot, "lease_child")
+	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte("99999\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	lease := model.Lease{
+		ID:         "lease_child",
+		GPU:        2,
+		Mode:       model.ModeBare,
+		Holder:     "alice",
+		RootPID:    12345,
+		CgroupPath: cgroupPath,
+		CreatedAt:  time.Now().Add(-time.Minute),
+		ExpiresAt:  time.Now().Add(time.Hour),
+		Active:     true,
+	}
+	if err := server.Store.AddLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	server.cleanupFinishedBareLeases()
+	status, err := server.Store.Status(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Leases) != 1 {
+		t.Fatalf("expected non-empty cgroup lease to stay active, got %+v", status.Leases)
+	}
+}
+
 func testServer(t *testing.T) *Server {
 	t.Helper()
 	dir := t.TempDir()

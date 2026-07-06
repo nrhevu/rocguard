@@ -460,6 +460,7 @@ func (s *Server) monitor(ctx context.Context) {
 
 func (s *Server) monitorOnce(ctx context.Context) {
 	s.cleanupExpiredLeases()
+	s.cleanupFinishedBareLeases()
 	state, err := s.Store.Snapshot()
 	if err != nil {
 		return
@@ -470,6 +471,37 @@ func (s *Server) monitorOnce(ctx context.Context) {
 		return
 	}
 	_, _ = s.authorizer().Enforce(ctx, state, processes)
+}
+
+func (s *Server) cleanupFinishedBareLeases() {
+	state, err := s.Store.Snapshot()
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, lease := range state.Leases {
+		if !lease.Active || lease.Mode != model.ModeBare || lease.RootPID <= 0 {
+			continue
+		}
+		if s.Proc != nil && s.Proc.Exists(lease.RootPID) {
+			continue
+		}
+		if lease.CgroupPath != "" && !cgroupEmpty(lease.CgroupPath) {
+			continue
+		}
+		_ = s.Store.ReleaseLease(lease.ID)
+		if lease.CgroupPath != "" {
+			_ = os.Remove(lease.CgroupPath)
+		}
+		_ = s.Store.AppendAudit(model.AuditEvent{
+			Time:    now.UTC(),
+			Kind:    "lease_released",
+			Message: "bare lease released after process exit",
+			GPU:     lease.GPU,
+			LeaseID: lease.ID,
+			User:    lease.Holder,
+		})
+	}
 }
 
 func (s *Server) cleanupExpiredLeases() {
@@ -520,6 +552,17 @@ func (s *Server) createCgroup(leaseID string) (string, string, error) {
 
 func (s *Server) movePIDToCgroup(cgroupPath string, pid int) error {
 	return os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0644)
+}
+
+func cgroupEmpty(cgroupPath string) bool {
+	data, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.procs"))
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(data)) == ""
 }
 
 func streamCopy(wg *sync.WaitGroup, mu *sync.Mutex, writer io.Writer, reqID, kind string, reader io.Reader) {
