@@ -28,7 +28,7 @@ type RegisterArgs struct {
 	RootKey string `json:"root_key"`
 	Mode    string `json:"mode"`
 	Name    string `json:"name"`
-	GPU     int    `json:"gpu,omitempty"`
+	GPUs    []int  `json:"gpus,omitempty"`
 	TTL     string `json:"ttl"`
 }
 

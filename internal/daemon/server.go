@@ -137,14 +137,25 @@ func (s *Server) dispatch(ctx context.Context, p peer, req protocol.Request) (an
 		}
 		switch store.NormalizeTokenMode(args.Mode) {
 		case model.TokenModeReserved:
-			if err := s.ensureGPUCanReserve(ctx, args.GPU); err != nil {
+			if err := validateGPUs(args.GPUs); err != nil {
 				return nil, err
 			}
-			secret, token, reservation, err := s.Store.RegisterHardReservation(args.RootKey, args.Name, args.GPU, args.TTL, now)
+			for _, gpu := range args.GPUs {
+				if err := s.ensureGPUCanReserve(ctx, gpu); err != nil {
+					return nil, err
+				}
+			}
+			secret, token, reservations, err := s.Store.RegisterHardReservations(args.RootKey, args.Name, args.GPUs, args.TTL, now)
 			if err != nil {
 				return nil, err
 			}
-			return model.RegisterResult{Token: secret, Mode: token.Mode, ReservationID: reservation.ID, GPU: reservation.GPU, ExpiresAt: timePtrIfSet(token.ExpiresAt)}, nil
+			ids := make([]string, 0, len(reservations))
+			gpus := make([]int, 0, len(reservations))
+			for _, reservation := range reservations {
+				ids = append(ids, reservation.ID)
+				gpus = append(gpus, reservation.GPU)
+			}
+			return model.RegisterResult{Token: secret, Mode: token.Mode, ReservationIDs: ids, GPUs: gpus, ExpiresAt: timePtrIfSet(token.ExpiresAt)}, nil
 		case model.TokenModeClaimed:
 			secret, token, err := s.Store.RegisterSoftToken(args.RootKey, args.Name, now)
 			if err != nil {
@@ -561,6 +572,23 @@ func (s *Server) ps(ctx context.Context, now time.Time) ([]model.PSRow, error) {
 		return rows[i].ID < rows[j].ID
 	})
 	return rows, nil
+}
+
+func validateGPUs(gpus []int) error {
+	if len(gpus) == 0 {
+		return errors.New("at least one gpu is required")
+	}
+	seen := map[int]bool{}
+	for _, gpu := range gpus {
+		if gpu < 0 {
+			return errors.New("gpu must be >= 0")
+		}
+		if seen[gpu] {
+			return fmt.Errorf("duplicate gpu %d", gpu)
+		}
+		seen[gpu] = true
+	}
+	return nil
 }
 
 func lookupUID(username string) (int, error) {

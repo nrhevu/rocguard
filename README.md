@@ -7,6 +7,9 @@ root-authorized reserved or claimed-mode keys.
 The enforcement model is intentionally simple:
 
 - `rocguardd` monitors AMD GPU process ownership with `amd-smi process --json`.
+- Rocguard only treats a PID as active GPU usage when AMD SMI reports non-zero
+  GPU memory for that PID. Parent launcher processes that do not hold GPU memory
+  are ignored and are not killed.
 - `reserved` registration reserves a GPU before use. While the reservation is
   active, non-bypassed processes on that GPU must match an authorization for
   the reservation token.
@@ -63,7 +66,7 @@ Root key:
 Name:
 ```
 
-Or reserve a GPU with a reserved key:
+Or reserve one or more GPUs with a reserved key:
 
 ```bash
 ./rocguard register --reserved
@@ -74,9 +77,12 @@ Reserved registration prompts for:
 ```text
 Root key:
 Name:
-GPU:
+GPUs:
 TTL [2h]:
 ```
+
+Use a comma-separated list such as `0,1` to reserve more than one GPU with the
+same token and TTL.
 
 Reserved TTL is capped at 8 hours.
 Only `--reserved` and `--claimed` are valid registration modes.
@@ -252,7 +258,8 @@ The integration runner:
 - auto-bypasses pre-existing AMD SMI PIDs on the selected GPUs;
 - uses small allocations and sleeps between compute iterations;
 - tests multi-GPU `hold_gpu.py`;
-- tests child GPU processes staying authorized inside the Rocguard cgroup.
+- tests child GPU processes with `hold_gpu.py --children` staying authorized
+  inside the Rocguard cgroup.
 
 Optional Docker test, using a ROCm/PyTorch image that already has Python and
 Torch:

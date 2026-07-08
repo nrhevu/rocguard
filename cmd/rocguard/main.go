@@ -131,19 +131,19 @@ func register(cfg config.Config, args []string) error {
 	registerArgs := protocol.RegisterArgs{RootKey: rootKey, Name: name}
 	if mode == model.TokenModeReserved {
 		registerArgs.Mode = model.TokenModeReserved
-		gpuText, err := prompt(reader, "GPU: ")
+		gpuText, err := prompt(reader, "GPUs: ")
 		if err != nil {
 			return err
 		}
-		gpu, err := strconv.Atoi(strings.TrimSpace(gpuText))
-		if err != nil || gpu < 0 {
-			return errors.New("gpu must be >= 0")
+		gpus, err := parseGPUList(gpuText)
+		if err != nil {
+			return err
 		}
 		ttl, err := prompt(reader, "TTL [2h]: ")
 		if err != nil {
 			return err
 		}
-		registerArgs.GPU = gpu
+		registerArgs.GPUs = gpus
 		registerArgs.TTL = ttl
 	} else {
 		registerArgs.Mode = model.TokenModeClaimed
@@ -157,13 +157,46 @@ func register(cfg config.Config, args []string) error {
 		return err
 	}
 	fmt.Printf("Token: %s\nMode: %s\n", result.Token, result.Mode)
-	if result.ReservationID != "" {
-		fmt.Printf("Reservation: %s\nGPU: %d\n", result.ReservationID, result.GPU)
+	if len(result.ReservationIDs) > 0 {
+		fmt.Printf("Reservations: %s\nGPUs: %s\n", strings.Join(result.ReservationIDs, ","), formatIntList(result.GPUs))
 	}
 	if result.ExpiresAt != nil {
 		fmt.Printf("Expires at: %s\n", result.ExpiresAt.Format(time.RFC3339))
 	}
 	return nil
+}
+
+func parseGPUList(value string) ([]int, error) {
+	parts := strings.Split(value, ",")
+	gpus := make([]int, 0, len(parts))
+	seen := map[int]bool{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		gpu, err := strconv.Atoi(part)
+		if err != nil || gpu < 0 {
+			return nil, errors.New("gpu must be >= 0")
+		}
+		if seen[gpu] {
+			return nil, fmt.Errorf("duplicate gpu %d", gpu)
+		}
+		seen[gpu] = true
+		gpus = append(gpus, gpu)
+	}
+	if len(gpus) == 0 {
+		return nil, errors.New("at least one gpu is required")
+	}
+	return gpus, nil
+}
+
+func formatIntList(values []int) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.Itoa(value))
+	}
+	return strings.Join(parts, ",")
 }
 
 func runCommand(cfg config.Config, args []string) error {

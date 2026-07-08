@@ -122,41 +122,54 @@ func (s *Store) RegisterSoftToken(rootKey, name string, now time.Time) (string, 
 	return tokenSecret, token, nil
 }
 
-func (s *Store) RegisterHardReservation(rootKey, name string, gpu int, ttlText string, now time.Time) (string, model.Token, model.Reservation, error) {
+func (s *Store) RegisterHardReservations(rootKey, name string, gpus []int, ttlText string, now time.Time) (string, model.Token, []model.Reservation, error) {
 	ttl, err := ParseTTL(ttlText, DefaultHardTTL, MaxHardTTL)
 	if err != nil {
-		return "", model.Token{}, model.Reservation{}, err
+		return "", model.Token{}, nil, err
 	}
-	if gpu < 0 {
-		return "", model.Token{}, model.Reservation{}, fmt.Errorf("gpu must be >= 0")
+	if len(gpus) == 0 {
+		return "", model.Token{}, nil, fmt.Errorf("at least one gpu is required")
+	}
+	seen := map[int]bool{}
+	for _, gpu := range gpus {
+		if gpu < 0 {
+			return "", model.Token{}, nil, fmt.Errorf("gpu must be >= 0")
+		}
+		if seen[gpu] {
+			return "", model.Token{}, nil, fmt.Errorf("duplicate gpu %d", gpu)
+		}
+		seen[gpu] = true
 	}
 	if ok, err := s.ValidateRootKey(rootKey); err != nil {
-		return "", model.Token{}, model.Reservation{}, err
+		return "", model.Token{}, nil, err
 	} else if !ok {
-		return "", model.Token{}, model.Reservation{}, ErrInvalidRootKey
+		return "", model.Token{}, nil, ErrInvalidRootKey
 	}
 	expiresAt := now.UTC().Add(ttl)
 	tokenSecret, token := newToken(model.TokenModeReserved, name, expiresAt, now)
-	reservation := model.Reservation{
-		ID:        NewReservationID(),
-		GPU:       gpu,
-		TokenHash: token.Hash,
-		Holder:    token.Name,
-		CreatedAt: now.UTC(),
-		ExpiresAt: expiresAt,
-		Active:    true,
+	reservations := make([]model.Reservation, 0, len(gpus))
+	for _, gpu := range gpus {
+		reservations = append(reservations, model.Reservation{
+			ID:        NewReservationID(),
+			GPU:       gpu,
+			TokenHash: token.Hash,
+			Holder:    token.Name,
+			CreatedAt: now.UTC(),
+			ExpiresAt: expiresAt,
+			Active:    true,
+		})
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.loadLocked(); err != nil {
-		return "", model.Token{}, model.Reservation{}, err
+		return "", model.Token{}, nil, err
 	}
 	s.state.Tokens = append(s.state.Tokens, token)
-	s.state.Reservations = append(s.state.Reservations, reservation)
+	s.state.Reservations = append(s.state.Reservations, reservations...)
 	if err := s.saveLocked(); err != nil {
-		return "", model.Token{}, model.Reservation{}, err
+		return "", model.Token{}, nil, err
 	}
-	return tokenSecret, token, reservation, nil
+	return tokenSecret, token, reservations, nil
 }
 
 func (s *Store) RegisterToken(rootKey, name, ttlText string, now time.Time) (string, model.Token, error) {

@@ -75,6 +75,10 @@ func (a Authorizer) Enforce(ctx context.Context, state model.State, processes []
 	var decisions []Decision
 	byGPU := map[int][]processView{}
 	for _, gpuProcess := range processes {
+		if !usesGPUResources(gpuProcess) {
+			decisions = append(decisions, Decision{Process: gpuProcess, Action: "skip", Reason: "no gpu resource usage"})
+			continue
+		}
 		if a.Proc == nil || !a.Proc.Exists(gpuProcess.PID) {
 			decisions = append(decisions, Decision{Process: gpuProcess, Action: "skip", Reason: "stale pid"})
 			continue
@@ -135,6 +139,9 @@ func (a Authorizer) BusyProcessesForGPU(ctx context.Context, state model.State, 
 		if gpuProcess.GPU != gpu {
 			continue
 		}
+		if !usesGPUResources(gpuProcess) {
+			continue
+		}
 		if a.Proc == nil || !a.Proc.Exists(gpuProcess.PID) {
 			continue
 		}
@@ -158,6 +165,9 @@ func (a Authorizer) BusyProcessesForLease(ctx context.Context, state model.State
 	var busy []Decision
 	for _, gpuProcess := range processes {
 		if gpuProcess.GPU != tentative.GPU {
+			continue
+		}
+		if !usesGPUResources(gpuProcess) {
 			continue
 		}
 		if a.Proc == nil || !a.Proc.Exists(gpuProcess.PID) {
@@ -208,6 +218,10 @@ func (a Authorizer) enforceHard(ctx context.Context, state model.State, gpu int,
 		}
 	}
 	return nil
+}
+
+func usesGPUResources(process model.GPUProcess) bool {
+	return process.MemBytes > 0
 }
 
 func (a Authorizer) enforceLegacyLeases(ctx context.Context, state model.State, gpu int, leases []model.Lease, views []processView, decisions *[]Decision, now time.Time) error {

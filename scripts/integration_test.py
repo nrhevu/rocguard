@@ -204,19 +204,12 @@ def test_child_processes(args, root, rocguard, env):
             "run",
             "--",
             sys.executable,
-            str(root / "scripts" / "spawn_gpu_children.py"),
-            "--gpus",
-            str(args.gpu_list[0]),
+            str(root / "scripts" / "hold_gpu.py"),
+        ]
+        + hold_args(args, args.gpu_list[0])
+        + [
             "--children",
             str(args.children),
-            "--mem-mb",
-            str(args.mem_mb),
-            "--duration",
-            str(args.duration),
-            "--matrix",
-            str(args.matrix),
-            "--sleep",
-            str(args.sleep),
         ],
         env=env,
     )

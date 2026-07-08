@@ -67,13 +67,32 @@ func TestHardRegisterTTLMax(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)
-	if _, token, reservation, err := st.RegisterHardReservation(key, "alice", 0, "8h", now); err != nil {
+	if _, token, reservations, err := st.RegisterHardReservations(key, "alice", []int{0}, "8h", now); err != nil {
 		t.Fatalf("8h reserved reservation should be accepted: %v", err)
-	} else if token.Mode != model.TokenModeReserved || reservation.GPU != 0 {
-		t.Fatalf("unexpected reserved token/reservation: token=%+v reservation=%+v", token, reservation)
+	} else if token.Mode != model.TokenModeReserved || len(reservations) != 1 || reservations[0].GPU != 0 {
+		t.Fatalf("unexpected reserved token/reservations: token=%+v reservations=%+v", token, reservations)
 	}
-	if _, _, _, err := st.RegisterHardReservation(key, "bob", 1, "8h1s", now); err == nil {
+	if _, _, _, err := st.RegisterHardReservations(key, "bob", []int{1}, "8h1s", now); err == nil {
 		t.Fatal("expected reserved ttl above 8h to fail")
+	}
+}
+
+func TestHardRegisterMultipleGPUs(t *testing.T) {
+	st := testStore(t)
+	key, err := st.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)
+	_, token, reservations, err := st.RegisterHardReservations(key, "alice", []int{0, 1}, "1h", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.Mode != model.TokenModeReserved || len(reservations) != 2 {
+		t.Fatalf("unexpected reserved token/reservations: token=%+v reservations=%+v", token, reservations)
+	}
+	if reservations[0].GPU != 0 || reservations[1].GPU != 1 || reservations[0].TokenHash != token.Hash || reservations[1].TokenHash != token.Hash {
+		t.Fatalf("unexpected reservations: %+v", reservations)
 	}
 }
 
@@ -103,10 +122,11 @@ func TestRevokeTokenRevokesRelatedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)
-	secret, token, reservation, err := st.RegisterHardReservation(key, "alice", 0, "1h", now)
+	secret, token, reservations, err := st.RegisterHardReservations(key, "alice", []int{0}, "1h", now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	reservation := reservations[0]
 	authorization := model.Authorization{
 		ID:        NewAuthorizationID(),
 		Mode:      model.ModeUser,

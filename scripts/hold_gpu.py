@@ -2,6 +2,7 @@
 import argparse
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -18,6 +19,7 @@ def parse_args():
     parser.add_argument("--duration", type=int, default=0, help="Seconds to run; 0 means forever.")
     parser.add_argument("--matrix", type=int, default=2048, help="Square matrix size for compute loop.")
     parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between compute iterations.")
+    parser.add_argument("--children", type=int, default=0, help="Spawn this many child holder processes; 0 runs in this process.")
     args = parser.parse_args()
     args.gpus = parse_gpus(args.gpu_values)
     if args.mem_mb <= 0:
@@ -26,6 +28,8 @@ def parse_args():
         raise SystemExit("--matrix must be positive")
     if args.sleep < 0:
         raise SystemExit("--sleep must be >= 0")
+    if args.children < 0:
+        raise SystemExit("--children must be >= 0")
     return args
 
 
@@ -58,6 +62,8 @@ def parse_gpus(values):
 
 def main():
     args = parse_args()
+    if args.children > 0:
+        return spawn_children(args)
 
     # Must be set before importing torch. PyTorch on ROCm still uses torch.cuda.
     visible_gpus = ",".join(str(gpu) for gpu in args.gpus)
@@ -135,6 +141,45 @@ def main():
         torch.cuda.synchronize(holder["device"])
     print(f"released gpus {visible_gpus}; iterations={iterations}")
     return 0
+
+
+def spawn_children(args):
+    script = os.path.abspath(__file__)
+    visible_gpus = ",".join(str(gpu) for gpu in args.gpus)
+    children = []
+    for idx in range(args.children):
+        cmd = [
+            sys.executable,
+            script,
+            "--gpus",
+            visible_gpus,
+            "--mem-mb",
+            str(args.mem_mb),
+            "--duration",
+            str(args.duration),
+            "--matrix",
+            str(args.matrix),
+            "--sleep",
+            str(args.sleep),
+            "--children",
+            "0",
+        ]
+        print(f"starting child {idx + 1}/{args.children}: {' '.join(cmd)}", flush=True)
+        children.append(subprocess.Popen(cmd))
+
+    exit_code = 0
+    try:
+        for child in children:
+            rc = child.wait()
+            if rc != 0 and exit_code == 0:
+                exit_code = rc
+    except KeyboardInterrupt:
+        for child in children:
+            child.terminate()
+        for child in children:
+            child.wait()
+        return 130
+    return exit_code
 
 
 if __name__ == "__main__":

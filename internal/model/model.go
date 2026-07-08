@@ -200,11 +200,11 @@ type KeyStatus struct {
 }
 
 type RegisterResult struct {
-	Token         string     `json:"token"`
-	Mode          string     `json:"mode"`
-	ReservationID string     `json:"reservation_id,omitempty"`
-	GPU           int        `json:"gpu,omitempty"`
-	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	Token          string     `json:"token"`
+	Mode           string     `json:"mode"`
+	ReservationIDs []string   `json:"reservation_ids,omitempty"`
+	GPUs           []int      `json:"gpus,omitempty"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 }
 
 type RunResult struct {

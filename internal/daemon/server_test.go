@@ -89,13 +89,13 @@ func TestHardRegisterCreatesReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	args, _ := json.Marshal(protocol.RegisterArgs{RootKey: key, Mode: model.TokenModeReserved, Name: "alice", GPU: 2, TTL: "1h"})
+	args, _ := json.Marshal(protocol.RegisterArgs{RootKey: key, Mode: model.TokenModeReserved, Name: "alice", GPUs: []int{2}, TTL: "1h"})
 	result, err := server.dispatch(context.Background(), peer{}, protocol.Request{ID: "1", Method: "register", Args: args})
 	if err != nil {
 		t.Fatal(err)
 	}
 	register := result.(model.RegisterResult)
-	if register.Token == "" || register.ReservationID == "" || register.GPU != 2 {
+	if register.Token == "" || len(register.ReservationIDs) != 1 || len(register.GPUs) != 1 || register.GPUs[0] != 2 {
 		t.Fatalf("unexpected register result: %+v", register)
 	}
 	status, err := server.Store.Status(time.Now())
@@ -107,15 +107,39 @@ func TestHardRegisterCreatesReservation(t *testing.T) {
 	}
 }
 
+func TestHardRegisterCreatesMultipleReservations(t *testing.T) {
+	server := testServer(t)
+	key, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, _ := json.Marshal(protocol.RegisterArgs{RootKey: key, Mode: model.TokenModeReserved, Name: "alice", GPUs: []int{0, 1}, TTL: "1h"})
+	result, err := server.dispatch(context.Background(), peer{}, protocol.Request{ID: "1", Method: "register", Args: args})
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := result.(model.RegisterResult)
+	if register.Token == "" || len(register.ReservationIDs) != 2 || len(register.GPUs) != 2 || register.GPUs[0] != 0 || register.GPUs[1] != 1 {
+		t.Fatalf("unexpected register result: %+v", register)
+	}
+	status, err := server.Store.Status(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Reservations) != 2 || status.Reservations[0].GPU != 0 || status.Reservations[1].GPU != 1 {
+		t.Fatalf("expected reserved reservations, got %+v", status.Reservations)
+	}
+}
+
 func TestHardRegisterBusyGPUFailsWithoutReservation(t *testing.T) {
 	server := testServer(t)
 	key, err := server.Store.ReadOrCreateRootKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	server.AMD = fakeAMD{processes: []model.GPUProcess{{GPU: 2, PID: 10}}}
+	server.AMD = fakeAMD{processes: []model.GPUProcess{{GPU: 2, PID: 10, MemBytes: 1}}}
 	server.Proc = daemonFakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000, Cmdline: []string{"python"}}}}
-	args, _ := json.Marshal(protocol.RegisterArgs{RootKey: key, Mode: model.TokenModeReserved, Name: "alice", GPU: 2, TTL: "1h"})
+	args, _ := json.Marshal(protocol.RegisterArgs{RootKey: key, Mode: model.TokenModeReserved, Name: "alice", GPUs: []int{1, 2}, TTL: "1h"})
 	if _, err := server.dispatch(context.Background(), peer{}, protocol.Request{ID: "1", Method: "register", Args: args}); err == nil {
 		t.Fatal("expected busy gpu error")
 	}
@@ -125,6 +149,27 @@ func TestHardRegisterBusyGPUFailsWithoutReservation(t *testing.T) {
 	}
 	if len(status.Reservations) != 0 {
 		t.Fatalf("busy reserved register should not create reservation: %+v", status.Reservations)
+	}
+}
+
+func TestHardRegisterIgnoresParentOnlyGPUProcess(t *testing.T) {
+	server := testServer(t)
+	key, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.AMD = fakeAMD{processes: []model.GPUProcess{{GPU: 2, PID: 10, MemBytes: 0}}}
+	server.Proc = daemonFakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000, Cmdline: []string{"python", "-m", "launcher"}}}}
+	args, _ := json.Marshal(protocol.RegisterArgs{RootKey: key, Mode: model.TokenModeReserved, Name: "alice", GPUs: []int{2}, TTL: "1h"})
+	if _, err := server.dispatch(context.Background(), peer{}, protocol.Request{ID: "1", Method: "register", Args: args}); err != nil {
+		t.Fatal(err)
+	}
+	status, err := server.Store.Status(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Reservations) != 1 || status.Reservations[0].GPU != 2 {
+		t.Fatalf("expected reservation despite parent-only process: %+v", status.Reservations)
 	}
 }
 
@@ -169,7 +214,7 @@ func TestAdminMethodsRequireRootKey(t *testing.T) {
 
 func TestEnsureGPUCanReserveRejectsBusyGPU(t *testing.T) {
 	server := testServer(t)
-	server.AMD = fakeAMD{processes: []model.GPUProcess{{GPU: 0, PID: 10}}}
+	server.AMD = fakeAMD{processes: []model.GPUProcess{{GPU: 0, PID: 10, MemBytes: 1}}}
 	server.Proc = daemonFakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000, Cmdline: []string{"python"}}}}
 	if err := server.ensureGPUCanReserve(context.Background(), 0); err == nil {
 		t.Fatal("expected busy gpu error")
@@ -182,7 +227,7 @@ func TestPSIncludesHardReservationRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := server.Store.RegisterHardReservation(key, "alice", 3, "1h", time.Now()); err != nil {
+	if _, _, _, err := server.Store.RegisterHardReservations(key, "alice", []int{3}, "1h", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := server.ps(context.Background(), time.Now())

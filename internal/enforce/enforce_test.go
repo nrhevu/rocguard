@@ -54,6 +54,10 @@ func (f *fakeKiller) Kill(info model.ProcInfo, message string) error {
 	return nil
 }
 
+func gpuProcess(gpu, pid int) model.GPUProcess {
+	return model.GPUProcess{GPU: gpu, PID: pid, MemBytes: 1}
+}
+
 func TestNoLeaseSkipsGPU(t *testing.T) {
 	killer := &fakeKiller{}
 	auth := Authorizer{
@@ -61,12 +65,32 @@ func TestNoLeaseSkipsGPU(t *testing.T) {
 		Killer: killer,
 		Now:    fixedNow,
 	}
-	decisions, err := auth.Enforce(context.Background(), model.State{}, []model.GPUProcess{{GPU: 0, PID: 10}})
+	decisions, err := auth.Enforce(context.Background(), model.State{}, []model.GPUProcess{gpuProcess(0, 10)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if decisions[0].Action != "skip" || len(killer.killed) != 0 {
 		t.Fatalf("unexpected decisions=%+v killed=%v", decisions, killer.killed)
+	}
+}
+
+func TestNoGPUResourceUsageSkipsProcess(t *testing.T) {
+	killer := &fakeKiller{}
+	auth := Authorizer{
+		Proc:   fakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000}}},
+		Killer: killer,
+		Now:    fixedNow,
+	}
+	state := model.State{
+		Tokens:       []model.Token{token("hash_reserved", model.TokenModeReserved)},
+		Reservations: []model.Reservation{reservation("hash_reserved", 0)},
+	}
+	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10, MemBytes: 0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decisions[0].Action != "skip" || decisions[0].Reason != "no gpu resource usage" || len(killer.killed) != 0 {
+		t.Fatalf("parent-only GPU process should be skipped: decisions=%+v killed=%v", decisions, killer.killed)
 	}
 }
 
@@ -80,7 +104,7 @@ func TestUnauthorizedPIDIsKilledOnLeasedGPU(t *testing.T) {
 	lease := activeLease(model.ModeBare, 0)
 	lease.Holder = "alice"
 	state := model.State{Leases: []model.Lease{lease}}
-	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +134,7 @@ func TestBypassAllowsPID(t *testing.T) {
 			ExpiresAt: fixedNow().Add(time.Hour),
 		}},
 	}
-	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +154,7 @@ func TestDockerLeaseAllowsMatchingContainer(t *testing.T) {
 	lease := activeLease(model.ModeDocker, 0)
 	lease.ContainerID = containerID
 	state := model.State{Leases: []model.Lease{lease}}
-	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +174,7 @@ func TestHardReservationKillsUnauthorizedWithoutAuthorizedProcess(t *testing.T) 
 		Tokens:       []model.Token{token("hash_reserved", model.TokenModeReserved)},
 		Reservations: []model.Reservation{reservation("hash_reserved", 0)},
 	}
-	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +195,7 @@ func TestDryRunDoesNotKill(t *testing.T) {
 		Tokens:       []model.Token{token("hash_reserved", model.TokenModeReserved)},
 		Reservations: []model.Reservation{reservation("hash_reserved", 0)},
 	}
-	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +260,7 @@ func TestHardReservationAllowsMatchingAuthorizationScopes(t *testing.T) {
 				Reservations:   []model.Reservation{reservation("hash_reserved", 0)},
 				Authorizations: []model.Authorization{tt.auth},
 			}
-			decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+			decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -258,7 +282,7 @@ func TestSoftClaimCreatedOnCleanAuthorizedGPU(t *testing.T) {
 		Tokens:         []model.Token{token("hash_claimed", model.TokenModeClaimed)},
 		Authorizations: []model.Authorization{authorization("auth_user", "hash_claimed", model.TokenModeClaimed, model.ModeUser, func(a *model.Authorization) { a.UID = 1000 })},
 	}
-	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +305,7 @@ func TestSoftClaimBlockedByExistingUnauthorizedProcess(t *testing.T) {
 		Tokens:         []model.Token{token("hash_claimed", model.TokenModeClaimed)},
 		Authorizations: []model.Authorization{authorization("auth_user", "hash_claimed", model.TokenModeClaimed, model.ModeUser, func(a *model.Authorization) { a.UID = 1000 })},
 	}
-	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}, {GPU: 0, PID: 11}})
+	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10), gpuProcess(0, 11)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +334,7 @@ func TestSoftClaimKillsLaterUnauthorizedProcess(t *testing.T) {
 		Authorizations: []model.Authorization{authorization("auth_user", "hash_claimed", model.TokenModeClaimed, model.ModeUser, func(a *model.Authorization) { a.UID = 1000 })},
 		SoftClaims:     []model.SoftClaim{{ID: "claim_test", GPU: 0, TokenHash: "hash_claimed", AuthorizationID: "auth_user", Holder: "alice"}},
 	}
-	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}, {GPU: 0, PID: 11}})
+	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10), gpuProcess(0, 11)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +351,7 @@ func TestStalePIDIsIgnored(t *testing.T) {
 		Now:    fixedNow,
 	}
 	state := model.State{Leases: []model.Lease{activeLease(model.ModeBare, 0)}}
-	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
 	if err != nil {
 		t.Fatal(err)
 	}

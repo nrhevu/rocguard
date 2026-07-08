@@ -38,6 +38,19 @@ func TestRunCommandRejectsLeadingFlag(t *testing.T) {
 	}
 }
 
+func TestParseGPUList(t *testing.T) {
+	gpus, err := parseGPUList("0, 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gpus) != 2 || gpus[0] != 0 || gpus[1] != 1 {
+		t.Fatalf("unexpected gpus: %+v", gpus)
+	}
+	if _, err := parseGPUList("0,0"); err == nil {
+		t.Fatal("expected duplicate gpu error")
+	}
+}
+
 func TestUsageTextShowsOnlyCurrentCommands(t *testing.T) {
 	out := usageText()
 	for _, want := range []string{
