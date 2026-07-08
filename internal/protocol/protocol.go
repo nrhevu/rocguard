@@ -26,25 +26,32 @@ const (
 
 type RegisterArgs struct {
 	RootKey string `json:"root_key"`
+	Mode    string `json:"mode"`
 	Name    string `json:"name"`
+	GPU     int    `json:"gpu,omitempty"`
 	TTL     string `json:"ttl"`
 }
 
 type RunArgs struct {
-	GPU     int      `json:"gpu"`
+	GPU     *int     `json:"gpu,omitempty"`
 	Command []string `json:"command"`
 	Workdir string   `json:"workdir,omitempty"`
 	Env     []string `json:"env,omitempty"`
 }
 
 type DockerAllowArgs struct {
-	GPU       int    `json:"gpu"`
+	GPU       *int   `json:"gpu,omitempty"`
 	Container string `json:"container"`
 }
 
 type K8sAllowArgs struct {
-	GPU       int    `json:"gpu"`
+	GPU       *int   `json:"gpu,omitempty"`
 	Namespace string `json:"namespace"`
+}
+
+type UserAllowArgs struct {
+	GPU  *int   `json:"gpu,omitempty"`
+	User string `json:"user"`
 }
 
 type WhoArgs struct {
@@ -56,6 +63,7 @@ type TokenInfoArgs struct {
 }
 
 type BypassAddArgs struct {
+	RootKey string `json:"root_key,omitempty"`
 	Type    string `json:"type"`
 	PID     int    `json:"pid,omitempty"`
 	Command string `json:"command,omitempty"`
@@ -65,5 +73,10 @@ type BypassAddArgs struct {
 }
 
 type RevokeArgs struct {
-	ID string `json:"id"`
+	RootKey string `json:"root_key,omitempty"`
+	ID      string `json:"id"`
+}
+
+type RootKeyArgs struct {
+	RootKey string `json:"root_key"`
 }

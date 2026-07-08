@@ -52,22 +52,29 @@ type Authorizer struct {
 }
 
 type Decision struct {
-	Process model.GPUProcess
-	Info    model.ProcInfo
-	Action  string
-	Reason  string
-	LeaseID string
+	Process   model.GPUProcess
+	Info      model.ProcInfo
+	Action    string
+	Reason    string
+	LeaseID   string
+	AuthID    string
+	ClaimID   string
+	Holder    string
+	TokenHash string
+	Claim     model.SoftClaim
+}
+
+type processView struct {
+	Process  model.GPUProcess
+	Info     model.ProcInfo
+	Bypassed bool
 }
 
 func (a Authorizer) Enforce(ctx context.Context, state model.State, processes []model.GPUProcess) ([]Decision, error) {
 	now := a.now()
 	var decisions []Decision
+	byGPU := map[int][]processView{}
 	for _, gpuProcess := range processes {
-		leases := activeLeasesForGPU(state.Leases, gpuProcess.GPU, now)
-		if len(leases) == 0 {
-			decisions = append(decisions, Decision{Process: gpuProcess, Action: "skip", Reason: "gpu has no active lease"})
-			continue
-		}
 		if a.Proc == nil || !a.Proc.Exists(gpuProcess.PID) {
 			decisions = append(decisions, Decision{Process: gpuProcess, Action: "skip", Reason: "stale pid"})
 			continue
@@ -77,46 +84,55 @@ func (a Authorizer) Enforce(ctx context.Context, state model.State, processes []
 			decisions = append(decisions, Decision{Process: gpuProcess, Action: "skip", Reason: "proc info unavailable"})
 			continue
 		}
-		if bypassMatch(state.Bypasses, info, now) {
+		view := processView{Process: gpuProcess, Info: info}
+		if BypassMatch(state.Bypasses, info, now) {
+			view.Bypassed = true
 			decisions = append(decisions, Decision{Process: gpuProcess, Info: info, Action: "allow", Reason: "bypass"})
-			continue
 		}
-		if leaseID, ok := a.matchesAnyLease(ctx, leases, info, now); ok {
-			decisions = append(decisions, Decision{Process: gpuProcess, Info: info, Action: "allow", Reason: "lease", LeaseID: leaseID})
-			continue
-		}
-		holder := leaseHolder(leases)
-		leaseID := firstLeaseID(leases)
-		reason := fmt.Sprintf("unauthorized GPU access on gpu=%d pid=%d; gpu is held by %s", gpuProcess.GPU, gpuProcess.PID, holder)
-		decision := Decision{Process: gpuProcess, Info: info, Action: "kill", Reason: reason, LeaseID: leaseID}
-		decisions = append(decisions, decision)
-		a.audit(model.AuditEvent{
-			Time:    now.UTC(),
-			Kind:    "kill",
-			Message: reason,
-			GPU:     gpuProcess.GPU,
-			PID:     gpuProcess.PID,
-			LeaseID: leaseID,
-			User:    holder,
-		})
-		if !a.DryRun && a.Killer != nil {
-			msg := fmt.Sprintf("rocguard killed pid=%d on gpu=%d: unauthorized GPU access; gpu is held by %s; use KEY=... rocguard run --gpu %d -- <command>", gpuProcess.PID, gpuProcess.GPU, holder, gpuProcess.GPU)
-			if err := a.Killer.Kill(info, msg); err != nil {
+		byGPU[gpuProcess.GPU] = append(byGPU[gpuProcess.GPU], view)
+	}
+
+	for gpu, views := range byGPU {
+		reservations := activeReservationsForGPU(state.Reservations, gpu, now)
+		if len(reservations) > 0 {
+			if err := a.enforceHard(ctx, state, gpu, reservations, views, &decisions, now); err != nil {
 				return decisions, err
 			}
+			continue
+		}
+		leases := activeLeasesForGPU(state.Leases, gpu, now)
+		if len(leases) > 0 {
+			if err := a.enforceLegacyLeases(ctx, state, gpu, leases, views, &decisions, now); err != nil {
+				return decisions, err
+			}
+			continue
+		}
+		if err := a.enforceSoft(ctx, state, gpu, views, &decisions, now); err != nil {
+			return decisions, err
 		}
 	}
+
+	for _, claim := range state.SoftClaims {
+		if !a.claimHasMatchingProcess(ctx, state, claim, byGPU[claim.GPU], now) {
+			decisions = append(decisions, Decision{Action: "release_claim", ClaimID: claim.ID, Reason: "claimed GPU has no matching process"})
+			a.audit(model.AuditEvent{
+				Time:    now.UTC(),
+				Kind:    "claim_released",
+				Message: "claimed GPU released after authorized process disappeared",
+				GPU:     claim.GPU,
+				User:    claim.Holder,
+			})
+		}
+	}
+
 	return decisions, nil
 }
 
-func (a Authorizer) BusyProcessesForLease(ctx context.Context, state model.State, processes []model.GPUProcess, tentative *model.Lease) ([]Decision, error) {
+func (a Authorizer) BusyProcessesForGPU(ctx context.Context, state model.State, processes []model.GPUProcess, gpu int) ([]Decision, error) {
 	now := a.now()
 	var busy []Decision
 	for _, gpuProcess := range processes {
-		if tentative != nil && gpuProcess.GPU != tentative.GPU {
-			continue
-		}
-		if tentative == nil {
+		if gpuProcess.GPU != gpu {
 			continue
 		}
 		if a.Proc == nil || !a.Proc.Exists(gpuProcess.PID) {
@@ -126,7 +142,32 @@ func (a Authorizer) BusyProcessesForLease(ctx context.Context, state model.State
 		if err != nil {
 			continue
 		}
-		if bypassMatch(state.Bypasses, info, now) {
+		if BypassMatch(state.Bypasses, info, now) {
+			continue
+		}
+		busy = append(busy, Decision{Process: gpuProcess, Info: info, Action: "busy", Reason: "gpu already has non-bypassed process"})
+	}
+	return busy, nil
+}
+
+func (a Authorizer) BusyProcessesForLease(ctx context.Context, state model.State, processes []model.GPUProcess, tentative *model.Lease) ([]Decision, error) {
+	if tentative == nil {
+		return nil, nil
+	}
+	now := a.now()
+	var busy []Decision
+	for _, gpuProcess := range processes {
+		if gpuProcess.GPU != tentative.GPU {
+			continue
+		}
+		if a.Proc == nil || !a.Proc.Exists(gpuProcess.PID) {
+			continue
+		}
+		info, err := a.Proc.Info(gpuProcess.PID)
+		if err != nil {
+			continue
+		}
+		if BypassMatch(state.Bypasses, info, now) {
 			continue
 		}
 		if tentative.Mode != "" && a.leaseMatches(ctx, *tentative, info, now) {
@@ -135,6 +176,256 @@ func (a Authorizer) BusyProcessesForLease(ctx context.Context, state model.State
 		busy = append(busy, Decision{Process: gpuProcess, Info: info, Action: "busy", Reason: "gpu already has non-bypassed process"})
 	}
 	return busy, nil
+}
+
+func (a Authorizer) enforceHard(ctx context.Context, state model.State, gpu int, reservations []model.Reservation, views []processView, decisions *[]Decision, now time.Time) error {
+	tokenFilter := map[string]bool{}
+	for _, reservation := range reservations {
+		tokenFilter[reservation.TokenHash] = true
+	}
+	holder := reservationHolder(reservations)
+	reservationID := firstReservationID(reservations)
+	for _, view := range views {
+		if view.Bypassed {
+			continue
+		}
+		auth, ok := a.matchAnyAuthorization(ctx, state, gpu, view.Info, tokenFilter, "", now)
+		if ok {
+			*decisions = append(*decisions, Decision{
+				Process:   view.Process,
+				Info:      view.Info,
+				Action:    "allow",
+				Reason:    "authorization",
+				AuthID:    auth.ID,
+				Holder:    auth.Holder,
+				TokenHash: auth.TokenHash,
+			})
+			continue
+		}
+		reason := fmt.Sprintf("unauthorized GPU access on gpu=%d pid=%d; gpu is reserved by %s", gpu, view.Process.PID, holder)
+		if err := a.kill(decisions, view, reason, reservationID, "", holder, tokenHashForReservations(reservations), now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a Authorizer) enforceLegacyLeases(ctx context.Context, state model.State, gpu int, leases []model.Lease, views []processView, decisions *[]Decision, now time.Time) error {
+	holder := leaseHolder(leases)
+	leaseID := firstLeaseID(leases)
+	for _, view := range views {
+		if view.Bypassed {
+			continue
+		}
+		if matchedLeaseID, ok := a.matchesAnyLease(ctx, leases, view.Info, now); ok {
+			*decisions = append(*decisions, Decision{
+				Process: view.Process,
+				Info:    view.Info,
+				Action:  "allow",
+				Reason:  "lease",
+				LeaseID: matchedLeaseID,
+				Holder:  holder,
+			})
+			continue
+		}
+		reason := fmt.Sprintf("unauthorized GPU access on gpu=%d pid=%d; gpu is held by %s", gpu, view.Process.PID, holder)
+		if err := a.kill(decisions, view, reason, leaseID, "", holder, "", now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a Authorizer) enforceSoft(ctx context.Context, state model.State, gpu int, views []processView, decisions *[]Decision, now time.Time) error {
+	claims := activeSoftClaimsForGPU(state, gpu, now)
+	if len(claims) > 0 && a.claimHasMatchingProcess(ctx, state, claims[0], views, now) {
+		claim := claims[0]
+		tokenFilter := map[string]bool{claim.TokenHash: true}
+		for _, view := range views {
+			if view.Bypassed {
+				continue
+			}
+			auth, ok := a.matchAnyAuthorization(ctx, state, gpu, view.Info, tokenFilter, model.TokenModeClaimed, now)
+			if ok {
+				*decisions = append(*decisions, Decision{
+					Process:   view.Process,
+					Info:      view.Info,
+					Action:    "allow",
+					Reason:    "claimed",
+					AuthID:    auth.ID,
+					ClaimID:   claim.ID,
+					Holder:    auth.Holder,
+					TokenHash: auth.TokenHash,
+				})
+				continue
+			}
+			reason := fmt.Sprintf("unauthorized GPU access on gpu=%d pid=%d; gpu is claimed by %s", gpu, view.Process.PID, claim.Holder)
+			if err := a.kill(decisions, view, reason, "", claim.AuthorizationID, claim.Holder, claim.TokenHash, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	type authorizedView struct {
+		view processView
+		auth model.Authorization
+	}
+	var authorized []authorizedView
+	var unauthorized []processView
+	for _, view := range views {
+		if view.Bypassed {
+			continue
+		}
+		auth, ok := a.matchAnyAuthorization(ctx, state, gpu, view.Info, nil, model.TokenModeClaimed, now)
+		if ok {
+			authorized = append(authorized, authorizedView{view: view, auth: auth})
+		} else {
+			unauthorized = append(unauthorized, view)
+		}
+	}
+	if len(authorized) == 0 {
+		for _, view := range unauthorized {
+			*decisions = append(*decisions, Decision{Process: view.Process, Info: view.Info, Action: "skip", Reason: "gpu has no active claimed authorization"})
+		}
+		return nil
+	}
+	if len(unauthorized) > 0 {
+		msg := fmt.Sprintf("claimed-mode authorization skipped on gpu=%d because non-authorized processes were already present", gpu)
+		a.audit(model.AuditEvent{Time: now.UTC(), Kind: "claim_conflict", Message: msg, GPU: gpu, User: authorized[0].auth.Holder})
+		for _, item := range authorized {
+			*decisions = append(*decisions, Decision{Process: item.view.Process, Info: item.view.Info, Action: "skip", Reason: "claim blocked by existing process", AuthID: item.auth.ID, Holder: item.auth.Holder, TokenHash: item.auth.TokenHash})
+		}
+		for _, view := range unauthorized {
+			*decisions = append(*decisions, Decision{Process: view.Process, Info: view.Info, Action: "skip", Reason: "claim blocked by existing process"})
+		}
+		return nil
+	}
+
+	claimAuth := authorized[0].auth
+	claim := model.SoftClaim{
+		GPU:             gpu,
+		TokenHash:       claimAuth.TokenHash,
+		AuthorizationID: claimAuth.ID,
+		Holder:          claimAuth.Holder,
+		CreatedAt:       now.UTC(),
+		UpdatedAt:       now.UTC(),
+	}
+	*decisions = append(*decisions, Decision{Action: "claim", Reason: "claimed", AuthID: claimAuth.ID, Holder: claimAuth.Holder, TokenHash: claimAuth.TokenHash, Claim: claim})
+	a.audit(model.AuditEvent{Time: now.UTC(), Kind: "claim", Message: "GPU claimed", GPU: gpu, User: claimAuth.Holder})
+	for _, item := range authorized {
+		if item.auth.TokenHash == claimAuth.TokenHash {
+			*decisions = append(*decisions, Decision{
+				Process:   item.view.Process,
+				Info:      item.view.Info,
+				Action:    "allow",
+				Reason:    "claimed",
+				AuthID:    item.auth.ID,
+				Holder:    item.auth.Holder,
+				TokenHash: item.auth.TokenHash,
+			})
+			continue
+		}
+		reason := fmt.Sprintf("unauthorized GPU access on gpu=%d pid=%d; gpu is claimed by %s", gpu, item.view.Process.PID, claimAuth.Holder)
+		if err := a.kill(decisions, item.view, reason, "", claimAuth.ID, claimAuth.Holder, claimAuth.TokenHash, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a Authorizer) kill(decisions *[]Decision, view processView, reason, leaseID, authID, holder, tokenHash string, now time.Time) error {
+	decision := Decision{
+		Process:   view.Process,
+		Info:      view.Info,
+		Action:    "kill",
+		Reason:    reason,
+		LeaseID:   leaseID,
+		AuthID:    authID,
+		Holder:    holder,
+		TokenHash: tokenHash,
+	}
+	*decisions = append(*decisions, decision)
+	a.audit(model.AuditEvent{
+		Time:    now.UTC(),
+		Kind:    "kill",
+		Message: reason,
+		GPU:     view.Process.GPU,
+		PID:     view.Process.PID,
+		LeaseID: leaseID,
+		User:    holder,
+	})
+	if a.DryRun || a.Killer == nil {
+		return nil
+	}
+	msg := fmt.Sprintf("rocguard killed pid=%d on gpu=%d: unauthorized GPU access; gpu is held by %s; use KEY=... rocguard run -- <command>", view.Process.PID, view.Process.GPU, holder)
+	return a.Killer.Kill(view.Info, msg)
+}
+
+func (a Authorizer) claimHasMatchingProcess(ctx context.Context, state model.State, claim model.SoftClaim, views []processView, now time.Time) bool {
+	if claim.TokenHash == "" {
+		return false
+	}
+	for _, view := range views {
+		if view.Bypassed {
+			continue
+		}
+		if _, ok := a.matchAnyAuthorization(ctx, state, claim.GPU, view.Info, map[string]bool{claim.TokenHash: true}, model.TokenModeClaimed, now); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (a Authorizer) matchAnyAuthorization(ctx context.Context, state model.State, gpu int, info model.ProcInfo, tokenFilter map[string]bool, tokenMode string, now time.Time) (model.Authorization, bool) {
+	for _, authorization := range state.Authorizations {
+		if !authorization.Active || authorization.Revoked || authorizationExpired(authorization, now) {
+			continue
+		}
+		if tokenFilter != nil && !tokenFilter[authorization.TokenHash] {
+			continue
+		}
+		token, ok := activeTokenByHash(state.Tokens, authorization.TokenHash, now)
+		if !ok {
+			continue
+		}
+		mode := normalizeTokenMode(token.Mode)
+		if tokenMode != "" && mode != tokenMode {
+			continue
+		}
+		authorization.TokenMode = mode
+		if a.authorizationMatches(ctx, authorization, gpu, info, now) {
+			return authorization, true
+		}
+	}
+	return model.Authorization{}, false
+}
+
+func (a Authorizer) authorizationMatches(ctx context.Context, authorization model.Authorization, gpu int, info model.ProcInfo, now time.Time) bool {
+	if !authorization.Active || authorization.Revoked || authorizationExpired(authorization, now) {
+		return false
+	}
+	if authorization.GPU != nil && *authorization.GPU != gpu {
+		return false
+	}
+	switch authorization.Mode {
+	case model.ModeBare:
+		return authorization.RootPID == info.PID ||
+			(authorization.CgroupRel != "" && strings.Contains(info.Cgroup, authorization.CgroupRel)) ||
+			(authorization.CgroupPath != "" && strings.Contains(info.Cgroup, strings.TrimPrefix(authorization.CgroupPath, "/sys/fs/cgroup/")))
+	case model.ModeDocker:
+		return sameContainer(info.ContainerID, authorization.ContainerID)
+	case model.ModeK8s:
+		if info.ContainerID == "" || a.Runtime == nil {
+			return false
+		}
+		ns, err := a.Runtime.NamespaceForContainer(ctx, info.ContainerID)
+		return err == nil && ns == authorization.Namespace
+	case model.ModeUser:
+		return authorization.UID >= 0 && info.UID == authorization.UID
+	default:
+		return false
+	}
 }
 
 func (a Authorizer) matchesAnyLease(ctx context.Context, leases []model.Lease, info model.ProcInfo, now time.Time) (string, bool) {
@@ -168,6 +459,29 @@ func (a Authorizer) leaseMatches(ctx context.Context, lease model.Lease, info mo
 	}
 }
 
+func activeReservationsForGPU(reservations []model.Reservation, gpu int, now time.Time) []model.Reservation {
+	var out []model.Reservation
+	for _, reservation := range reservations {
+		if reservation.GPU == gpu && reservation.Active && !reservation.Revoked && now.Before(reservation.ExpiresAt) {
+			out = append(out, reservation)
+		}
+	}
+	return out
+}
+
+func activeSoftClaimsForGPU(state model.State, gpu int, now time.Time) []model.SoftClaim {
+	var out []model.SoftClaim
+	for _, claim := range state.SoftClaims {
+		if claim.GPU != gpu {
+			continue
+		}
+		if token, ok := activeTokenByHash(state.Tokens, claim.TokenHash, now); ok && normalizeTokenMode(token.Mode) == model.TokenModeClaimed {
+			out = append(out, claim)
+		}
+	}
+	return out
+}
+
 func activeLeasesForGPU(leases []model.Lease, gpu int, now time.Time) []model.Lease {
 	var out []model.Lease
 	for _, lease := range leases {
@@ -176,6 +490,42 @@ func activeLeasesForGPU(leases []model.Lease, gpu int, now time.Time) []model.Le
 		}
 	}
 	return out
+}
+
+func activeTokenByHash(tokens []model.Token, hash string, now time.Time) (model.Token, bool) {
+	for _, token := range tokens {
+		if token.Hash != hash || token.Revoked {
+			continue
+		}
+		if timeIsSet(token.ExpiresAt) && !now.Before(token.ExpiresAt) {
+			continue
+		}
+		token.Mode = normalizeTokenMode(token.Mode)
+		return token, true
+	}
+	return model.Token{}, false
+}
+
+func authorizationExpired(authorization model.Authorization, now time.Time) bool {
+	return timeIsSet(authorization.ExpiresAt) && !now.Before(authorization.ExpiresAt)
+}
+
+func reservationHolder(reservations []model.Reservation) string {
+	var parts []string
+	for _, reservation := range reservations {
+		holder := strings.TrimSpace(reservation.Holder)
+		if holder == "" {
+			holder = "unknown"
+		}
+		if reservation.ID != "" {
+			holder = fmt.Sprintf("%s (reservation=%s)", holder, reservation.ID)
+		}
+		parts = append(parts, holder)
+	}
+	if len(parts) == 0 {
+		return "unknown"
+	}
+	return strings.Join(parts, ", ")
 }
 
 func leaseHolder(leases []model.Lease) string {
@@ -196,6 +546,13 @@ func leaseHolder(leases []model.Lease) string {
 	return strings.Join(parts, ", ")
 }
 
+func firstReservationID(reservations []model.Reservation) string {
+	if len(reservations) == 0 {
+		return ""
+	}
+	return reservations[0].ID
+}
+
 func firstLeaseID(leases []model.Lease) string {
 	if len(leases) == 0 {
 		return ""
@@ -203,7 +560,14 @@ func firstLeaseID(leases []model.Lease) string {
 	return leases[0].ID
 }
 
-func bypassMatch(rules []model.BypassRule, info model.ProcInfo, now time.Time) bool {
+func tokenHashForReservations(reservations []model.Reservation) string {
+	if len(reservations) == 0 {
+		return ""
+	}
+	return reservations[0].TokenHash
+}
+
+func BypassMatch(rules []model.BypassRule, info model.ProcInfo, now time.Time) bool {
 	for _, rule := range rules {
 		if rule.Revoked || !now.Before(rule.ExpiresAt) {
 			continue
@@ -229,6 +593,22 @@ func sameContainer(a, b string) bool {
 		return false
 	}
 	return a == b || strings.HasPrefix(a, b) || strings.HasPrefix(b, a)
+}
+
+func normalizeTokenMode(mode string) string {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	switch mode {
+	case "", "soft":
+		return model.TokenModeClaimed
+	case "hard":
+		return model.TokenModeReserved
+	default:
+		return mode
+	}
+}
+
+func timeIsSet(value time.Time) bool {
+	return !value.IsZero()
 }
 
 func (a Authorizer) now() time.Time {

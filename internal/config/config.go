@@ -9,6 +9,7 @@ type Config struct {
 	AuditLog    string
 	CgroupRoot  string
 	ProcRoot    string
+	DryRun      bool
 }
 
 func Default() Config {
@@ -19,6 +20,7 @@ func Default() Config {
 		AuditLog:    env("ROCGUARD_AUDIT_LOG", "/var/log/rocguard/audit.log"),
 		CgroupRoot:  env("ROCGUARD_CGROUP_ROOT", "/sys/fs/cgroup/rocguard"),
 		ProcRoot:    env("ROCGUARD_PROC_ROOT", "/proc"),
+		DryRun:      env("ROCGUARD_DRY_RUN", "") == "1",
 	}
 }
 

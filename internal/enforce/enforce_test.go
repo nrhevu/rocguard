@@ -139,6 +139,186 @@ func TestDockerLeaseAllowsMatchingContainer(t *testing.T) {
 	}
 }
 
+func TestHardReservationKillsUnauthorizedWithoutAuthorizedProcess(t *testing.T) {
+	killer := &fakeKiller{}
+	auth := Authorizer{
+		Proc:   fakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000}}},
+		Killer: killer,
+		Now:    fixedNow,
+	}
+	state := model.State{
+		Tokens:       []model.Token{token("hash_reserved", model.TokenModeReserved)},
+		Reservations: []model.Reservation{reservation("hash_reserved", 0)},
+	}
+	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decisions[0].Action != "kill" || len(killer.killed) != 1 {
+		t.Fatalf("unexpected decisions=%+v killed=%v", decisions, killer.killed)
+	}
+}
+
+func TestDryRunDoesNotKill(t *testing.T) {
+	killer := &fakeKiller{}
+	auth := Authorizer{
+		Proc:   fakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000}}},
+		Killer: killer,
+		Now:    fixedNow,
+		DryRun: true,
+	}
+	state := model.State{
+		Tokens:       []model.Token{token("hash_reserved", model.TokenModeReserved)},
+		Reservations: []model.Reservation{reservation("hash_reserved", 0)},
+	}
+	decisions, err := auth.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decisions[0].Action != "kill" || len(killer.killed) != 0 {
+		t.Fatalf("dry run should decide kill without invoking killer: decisions=%+v killed=%v", decisions, killer.killed)
+	}
+}
+
+func TestHardReservationAllowsMatchingAuthorizationScopes(t *testing.T) {
+	containerID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	tests := []struct {
+		name    string
+		auth    model.Authorization
+		info    model.ProcInfo
+		runtime fakeRuntime
+	}{
+		{
+			name: "bare",
+			auth: authorization("auth_bare", "hash_reserved", model.TokenModeReserved, model.ModeBare, func(a *model.Authorization) {
+				a.RootPID = 10
+			}),
+			info: model.ProcInfo{PID: 10, UID: 1000},
+		},
+		{
+			name: "docker",
+			auth: authorization("auth_docker", "hash_reserved", model.TokenModeReserved, model.ModeDocker, func(a *model.Authorization) {
+				a.ContainerID = containerID
+			}),
+			info: model.ProcInfo{PID: 10, ContainerID: containerID},
+		},
+		{
+			name: "k8s",
+			auth: authorization("auth_k8s", "hash_reserved", model.TokenModeReserved, model.ModeK8s, func(a *model.Authorization) {
+				a.Namespace = "training"
+			}),
+			info:    model.ProcInfo{PID: 10, ContainerID: containerID},
+			runtime: fakeRuntime{namespaces: map[string]string{containerID: "training"}},
+		},
+		{
+			name: "user",
+			auth: authorization("auth_user", "hash_reserved", model.TokenModeReserved, model.ModeUser, func(a *model.Authorization) {
+				a.UID = 1000
+			}),
+			info: model.ProcInfo{PID: 10, UID: 1000},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			killer := &fakeKiller{}
+			rt := tt.runtime
+			if rt.namespaces == nil {
+				rt.namespaces = map[string]string{}
+			}
+			authz := Authorizer{
+				Proc:    fakeProc{infos: map[int]model.ProcInfo{10: tt.info}},
+				Runtime: rt,
+				Killer:  killer,
+				Now:     fixedNow,
+			}
+			state := model.State{
+				Tokens:         []model.Token{token("hash_reserved", model.TokenModeReserved)},
+				Reservations:   []model.Reservation{reservation("hash_reserved", 0)},
+				Authorizations: []model.Authorization{tt.auth},
+			}
+			decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decisions[0].Action != "allow" || len(killer.killed) != 0 {
+				t.Fatalf("unexpected decisions=%+v killed=%v", decisions, killer.killed)
+			}
+		})
+	}
+}
+
+func TestSoftClaimCreatedOnCleanAuthorizedGPU(t *testing.T) {
+	killer := &fakeKiller{}
+	authz := Authorizer{
+		Proc:   fakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000}}},
+		Killer: killer,
+		Now:    fixedNow,
+	}
+	state := model.State{
+		Tokens:         []model.Token{token("hash_claimed", model.TokenModeClaimed)},
+		Authorizations: []model.Authorization{authorization("auth_user", "hash_claimed", model.TokenModeClaimed, model.ModeUser, func(a *model.Authorization) { a.UID = 1000 })},
+	}
+	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decisions[0].Action != "claim" || decisions[1].Action != "allow" || len(killer.killed) != 0 {
+		t.Fatalf("unexpected decisions=%+v killed=%v", decisions, killer.killed)
+	}
+}
+
+func TestSoftClaimBlockedByExistingUnauthorizedProcess(t *testing.T) {
+	killer := &fakeKiller{}
+	authz := Authorizer{
+		Proc: fakeProc{infos: map[int]model.ProcInfo{
+			10: {PID: 10, UID: 1000},
+			11: {PID: 11, UID: 2000},
+		}},
+		Killer: killer,
+		Now:    fixedNow,
+	}
+	state := model.State{
+		Tokens:         []model.Token{token("hash_claimed", model.TokenModeClaimed)},
+		Authorizations: []model.Authorization{authorization("auth_user", "hash_claimed", model.TokenModeClaimed, model.ModeUser, func(a *model.Authorization) { a.UID = 1000 })},
+	}
+	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}, {GPU: 0, PID: 11}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decision := range decisions {
+		if decision.Action == "kill" || decision.Action == "claim" {
+			t.Fatalf("claimed conflict should not kill or claim: %+v", decisions)
+		}
+	}
+	if len(killer.killed) != 0 {
+		t.Fatalf("unexpected kills: %v", killer.killed)
+	}
+}
+
+func TestSoftClaimKillsLaterUnauthorizedProcess(t *testing.T) {
+	killer := &fakeKiller{}
+	authz := Authorizer{
+		Proc: fakeProc{infos: map[int]model.ProcInfo{
+			10: {PID: 10, UID: 1000},
+			11: {PID: 11, UID: 2000},
+		}},
+		Killer: killer,
+		Now:    fixedNow,
+	}
+	state := model.State{
+		Tokens:         []model.Token{token("hash_claimed", model.TokenModeClaimed)},
+		Authorizations: []model.Authorization{authorization("auth_user", "hash_claimed", model.TokenModeClaimed, model.ModeUser, func(a *model.Authorization) { a.UID = 1000 })},
+		SoftClaims:     []model.SoftClaim{{ID: "claim_test", GPU: 0, TokenHash: "hash_claimed", AuthorizationID: "auth_user", Holder: "alice"}},
+	}
+	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{{GPU: 0, PID: 10}, {GPU: 0, PID: 11}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(killer.killed) != 1 || killer.killed[0] != 11 {
+		t.Fatalf("expected later unauthorized pid to be killed: decisions=%+v killed=%v", decisions, killer.killed)
+	}
+}
+
 func TestStalePIDIsIgnored(t *testing.T) {
 	killer := &fakeKiller{}
 	auth := Authorizer{
@@ -165,6 +345,46 @@ func activeLease(mode string, gpu int) model.Lease {
 		ExpiresAt: fixedNow().Add(time.Hour),
 		Active:    true,
 	}
+}
+
+func token(hash, mode string) model.Token {
+	return model.Token{
+		ID:        "tok_test",
+		Hash:      hash,
+		Name:      "alice",
+		Mode:      mode,
+		CreatedAt: fixedNow(),
+		ExpiresAt: fixedNow().Add(time.Hour),
+	}
+}
+
+func reservation(hash string, gpu int) model.Reservation {
+	return model.Reservation{
+		ID:        "res_test",
+		GPU:       gpu,
+		TokenHash: hash,
+		Holder:    "alice",
+		CreatedAt: fixedNow(),
+		ExpiresAt: fixedNow().Add(time.Hour),
+		Active:    true,
+	}
+}
+
+func authorization(id, hash, tokenMode, mode string, apply func(*model.Authorization)) model.Authorization {
+	out := model.Authorization{
+		ID:        id,
+		Mode:      mode,
+		TokenHash: hash,
+		TokenMode: tokenMode,
+		Holder:    "alice",
+		CreatedAt: fixedNow(),
+		ExpiresAt: fixedNow().Add(time.Hour),
+		Active:    true,
+	}
+	if apply != nil {
+		apply(&out)
+	}
+	return out
 }
 
 func fixedNow() time.Time {

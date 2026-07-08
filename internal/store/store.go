@@ -21,6 +21,8 @@ import (
 const (
 	DefaultTokenTTL = 2 * time.Hour
 	MaxTokenTTL     = 24 * time.Hour
+	DefaultHardTTL  = 2 * time.Hour
+	MaxHardTTL      = 8 * time.Hour
 	maxAuditEvents  = 1000
 )
 
@@ -101,6 +103,62 @@ func (s *Store) Snapshot() (model.State, error) {
 	return cloneState(s.state), nil
 }
 
+func (s *Store) RegisterSoftToken(rootKey, name string, now time.Time) (string, model.Token, error) {
+	if ok, err := s.ValidateRootKey(rootKey); err != nil {
+		return "", model.Token{}, err
+	} else if !ok {
+		return "", model.Token{}, ErrInvalidRootKey
+	}
+	tokenSecret, token := newToken(model.TokenModeClaimed, name, time.Time{}, now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return "", model.Token{}, err
+	}
+	s.state.Tokens = append(s.state.Tokens, token)
+	if err := s.saveLocked(); err != nil {
+		return "", model.Token{}, err
+	}
+	return tokenSecret, token, nil
+}
+
+func (s *Store) RegisterHardReservation(rootKey, name string, gpu int, ttlText string, now time.Time) (string, model.Token, model.Reservation, error) {
+	ttl, err := ParseTTL(ttlText, DefaultHardTTL, MaxHardTTL)
+	if err != nil {
+		return "", model.Token{}, model.Reservation{}, err
+	}
+	if gpu < 0 {
+		return "", model.Token{}, model.Reservation{}, fmt.Errorf("gpu must be >= 0")
+	}
+	if ok, err := s.ValidateRootKey(rootKey); err != nil {
+		return "", model.Token{}, model.Reservation{}, err
+	} else if !ok {
+		return "", model.Token{}, model.Reservation{}, ErrInvalidRootKey
+	}
+	expiresAt := now.UTC().Add(ttl)
+	tokenSecret, token := newToken(model.TokenModeReserved, name, expiresAt, now)
+	reservation := model.Reservation{
+		ID:        NewReservationID(),
+		GPU:       gpu,
+		TokenHash: token.Hash,
+		Holder:    token.Name,
+		CreatedAt: now.UTC(),
+		ExpiresAt: expiresAt,
+		Active:    true,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return "", model.Token{}, model.Reservation{}, err
+	}
+	s.state.Tokens = append(s.state.Tokens, token)
+	s.state.Reservations = append(s.state.Reservations, reservation)
+	if err := s.saveLocked(); err != nil {
+		return "", model.Token{}, model.Reservation{}, err
+	}
+	return tokenSecret, token, reservation, nil
+}
+
 func (s *Store) RegisterToken(rootKey, name, ttlText string, now time.Time) (string, model.Token, error) {
 	ttl, err := ParseTTL(ttlText, DefaultTokenTTL, MaxTokenTTL)
 	if err != nil {
@@ -111,17 +169,7 @@ func (s *Store) RegisterToken(rootKey, name, ttlText string, now time.Time) (str
 	} else if !ok {
 		return "", model.Token{}, ErrInvalidRootKey
 	}
-	tokenSecret := "rg_" + randomHex(24)
-	token := model.Token{
-		ID:        "tok_" + randomHex(8),
-		Hash:      HashToken(tokenSecret),
-		Name:      strings.TrimSpace(name),
-		CreatedAt: now.UTC(),
-		ExpiresAt: now.UTC().Add(ttl),
-	}
-	if token.Name == "" {
-		token.Name = "anonymous"
-	}
+	tokenSecret, token := newToken(model.TokenModeClaimed, name, now.UTC().Add(ttl), now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.loadLocked(); err != nil {
@@ -148,7 +196,8 @@ func (s *Store) ValidateToken(secret string, now time.Time) (model.Token, string
 		if token.Revoked {
 			return token, hash, ErrTokenRevoked
 		}
-		if !now.Before(token.ExpiresAt) {
+		token.Mode = NormalizeTokenMode(token.Mode)
+		if timeIsSet(token.ExpiresAt) && !now.Before(token.ExpiresAt) {
 			return token, hash, ErrTokenExpired
 		}
 		return token, hash, nil
@@ -164,8 +213,9 @@ func (s *Store) TokenView(secret string, now time.Time) (model.TokenView, error)
 	return model.TokenView{
 		ID:        token.ID,
 		Name:      token.Name,
+		Mode:      NormalizeTokenMode(token.Mode),
 		CreatedAt: token.CreatedAt,
-		ExpiresAt: token.ExpiresAt,
+		ExpiresAt: timePtrIfSet(token.ExpiresAt),
 		Revoked:   token.Revoked,
 	}, nil
 }
@@ -210,6 +260,118 @@ func (s *Store) ReleaseLease(id string) error {
 	return nil
 }
 
+func (s *Store) AddReservation(reservation model.Reservation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	s.state.Reservations = append(s.state.Reservations, reservation)
+	return s.saveLocked()
+}
+
+func (s *Store) ReleaseReservation(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	for i := range s.state.Reservations {
+		if s.state.Reservations[i].ID == id {
+			s.state.Reservations[i].Active = false
+			return s.saveLocked()
+		}
+	}
+	return nil
+}
+
+func (s *Store) AddAuthorization(authorization model.Authorization) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	s.state.Authorizations = append(s.state.Authorizations, authorization)
+	return s.saveLocked()
+}
+
+func (s *Store) UpdateAuthorization(update model.Authorization) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	for i := range s.state.Authorizations {
+		if s.state.Authorizations[i].ID == update.ID {
+			s.state.Authorizations[i] = update
+			return s.saveLocked()
+		}
+	}
+	return fmt.Errorf("authorization %s not found", update.ID)
+}
+
+func (s *Store) ReleaseAuthorization(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	for i := range s.state.Authorizations {
+		if s.state.Authorizations[i].ID == id {
+			s.state.Authorizations[i].Active = false
+			return s.saveLocked()
+		}
+	}
+	return nil
+}
+
+func (s *Store) UpsertSoftClaim(claim model.SoftClaim, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	if claim.ID == "" {
+		claim.ID = NewSoftClaimID()
+	}
+	if claim.CreatedAt.IsZero() {
+		claim.CreatedAt = now.UTC()
+	}
+	claim.UpdatedAt = now.UTC()
+	for i := range s.state.SoftClaims {
+		if s.state.SoftClaims[i].GPU == claim.GPU && s.state.SoftClaims[i].TokenHash == claim.TokenHash {
+			claim.ID = s.state.SoftClaims[i].ID
+			claim.CreatedAt = s.state.SoftClaims[i].CreatedAt
+			s.state.SoftClaims[i] = claim
+			return s.saveLocked()
+		}
+	}
+	s.state.SoftClaims = append(s.state.SoftClaims, claim)
+	return s.saveLocked()
+}
+
+func (s *Store) ReleaseSoftClaim(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return err
+	}
+	filtered := s.state.SoftClaims[:0]
+	changed := false
+	for _, claim := range s.state.SoftClaims {
+		if claim.ID == id {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, claim)
+	}
+	if !changed {
+		return nil
+	}
+	s.state.SoftClaims = filtered
+	return s.saveLocked()
+}
+
 func (s *Store) AddBypass(rule model.BypassRule) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,6 +397,21 @@ func (s *Store) Revoke(idOrToken string) error {
 	for i := range s.state.Tokens {
 		if s.state.Tokens[i].ID == idOrToken || s.state.Tokens[i].Hash == tokenHash {
 			s.state.Tokens[i].Revoked = true
+			tokenHash = s.state.Tokens[i].Hash
+			changed = true
+		}
+	}
+	for i := range s.state.Reservations {
+		if s.state.Reservations[i].ID == idOrToken || (tokenHash != "" && s.state.Reservations[i].TokenHash == tokenHash) {
+			s.state.Reservations[i].Active = false
+			s.state.Reservations[i].Revoked = true
+			changed = true
+		}
+	}
+	for i := range s.state.Authorizations {
+		if s.state.Authorizations[i].ID == idOrToken || (tokenHash != "" && s.state.Authorizations[i].TokenHash == tokenHash) {
+			s.state.Authorizations[i].Active = false
+			s.state.Authorizations[i].Revoked = true
 			changed = true
 		}
 	}
@@ -249,6 +426,17 @@ func (s *Store) Revoke(idOrToken string) error {
 			s.state.Bypasses[i].Revoked = true
 			changed = true
 		}
+	}
+	if tokenHash != "" || changed {
+		filtered := s.state.SoftClaims[:0]
+		for _, claim := range s.state.SoftClaims {
+			if claim.ID == idOrToken || claim.AuthorizationID == idOrToken || (tokenHash != "" && claim.TokenHash == tokenHash) {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, claim)
+		}
+		s.state.SoftClaims = filtered
 	}
 	if !changed {
 		return fmt.Errorf("%s not found", idOrToken)
@@ -283,9 +471,38 @@ func (s *Store) Status(now time.Time) (model.Status, error) {
 		status.Tokens = append(status.Tokens, model.TokenView{
 			ID:        token.ID,
 			Name:      token.Name,
+			Mode:      NormalizeTokenMode(token.Mode),
 			CreatedAt: token.CreatedAt,
-			ExpiresAt: token.ExpiresAt,
+			ExpiresAt: timePtrIfSet(token.ExpiresAt),
 			Revoked:   token.Revoked,
+		})
+	}
+	for _, reservation := range s.state.Reservations {
+		if reservation.Active && now.Before(reservation.ExpiresAt) {
+			status.Reservations = append(status.Reservations, model.ReservationView{
+				ID:        reservation.ID,
+				GPU:       reservation.GPU,
+				Holder:    reservation.Holder,
+				CreatedAt: reservation.CreatedAt,
+				ExpiresAt: reservation.ExpiresAt,
+				Active:    reservation.Active,
+				Revoked:   reservation.Revoked,
+			})
+		}
+	}
+	for _, authorization := range s.state.Authorizations {
+		if authorization.Active && !authorizationExpired(authorization, now) {
+			status.Authorizations = append(status.Authorizations, authorizationView(authorization))
+		}
+	}
+	for _, claim := range s.state.SoftClaims {
+		status.SoftClaims = append(status.SoftClaims, model.SoftClaimView{
+			ID:              claim.ID,
+			GPU:             claim.GPU,
+			AuthorizationID: claim.AuthorizationID,
+			Holder:          claim.Holder,
+			CreatedAt:       claim.CreatedAt,
+			UpdatedAt:       claim.UpdatedAt,
 		})
 	}
 	for _, lease := range s.state.Leases {
@@ -294,6 +511,25 @@ func (s *Store) Status(now time.Time) (model.Status, error) {
 		}
 	}
 	return status, nil
+}
+
+func (s *Store) KeyStatus(rootKey string, now time.Time) (model.KeyStatus, error) {
+	if ok, err := s.ValidateRootKey(rootKey); err != nil {
+		return model.KeyStatus{}, err
+	} else if !ok {
+		return model.KeyStatus{}, ErrInvalidRootKey
+	}
+	status, err := s.Status(now)
+	if err != nil {
+		return model.KeyStatus{}, err
+	}
+	return model.KeyStatus{
+		Now:            status.Now,
+		Tokens:         status.Tokens,
+		Reservations:   status.Reservations,
+		Authorizations: status.Authorizations,
+		Bypasses:       status.Bypasses,
+	}, nil
 }
 
 func (s *Store) ReadOrCreateRootKey() (string, error) {
@@ -372,10 +608,81 @@ func appendAuditLog(path string, event model.AuditEvent) error {
 func cloneState(state model.State) model.State {
 	out := model.State{}
 	out.Tokens = append(out.Tokens, state.Tokens...)
+	out.Reservations = append(out.Reservations, state.Reservations...)
+	out.Authorizations = append(out.Authorizations, state.Authorizations...)
+	out.SoftClaims = append(out.SoftClaims, state.SoftClaims...)
 	out.Leases = append(out.Leases, state.Leases...)
 	out.Bypasses = append(out.Bypasses, state.Bypasses...)
 	out.Audit = append(out.Audit, state.Audit...)
 	return out
+}
+
+func newToken(mode, name string, expiresAt time.Time, now time.Time) (string, model.Token) {
+	tokenSecret := "rg_" + randomHex(24)
+	token := model.Token{
+		ID:        "tok_" + randomHex(8),
+		Hash:      HashToken(tokenSecret),
+		Name:      strings.TrimSpace(name),
+		Mode:      NormalizeTokenMode(mode),
+		CreatedAt: now.UTC(),
+		ExpiresAt: expiresAt.UTC(),
+	}
+	if expiresAt.IsZero() {
+		token.ExpiresAt = time.Time{}
+	}
+	if token.Name == "" {
+		token.Name = "anonymous"
+	}
+	return tokenSecret, token
+}
+
+func NormalizeTokenMode(mode string) string {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	switch mode {
+	case "", "soft":
+		return model.TokenModeClaimed
+	case "hard":
+		return model.TokenModeReserved
+	default:
+		return mode
+	}
+}
+
+func authorizationView(authorization model.Authorization) model.AuthorizationView {
+	return model.AuthorizationView{
+		ID:          authorization.ID,
+		Mode:        authorization.Mode,
+		TokenMode:   NormalizeTokenMode(authorization.TokenMode),
+		Holder:      authorization.Holder,
+		UID:         authorization.UID,
+		GID:         authorization.GID,
+		Username:    authorization.Username,
+		GPU:         authorization.GPU,
+		Command:     append([]string(nil), authorization.Command...),
+		RootPID:     authorization.RootPID,
+		ContainerID: authorization.ContainerID,
+		Namespace:   authorization.Namespace,
+		CreatedAt:   authorization.CreatedAt,
+		ExpiresAt:   timePtrIfSet(authorization.ExpiresAt),
+		Active:      authorization.Active,
+		Revoked:     authorization.Revoked,
+	}
+}
+
+func authorizationExpired(authorization model.Authorization, now time.Time) bool {
+	return timeIsSet(authorization.ExpiresAt) && !now.Before(authorization.ExpiresAt)
+}
+
+func timeIsSet(value time.Time) bool {
+	return !value.IsZero()
+}
+
+func timePtrIfSet(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	out := value
+	return &out
 }
 
 func randomHex(bytes int) string {
@@ -388,6 +695,18 @@ func randomHex(bytes int) string {
 
 func NewLeaseID() string {
 	return "lease_" + randomHex(8)
+}
+
+func NewReservationID() string {
+	return "res_" + randomHex(8)
+}
+
+func NewAuthorizationID() string {
+	return "auth_" + randomHex(8)
+}
+
+func NewSoftClaimID() string {
+	return "claim_" + randomHex(8)
 }
 
 func NewBypassID() string {

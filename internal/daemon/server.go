@@ -10,7 +10,9 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -125,12 +127,31 @@ func (s *Server) dispatch(ctx context.Context, p peer, req protocol.Request) (an
 		if err := json.Unmarshal(req.Args, &args); err != nil {
 			return nil, err
 		}
-		secret, token, err := s.Store.RegisterToken(args.RootKey, args.Name, args.TTL, now)
-		if err != nil {
+		if ok, err := s.Store.ValidateRootKey(args.RootKey); err != nil {
 			return nil, err
+		} else if !ok {
+			return nil, store.ErrInvalidRootKey
 		}
-		return model.RegisterResult{Token: secret, ExpiresAt: token.ExpiresAt}, nil
-	case "docker_allow":
+		switch store.NormalizeTokenMode(args.Mode) {
+		case model.TokenModeReserved:
+			if err := s.ensureGPUCanReserve(ctx, args.GPU); err != nil {
+				return nil, err
+			}
+			secret, token, reservation, err := s.Store.RegisterHardReservation(args.RootKey, args.Name, args.GPU, args.TTL, now)
+			if err != nil {
+				return nil, err
+			}
+			return model.RegisterResult{Token: secret, Mode: token.Mode, ReservationID: reservation.ID, GPU: reservation.GPU, ExpiresAt: timePtrIfSet(token.ExpiresAt)}, nil
+		case model.TokenModeClaimed:
+			secret, token, err := s.Store.RegisterSoftToken(args.RootKey, args.Name, now)
+			if err != nil {
+				return nil, err
+			}
+			return model.RegisterResult{Token: secret, Mode: token.Mode}, nil
+		default:
+			return nil, errors.New("mode must be reserved or claimed")
+		}
+	case "docker_allow", "allow_docker":
 		token, tokenHash, err := s.validateToken(req.Token, now)
 		if err != nil {
 			return nil, err
@@ -139,8 +160,8 @@ func (s *Server) dispatch(ctx context.Context, p peer, req protocol.Request) (an
 		if err := json.Unmarshal(req.Args, &args); err != nil {
 			return nil, err
 		}
-		return s.createDockerLease(ctx, token, tokenHash, p, args)
-	case "k8s_allow":
+		return s.createDockerAuthorization(ctx, token, tokenHash, p, args)
+	case "k8s_allow", "allow_k8s":
 		token, tokenHash, err := s.validateToken(req.Token, now)
 		if err != nil {
 			return nil, err
@@ -149,31 +170,37 @@ func (s *Server) dispatch(ctx context.Context, p peer, req protocol.Request) (an
 		if err := json.Unmarshal(req.Args, &args); err != nil {
 			return nil, err
 		}
-		return s.createK8sLease(ctx, token, tokenHash, p, args)
-	case "status":
-		return s.Store.Status(now)
-	case "ps":
-		status, err := s.Store.Status(now)
+		return s.createK8sAuthorization(ctx, token, tokenHash, p, args)
+	case "allow_user":
+		token, tokenHash, err := s.validateToken(req.Token, now)
 		if err != nil {
 			return nil, err
 		}
-		return status.Leases, nil
+		var args protocol.UserAllowArgs
+		if err := json.Unmarshal(req.Args, &args); err != nil {
+			return nil, err
+		}
+		return s.createUserAuthorization(token, tokenHash, p, args)
+	case "status":
+		return s.Store.Status(now)
+	case "ps":
+		return s.ps(ctx, now)
 	case "who":
 		var args protocol.WhoArgs
 		if err := json.Unmarshal(req.Args, &args); err != nil {
 			return nil, err
 		}
-		status, err := s.Store.Status(now)
+		rows, err := s.ps(ctx, now)
 		if err != nil {
 			return nil, err
 		}
-		var leases []model.Lease
-		for _, lease := range status.Leases {
-			if lease.GPU == args.GPU {
-				leases = append(leases, lease)
+		var out []model.PSRow
+		for _, row := range rows {
+			if row.GPU == args.GPU {
+				out = append(out, row)
 			}
 		}
-		return leases, nil
+		return out, nil
 	case "token_info":
 		var args protocol.TokenInfoArgs
 		if len(req.Args) > 0 {
@@ -184,22 +211,32 @@ func (s *Server) dispatch(ctx context.Context, p peer, req protocol.Request) (an
 			token = req.Token
 		}
 		return s.Store.TokenView(token, now)
-	case "bypass_add":
-		if p.UID != 0 {
-			return nil, errors.New("admin command requires uid 0")
+	case "show_keys":
+		var args protocol.RootKeyArgs
+		if err := json.Unmarshal(req.Args, &args); err != nil {
+			return nil, err
 		}
+		return s.Store.KeyStatus(args.RootKey, now)
+	case "bypass_add":
 		var args protocol.BypassAddArgs
 		if err := json.Unmarshal(req.Args, &args); err != nil {
 			return nil, err
 		}
+		if ok, err := s.Store.ValidateRootKey(args.RootKey); err != nil {
+			return nil, err
+		} else if !ok {
+			return nil, store.ErrInvalidRootKey
+		}
 		return s.addBypass(args, now)
 	case "revoke":
-		if p.UID != 0 {
-			return nil, errors.New("admin command requires uid 0")
-		}
 		var args protocol.RevokeArgs
 		if err := json.Unmarshal(req.Args, &args); err != nil {
 			return nil, err
+		}
+		if ok, err := s.Store.ValidateRootKey(args.RootKey); err != nil {
+			return nil, err
+		} else if !ok {
+			return nil, store.ErrInvalidRootKey
 		}
 		return map[string]string{"revoked": args.ID}, s.Store.Revoke(args.ID)
 	default:
@@ -235,40 +272,44 @@ func (s *Server) validateToken(secret string, now time.Time) (model.Token, strin
 	return s.Store.ValidateToken(secret, now)
 }
 
-func (s *Server) createDockerLease(ctx context.Context, token model.Token, tokenHash string, p peer, args protocol.DockerAllowArgs) (model.AllowResult, error) {
-	if args.GPU < 0 {
-		return model.AllowResult{}, errors.New("gpu must be >= 0")
+func (s *Server) createDockerAuthorization(ctx context.Context, token model.Token, tokenHash string, p peer, args protocol.DockerAllowArgs) (model.AllowResult, error) {
+	if err := validateOptionalGPU(args.GPU); err != nil {
+		return model.AllowResult{}, err
+	}
+	if err := s.ensureTokenCanAuthorize(tokenHash, token, time.Now()); err != nil {
+		return model.AllowResult{}, err
 	}
 	containerID, err := s.Runtime.ResolveDockerContainer(ctx, args.Container)
 	if err != nil {
 		return model.AllowResult{}, fmt.Errorf("resolve docker container: %w", err)
 	}
 	now := time.Now()
-	lease := model.Lease{
-		ID:          store.NewLeaseID(),
-		GPU:         args.GPU,
+	authorization := model.Authorization{
+		ID:          store.NewAuthorizationID(),
 		Mode:        model.ModeDocker,
 		TokenHash:   tokenHash,
+		TokenMode:   store.NormalizeTokenMode(token.Mode),
 		Holder:      token.Name,
 		UID:         p.UID,
 		GID:         p.GID,
+		GPU:         args.GPU,
 		ContainerID: containerID,
 		CreatedAt:   now.UTC(),
 		ExpiresAt:   token.ExpiresAt,
 		Active:      true,
 	}
-	if err := s.ensureLeaseCanStart(ctx, lease); err != nil {
+	if err := s.Store.AddAuthorization(authorization); err != nil {
 		return model.AllowResult{}, err
 	}
-	if err := s.Store.AddLease(lease); err != nil {
-		return model.AllowResult{}, err
-	}
-	return model.AllowResult{LeaseID: lease.ID, Mode: lease.Mode, GPU: lease.GPU, ContainerID: containerID, ExpiresAt: lease.ExpiresAt}, nil
+	return model.AllowResult{AuthorizationID: authorization.ID, Mode: authorization.Mode, GPU: authorization.GPU, ContainerID: containerID, ExpiresAt: timePtrIfSet(authorization.ExpiresAt)}, nil
 }
 
-func (s *Server) createK8sLease(ctx context.Context, token model.Token, tokenHash string, p peer, args protocol.K8sAllowArgs) (model.AllowResult, error) {
-	if args.GPU < 0 {
-		return model.AllowResult{}, errors.New("gpu must be >= 0")
+func (s *Server) createK8sAuthorization(ctx context.Context, token model.Token, tokenHash string, p peer, args protocol.K8sAllowArgs) (model.AllowResult, error) {
+	if err := validateOptionalGPU(args.GPU); err != nil {
+		return model.AllowResult{}, err
+	}
+	if err := s.ensureTokenCanAuthorize(tokenHash, token, time.Now()); err != nil {
+		return model.AllowResult{}, err
 	}
 	if strings.TrimSpace(args.Namespace) == "" {
 		return model.AllowResult{}, errors.New("namespace is required")
@@ -279,58 +320,93 @@ func (s *Server) createK8sLease(ctx context.Context, token model.Token, tokenHas
 		}
 	}
 	now := time.Now()
-	lease := model.Lease{
-		ID:        store.NewLeaseID(),
-		GPU:       args.GPU,
+	authorization := model.Authorization{
+		ID:        store.NewAuthorizationID(),
 		Mode:      model.ModeK8s,
 		TokenHash: tokenHash,
+		TokenMode: store.NormalizeTokenMode(token.Mode),
 		Holder:    token.Name,
 		UID:       p.UID,
 		GID:       p.GID,
+		GPU:       args.GPU,
 		Namespace: strings.TrimSpace(args.Namespace),
 		CreatedAt: now.UTC(),
 		ExpiresAt: token.ExpiresAt,
 		Active:    true,
 	}
-	if err := s.ensureLeaseCanStart(ctx, lease); err != nil {
+	if err := s.Store.AddAuthorization(authorization); err != nil {
 		return model.AllowResult{}, err
 	}
-	if err := s.Store.AddLease(lease); err != nil {
+	return model.AllowResult{AuthorizationID: authorization.ID, Mode: authorization.Mode, GPU: authorization.GPU, Namespace: authorization.Namespace, ExpiresAt: timePtrIfSet(authorization.ExpiresAt)}, nil
+}
+
+func (s *Server) createUserAuthorization(token model.Token, tokenHash string, p peer, args protocol.UserAllowArgs) (model.AllowResult, error) {
+	if err := validateOptionalGPU(args.GPU); err != nil {
 		return model.AllowResult{}, err
 	}
-	return model.AllowResult{LeaseID: lease.ID, Mode: lease.Mode, GPU: lease.GPU, Namespace: lease.Namespace, ExpiresAt: lease.ExpiresAt}, nil
+	if err := s.ensureTokenCanAuthorize(tokenHash, token, time.Now()); err != nil {
+		return model.AllowResult{}, err
+	}
+	username := strings.TrimSpace(args.User)
+	if username == "" {
+		return model.AllowResult{}, errors.New("user is required")
+	}
+	uid, err := lookupUID(username)
+	if err != nil {
+		return model.AllowResult{}, err
+	}
+	now := time.Now()
+	authorization := model.Authorization{
+		ID:        store.NewAuthorizationID(),
+		Mode:      model.ModeUser,
+		TokenHash: tokenHash,
+		TokenMode: store.NormalizeTokenMode(token.Mode),
+		Holder:    token.Name,
+		UID:       uid,
+		GID:       p.GID,
+		Username:  username,
+		GPU:       args.GPU,
+		CreatedAt: now.UTC(),
+		ExpiresAt: token.ExpiresAt,
+		Active:    true,
+	}
+	if err := s.Store.AddAuthorization(authorization); err != nil {
+		return model.AllowResult{}, err
+	}
+	return model.AllowResult{AuthorizationID: authorization.ID, Mode: authorization.Mode, GPU: authorization.GPU, Username: authorization.Username, ExpiresAt: timePtrIfSet(authorization.ExpiresAt)}, nil
 }
 
 func (s *Server) runCommand(ctx context.Context, conn net.Conn, reqID string, token model.Token, tokenHash string, p peer, args protocol.RunArgs) (model.RunResult, error) {
-	if args.GPU < 0 {
-		return model.RunResult{}, errors.New("gpu must be >= 0")
+	if err := validateOptionalGPU(args.GPU); err != nil {
+		return model.RunResult{}, err
+	}
+	if err := s.ensureTokenCanAuthorize(tokenHash, token, time.Now()); err != nil {
+		return model.RunResult{}, err
 	}
 	if len(args.Command) == 0 {
 		return model.RunResult{}, errors.New("command is required")
 	}
 	now := time.Now()
-	lease := model.Lease{
-		ID:        store.NewLeaseID(),
-		GPU:       args.GPU,
+	authorization := model.Authorization{
+		ID:        store.NewAuthorizationID(),
 		Mode:      model.ModeBare,
 		TokenHash: tokenHash,
+		TokenMode: store.NormalizeTokenMode(token.Mode),
 		Holder:    token.Name,
 		UID:       p.UID,
 		GID:       p.GID,
+		GPU:       args.GPU,
 		Command:   args.Command,
 		CreatedAt: now.UTC(),
 		ExpiresAt: token.ExpiresAt,
 		Active:    true,
 	}
-	if err := s.ensureLeaseCanStart(ctx, lease); err != nil {
-		return model.RunResult{}, err
-	}
-	cgroupPath, cgroupRel, err := s.createCgroup(lease.ID)
+	cgroupPath, cgroupRel, err := s.createCgroup(authorization.ID)
 	if err != nil {
 		return model.RunResult{}, err
 	}
-	lease.CgroupPath = cgroupPath
-	lease.CgroupRel = cgroupRel
+	authorization.CgroupPath = cgroupPath
+	authorization.CgroupRel = cgroupRel
 	cmd := exec.CommandContext(ctx, args.Command[0], args.Command[1:]...)
 	cmd.Dir = args.Workdir
 	cmd.Env = commandEnv(args.Env)
@@ -350,12 +426,12 @@ func (s *Server) runCommand(ctx context.Context, conn net.Conn, reqID string, to
 	if err := cmd.Start(); err != nil {
 		return model.RunResult{}, err
 	}
-	lease.RootPID = cmd.Process.Pid
-	if err := s.movePIDToCgroup(cgroupPath, lease.RootPID); err != nil {
+	authorization.RootPID = cmd.Process.Pid
+	if err := s.movePIDToCgroup(cgroupPath, authorization.RootPID); err != nil {
 		_ = cmd.Process.Kill()
 		return model.RunResult{}, err
 	}
-	if err := s.Store.AddLease(lease); err != nil {
+	if err := s.Store.AddAuthorization(authorization); err != nil {
 		_ = cmd.Process.Kill()
 		return model.RunResult{}, err
 	}
@@ -366,46 +442,173 @@ func (s *Server) runCommand(ctx context.Context, conn net.Conn, reqID string, to
 	go streamCopy(&wg, &writeMu, conn, reqID, protocol.KindStderr, stderr)
 	waitErr := cmd.Wait()
 	wg.Wait()
-	_ = s.Store.ReleaseLease(lease.ID)
+	_ = s.Store.ReleaseAuthorization(authorization.ID)
 	_ = os.Remove(cgroupPath)
 	exitCode := 0
 	if cmd.ProcessState != nil {
 		exitCode = cmd.ProcessState.ExitCode()
 	}
 	if waitErr != nil && exitCode == 0 {
-		return model.RunResult{LeaseID: lease.ID, ExitCode: exitCode}, waitErr
+		return model.RunResult{AuthorizationID: authorization.ID, ExitCode: exitCode}, waitErr
 	}
-	return model.RunResult{LeaseID: lease.ID, ExitCode: exitCode}, nil
+	return model.RunResult{AuthorizationID: authorization.ID, ExitCode: exitCode}, nil
 }
 
-func (s *Server) ensureLeaseCanStart(ctx context.Context, tentative model.Lease) error {
-	status, err := s.Store.Status(time.Now())
-	if err != nil {
-		return err
-	}
-	for _, lease := range status.Leases {
-		if lease.GPU == tentative.GPU {
-			return fmt.Errorf("gpu %d already held by lease %s", tentative.GPU, lease.ID)
-		}
+func (s *Server) ensureGPUCanReserve(ctx context.Context, gpu int) error {
+	if gpu < 0 {
+		return errors.New("gpu must be >= 0")
 	}
 	state, err := s.Store.Snapshot()
 	if err != nil {
 		return err
+	}
+	now := time.Now()
+	for _, reservation := range state.Reservations {
+		if reservation.GPU == gpu && reservation.Active && !reservation.Revoked && now.Before(reservation.ExpiresAt) {
+			return fmt.Errorf("gpu %d already reserved by %s", gpu, reservation.ID)
+		}
+	}
+	for _, lease := range state.Leases {
+		if lease.GPU == gpu && lease.Active && now.Before(lease.ExpiresAt) {
+			return fmt.Errorf("gpu %d already held by legacy lease %s", gpu, lease.ID)
+		}
 	}
 	processes, err := s.AMD.Processes(ctx)
 	if err != nil {
 		return fmt.Errorf("amd-smi process list: %w", err)
 	}
 	auth := s.authorizer()
-	busy, err := auth.BusyProcessesForLease(ctx, state, processes, &tentative)
+	busy, err := auth.BusyProcessesForGPU(ctx, state, processes, gpu)
 	if err != nil {
 		return err
 	}
 	if len(busy) > 0 {
 		first := busy[0]
-		return fmt.Errorf("gpu %d is busy: pid=%d cmd=%s", tentative.GPU, first.Process.PID, strings.Join(first.Info.Cmdline, " "))
+		return fmt.Errorf("gpu %d is busy: pid=%d cmd=%s", gpu, first.Process.PID, strings.Join(first.Info.Cmdline, " "))
 	}
 	return nil
+}
+
+func (s *Server) ensureTokenCanAuthorize(tokenHash string, token model.Token, now time.Time) error {
+	if store.NormalizeTokenMode(token.Mode) != model.TokenModeReserved {
+		return nil
+	}
+	state, err := s.Store.Snapshot()
+	if err != nil {
+		return err
+	}
+	for _, reservation := range state.Reservations {
+		if reservation.TokenHash == tokenHash && reservation.Active && !reservation.Revoked && now.Before(reservation.ExpiresAt) {
+			return nil
+		}
+	}
+	return errors.New("reserved token has no active reservation")
+}
+
+func (s *Server) ps(ctx context.Context, now time.Time) ([]model.PSRow, error) {
+	state, err := s.Store.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	processes, err := s.AMD.Processes(ctx)
+	if err != nil {
+		processes = nil
+	}
+	auth := s.authorizer()
+	auth.DryRun = true
+	auth.Killer = nil
+	auth.OnAudit = nil
+	decisions, err := auth.Enforce(ctx, state, processes)
+	if err != nil {
+		return nil, err
+	}
+	var rows []model.PSRow
+	liveHard := map[string]bool{}
+	for _, decision := range decisions {
+		if decision.Action != "allow" || decision.Reason == "bypass" {
+			continue
+		}
+		id := decision.AuthID
+		if id == "" {
+			id = decision.LeaseID
+		}
+		if id == "" {
+			continue
+		}
+		holder := strings.TrimSpace(decision.Holder)
+		if holder == "" {
+			holder = "unknown"
+		}
+		command := strings.Join(decision.Info.Cmdline, " ")
+		if command == "" {
+			command = decision.Process.Name
+		}
+		if command == "" {
+			command = fmt.Sprintf("pid %d", decision.Process.PID)
+		}
+		rows = append(rows, model.PSRow{
+			ID:      fmt.Sprintf("%s/%d", id, decision.Process.PID),
+			GPU:     decision.Process.GPU,
+			User:    holder,
+			Command: command,
+		})
+		if decision.TokenHash != "" {
+			liveHard[reservationLiveKey(decision.Process.GPU, decision.TokenHash)] = true
+		}
+	}
+	for _, reservation := range state.Reservations {
+		if !reservation.Active || reservation.Revoked || !now.Before(reservation.ExpiresAt) || liveHard[reservationLiveKey(reservation.GPU, reservation.TokenHash)] {
+			continue
+		}
+		rows = append(rows, model.PSRow{
+			ID:      reservation.ID,
+			GPU:     reservation.GPU,
+			User:    reservation.Holder,
+			Command: "reserved until " + reservation.ExpiresAt.Format(time.RFC3339),
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].GPU != rows[j].GPU {
+			return rows[i].GPU < rows[j].GPU
+		}
+		return rows[i].ID < rows[j].ID
+	})
+	return rows, nil
+}
+
+func validateOptionalGPU(gpu *int) error {
+	if gpu != nil && *gpu < 0 {
+		return errors.New("gpu must be >= 0")
+	}
+	return nil
+}
+
+func lookupUID(username string) (int, error) {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return -1, err
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return -1, err
+	}
+	return uid, nil
+}
+
+func reservationLiveKey(gpu int, tokenHash string) string {
+	return fmt.Sprintf("%d:%s", gpu, tokenHash)
+}
+
+func timeIsSet(value time.Time) bool {
+	return !value.IsZero()
+}
+
+func timePtrIfSet(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	out := value
+	return &out
 }
 
 func (s *Server) addBypass(args protocol.BypassAddArgs, now time.Time) (model.BypassRule, error) {
@@ -459,6 +662,9 @@ func (s *Server) monitor(ctx context.Context) {
 }
 
 func (s *Server) monitorOnce(ctx context.Context) {
+	s.cleanupExpiredReservations()
+	s.cleanupExpiredAuthorizations()
+	s.cleanupFinishedBareAuthorizations()
 	s.cleanupExpiredLeases()
 	s.cleanupFinishedBareLeases()
 	state, err := s.Store.Snapshot()
@@ -470,7 +676,84 @@ func (s *Server) monitorOnce(ctx context.Context) {
 		_ = s.Store.AppendAudit(model.AuditEvent{Time: time.Now().UTC(), Kind: "error", Message: "amd-smi process list failed: " + err.Error()})
 		return
 	}
-	_, _ = s.authorizer().Enforce(ctx, state, processes)
+	decisions, _ := s.authorizer().Enforce(ctx, state, processes)
+	now := time.Now()
+	for _, decision := range decisions {
+		switch decision.Action {
+		case "claim":
+			_ = s.Store.UpsertSoftClaim(decision.Claim, now)
+		case "release_claim":
+			_ = s.Store.ReleaseSoftClaim(decision.ClaimID)
+		}
+	}
+}
+
+func (s *Server) cleanupFinishedBareAuthorizations() {
+	state, err := s.Store.Snapshot()
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, authorization := range state.Authorizations {
+		if !authorization.Active || authorization.Mode != model.ModeBare || authorization.RootPID <= 0 {
+			continue
+		}
+		if s.Proc != nil && s.Proc.Exists(authorization.RootPID) {
+			continue
+		}
+		if authorization.CgroupPath != "" && !cgroupEmpty(authorization.CgroupPath) {
+			continue
+		}
+		_ = s.Store.ReleaseAuthorization(authorization.ID)
+		if authorization.CgroupPath != "" {
+			_ = os.Remove(authorization.CgroupPath)
+		}
+		_ = s.Store.AppendAudit(model.AuditEvent{
+			Time:    now.UTC(),
+			Kind:    "authorization_released",
+			Message: "bare authorization released after process exit",
+			LeaseID: authorization.ID,
+			User:    authorization.Holder,
+		})
+	}
+}
+
+func (s *Server) cleanupExpiredAuthorizations() {
+	state, err := s.Store.Snapshot()
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, authorization := range state.Authorizations {
+		if !authorization.Active || !timeIsSet(authorization.ExpiresAt) || now.Before(authorization.ExpiresAt) {
+			continue
+		}
+		if authorization.RootPID > 0 {
+			_ = syscall.Kill(-authorization.RootPID, syscall.SIGTERM)
+			time.Sleep(500 * time.Millisecond)
+			_ = syscall.Kill(-authorization.RootPID, syscall.SIGKILL)
+		}
+		_ = s.Store.ReleaseAuthorization(authorization.ID)
+		if authorization.CgroupPath != "" {
+			_ = os.Remove(authorization.CgroupPath)
+		}
+		_ = s.Store.AppendAudit(model.AuditEvent{Time: now.UTC(), Kind: "authorization_expired", Message: "authorization expired", LeaseID: authorization.ID, User: authorization.Holder})
+	}
+}
+
+func (s *Server) cleanupExpiredReservations() {
+	state, err := s.Store.Snapshot()
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, reservation := range state.Reservations {
+		if !reservation.Active || now.Before(reservation.ExpiresAt) {
+			continue
+		}
+		_ = s.Store.ReleaseReservation(reservation.ID)
+		_ = s.Store.AppendAudit(model.AuditEvent{Time: now.UTC(), Kind: "reservation_expired", Message: "reserved GPU reservation expired", GPU: reservation.GPU, LeaseID: reservation.ID, User: reservation.Holder})
+	}
 }
 
 func (s *Server) cleanupFinishedBareLeases() {
@@ -532,6 +815,7 @@ func (s *Server) authorizer() enforce.Authorizer {
 		Proc:    s.Proc,
 		Runtime: s.Runtime,
 		Killer:  s.Killer,
+		DryRun:  s.Cfg.DryRun,
 		OnAudit: func(event model.AuditEvent) {
 			_ = s.Store.AppendAudit(event)
 		},

@@ -9,7 +9,6 @@ import time
 def parse_args():
     parser = argparse.ArgumentParser(description="Hold one or more AMD/ROCm GPUs with PyTorch.")
     parser.add_argument(
-        "--gpu",
         "--gpus",
         dest="gpu_values",
         action="append",
@@ -18,8 +17,15 @@ def parse_args():
     parser.add_argument("--mem-mb", type=int, default=1024, help="Approximate VRAM to allocate per GPU.")
     parser.add_argument("--duration", type=int, default=0, help="Seconds to run; 0 means forever.")
     parser.add_argument("--matrix", type=int, default=2048, help="Square matrix size for compute loop.")
+    parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between compute iterations.")
     args = parser.parse_args()
     args.gpus = parse_gpus(args.gpu_values)
+    if args.mem_mb <= 0:
+        raise SystemExit("--mem-mb must be positive")
+    if args.matrix <= 0:
+        raise SystemExit("--matrix must be positive")
+    if args.sleep < 0:
+        raise SystemExit("--sleep must be >= 0")
     return args
 
 
@@ -84,7 +90,7 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    chunk_mb = 256
+    chunk_mb = min(64, args.mem_mb)
     element_size = torch.empty((), dtype=torch.float32, device="cuda:0").element_size()
     elems_per_chunk = chunk_mb * 1024 * 1024 // element_size
     chunks = max(1, (args.mem_mb + chunk_mb - 1) // chunk_mb)
@@ -118,6 +124,8 @@ def main():
         for holder in holders:
             holder["a"] = (holder["a"] @ holder["b"]).relu()
         iterations += 1
+        if args.sleep:
+            time.sleep(args.sleep)
         if iterations % 10 == 0:
             for holder in holders:
                 torch.cuda.synchronize(holder["device"])

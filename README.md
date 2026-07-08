@@ -1,19 +1,23 @@
 # Rocguard
 
 Rocguard is a local AMD GPU guard for shared Linux servers. It provides a root
-daemon plus a small CLI wrapper so users can run GPU workloads only through an
-active lease.
+daemon plus a small CLI wrapper so users can run GPU workloads through
+root-authorized reserved or claimed-mode keys.
 
-The v1 enforcement model is intentionally simple:
+The enforcement model is intentionally simple:
 
 - `rocguardd` monitors AMD GPU process ownership with `amd-smi process --json`.
-- A GPU is enforced only while it has an active Rocguard lease.
-- If a GPU has no active Rocguard lease, Rocguard ignores that GPU and never
-  kills existing workloads there.
-- While a GPU is leased, processes that do not match the lease or a bypass rule
-  are terminated.
+- `reserved` registration reserves a GPU before use. While the reservation is
+  active, non-bypassed processes on that GPU must match an authorization for
+  the reservation token.
+- `claimed` registration creates a non-expiring key. A claimed-mode
+  authorization claims a GPU only after an authorized process is observed on an
+  otherwise clean GPU.
+- If a claimed-mode process appears on a GPU that already has unrelated
+  processes, Rocguard leaves the GPU unclaimed and does not kill those existing
+  workloads.
 
-This is monitor-kill enforcement, not hard device isolation. Users with root,
+This is monitor-kill enforcement, not kernel device isolation. Users with root,
 sudo, or root-equivalent Docker access can bypass it.
 
 ## Requirements
@@ -44,13 +48,16 @@ sudo ./rocguard daemon
 In another terminal, create or show the local root key:
 
 ```bash
-sudo ./rocguard show-key
+sudo ./rocguard show-root-key
 ```
 
-Register a user token:
+The old `show-key` command is kept as a compatibility alias. Only UID 0 can
+show or create the root key.
+
+Register a claimed-mode key:
 
 ```bash
-./rocguard register
+./rocguard register --claimed
 ```
 
 The command prompts for:
@@ -58,18 +65,35 @@ The command prompts for:
 ```text
 Root key:
 Name:
+```
+
+Or reserve a GPU with a reserved key:
+
+```bash
+./rocguard register --reserved
+```
+
+Reserved registration prompts for:
+
+```text
+Root key:
+Name:
+GPU:
 TTL [2h]:
 ```
+
+Reserved TTL is capped at 8 hours.
 
 Use the returned token to run a GPU command:
 
 ```bash
-KEY=rg_xxx ./rocguard run --gpu 0 -- python train.py
+KEY=rg_xxx ./rocguard run -- python train.py
 ```
 
-The `--gpu` flag tells the daemon which host GPU to lease and monitor. Rocguard
-does not set `HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, or similar GPU
-visibility variables for the wrapped command.
+The deprecated `--gpu` flag is still accepted to limit an authorization to one
+host GPU for older scripts. Rocguard does not set `HIP_VISIBLE_DEVICES`,
+`ROCR_VISIBLE_DEVICES`, or similar GPU visibility variables for the wrapped
+command.
 
 Check current state:
 
@@ -78,36 +102,67 @@ Check current state:
 ./rocguard ps
 ./rocguard who --gpu 0
 KEY=rg_xxx ./rocguard token info
+ROOT_KEY=rk_xxx ./rocguard show-keys
+```
+
+`rocguard ps` prints a table with `id`, `gpu`, `user`, and `command`. Idle
+reserved GPU reservations appear as `reserved until <timestamp>`.
+
+Admin commands that need the root key read it from `ROOT_KEY` or prompt for it.
+
+## Command Reference
+
+```text
+rocguard daemon [--dry-run]
+sudo rocguard show-root-key
+rocguard show-keys
+rocguard register (--reserved | --claimed)
+KEY=... rocguard run [--gpu <id>] -- <command>
+KEY=... rocguard allow docker [--gpu <id>] --container <name-or-id>
+KEY=... rocguard allow k8s [--gpu <id>] --namespace <name>
+KEY=... rocguard allow user [--gpu <id>] --user <name>
+rocguard bypass add (--pid <pid> | --command <path> --uid <uid>) --ttl <duration> --reason <text>
+rocguard revoke <token-or-reservation-or-authorization-or-bypass-id>
 ```
 
 ## Docker Mode
 
-Authorize a specific Docker container for a GPU:
+Authorize a specific Docker container:
 
 ```bash
-KEY=rg_xxx ./rocguard docker allow --gpu 0 --container trainer
+KEY=rg_xxx ./rocguard allow docker --container trainer
 ```
 
-Rocguard resolves the container name to an immutable container ID at lease
-creation time. The mutable container name is not trusted during enforcement.
+Rocguard resolves the container name to an immutable container ID at
+authorization time. The mutable container name is not trusted during
+enforcement. The old `rocguard docker allow [--gpu <id>] --container ...`
+alias is still accepted.
 
 For this to be meaningful, regular users should not have direct access to the
 Docker socket. Membership in the `docker` group is effectively root-equivalent.
 
 ## Kubernetes Mode
 
-Authorize a Kubernetes namespace for a GPU:
+Authorize a Kubernetes namespace:
 
 ```bash
-KEY=rg_xxx ./rocguard k8s allow --gpu 0 --namespace training
+KEY=rg_xxx ./rocguard allow k8s --namespace training
 ```
 
 Rocguard maps GPU PIDs to container IDs and then to Kubernetes namespaces using
-`crictl inspect` first, with `kubectl get pod -A -o json` as a fallback. If
-neither runtime path is available, Kubernetes lease creation fails.
+`crictl inspect` first, with `kubectl get pod -A -o json` as a fallback. The
+old `rocguard k8s allow [--gpu <id>] --namespace ...` alias is still accepted.
 
 Namespace-level authorization is broad: any pod in that namespace can match the
-lease for the selected GPU.
+authorization.
+
+## User Mode
+
+Authorize all processes for one Linux user:
+
+```bash
+KEY=rg_xxx ./rocguard allow user --user alice
+```
 
 ## Bypass Rules
 
@@ -116,27 +171,27 @@ Bypass rules are intended for trusted host agents such as GPU metrics daemons.
 Bypass one PID:
 
 ```bash
-sudo ./rocguard bypass add --pid 1234 --ttl 24h --reason gpuagent
+ROOT_KEY=rk_xxx ./rocguard bypass add --pid 1234 --ttl 24h --reason gpuagent
 ```
 
 Bypass a command path for a specific UID:
 
 ```bash
-sudo ./rocguard bypass add --command /usr/bin/gpuagent --uid 0 --ttl 24h --reason gpuagent
+ROOT_KEY=rk_xxx ./rocguard bypass add --command /usr/bin/gpuagent --uid 0 --ttl 24h --reason gpuagent
 ```
 
 Bypasses expire automatically when their TTL ends.
 
 ## Revoke
 
-Revoke a token, lease, or bypass ID:
+Revoke a token, reservation, authorization, or bypass ID:
 
 ```bash
-sudo ./rocguard revoke <token-or-lease-id>
+ROOT_KEY=rk_xxx ./rocguard revoke <id>
 ```
 
-Revoking a lease stops enforcement for that GPU after the lease is marked
-inactive.
+Revoking a token also disables reservations, authorizations, and claimed GPUs
+created by that token.
 
 ## Runtime Paths
 
@@ -147,7 +202,7 @@ Defaults:
 /var/lib/rocguard/state.json
 /var/lib/rocguard/root.key
 /var/log/rocguard/audit.log
-/sys/fs/cgroup/rocguard/lease_<id>
+/sys/fs/cgroup/rocguard/auth_<id>
 ```
 
 Environment overrides:
@@ -159,6 +214,7 @@ ROCGUARD_ROOT_KEY
 ROCGUARD_AUDIT_LOG
 ROCGUARD_CGROUP_ROOT
 ROCGUARD_PROC_ROOT
+ROCGUARD_DRY_RUN
 ```
 
 These are useful for local testing without writing to `/var` or `/run`.
@@ -177,27 +233,77 @@ Build:
 GOCACHE=/tmp/rocguard-go-build go build -buildvcs=false -o rocguard ./cmd/rocguard
 ```
 
-Run a non-root smoke test for root-key creation with temporary paths:
+Run a root-key smoke test with temporary paths:
 
 ```bash
-ROCGUARD_ROOT_KEY=/tmp/rocguard/root.key \
-ROCGUARD_STATE=/tmp/rocguard/state.json \
-ROCGUARD_AUDIT_LOG=/tmp/rocguard/audit.log \
-./rocguard show-key
+sudo env \
+  ROCGUARD_ROOT_KEY=/tmp/rocguard/root.key \
+  ROCGUARD_STATE=/tmp/rocguard/state.json \
+  ROCGUARD_AUDIT_LOG=/tmp/rocguard/audit.log \
+  ./rocguard show-root-key
 ```
+
+Run light bare-metal integration tests:
+
+```bash
+KEY=rg_xxx ROOT_KEY=rk_xxx ./scripts/integration_test.py --gpus 2,3
+```
+
+The integration runner:
+
+- auto-bypasses pre-existing AMD SMI PIDs on the selected GPUs;
+- uses small allocations and sleeps between compute iterations;
+- tests multi-GPU `hold_gpu.py`;
+- tests child GPU processes staying authorized inside the Rocguard cgroup.
+
+Optional Docker test, using a ROCm/PyTorch image that already has Python and
+Torch:
+
+```bash
+KEY=rg_xxx ROOT_KEY=rk_xxx ./scripts/integration_test.py \
+  --gpus 2 \
+  --docker-image <rocm-pytorch-image>
+```
+
+Optional Kubernetes test:
+
+```bash
+KEY=rg_xxx ROOT_KEY=rk_xxx ./scripts/integration_test.py \
+  --gpus 2 \
+  --k8s-namespace training \
+  --k8s-image <rocm-pytorch-image> \
+  --k8s-gpu-resource amd.com/gpu
+```
+
+The script needs `ROOT_KEY` for auto-bypass setup and cleanup revoke calls.
+Pass `--no-auto-bypass` only when you have already confirmed the selected GPUs
+have no unrelated workloads or you intentionally want to skip that safety step.
 
 ## Safety Notes
 
 Do not test Rocguard on a production GPU with active workloads unless you are
-ready for unauthorized processes on a leased GPU to be killed.
+ready for unauthorized processes on a reserved or claimed GPU to be killed.
 
 The safest first test is:
 
 1. Pick an idle GPU.
-2. Start `sudo ./rocguard daemon`.
-3. Register a short-lived token.
-4. Run one known command with `KEY=... ./rocguard run --gpu <id> -- ...`.
+2. Start the daemon in dry-run mode with temporary paths:
+
+   ```bash
+   sudo env \
+     ROCGUARD_SOCKET=/tmp/rocguard.sock \
+     ROCGUARD_STATE=/tmp/rocguard/state.json \
+     ROCGUARD_ROOT_KEY=/tmp/rocguard/root.key \
+     ROCGUARD_AUDIT_LOG=/tmp/rocguard/audit.log \
+     ROCGUARD_CGROUP_ROOT=/tmp/rocguard/cgroup \
+     ./rocguard daemon --dry-run
+   ```
+
+3. Register a short-lived reserved token for that idle GPU.
+4. Run one known command with `KEY=... ./rocguard run -- ...`.
 5. Confirm `./rocguard ps` and audit output.
+6. Restart the daemon without `--dry-run` only after the dry-run decisions look
+   correct.
 
 Rocguard does not currently configure Linux device permissions, ROCm device
 ACLs, or container runtime isolation. It detects and kills unauthorized GPU
