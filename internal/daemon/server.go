@@ -39,6 +39,8 @@ type Server struct {
 	Interval time.Duration
 }
 
+const openPath = 0x200000
+
 type peer struct {
 	PID    int
 	UID    int
@@ -398,6 +400,30 @@ func hasWildcard(value string) bool {
 	return strings.Contains(value, "*")
 }
 
+func prepareRunCommand(ctx context.Context, args protocol.RunArgs, p peer, useCgroupFD bool, cgroupFD int) (*exec.Cmd, io.ReadCloser, io.ReadCloser, error) {
+	cmd := exec.CommandContext(ctx, args.Command[0], args.Command[1:]...)
+	cmd.Dir = args.Workdir
+	cmd.Env = commandEnv(args.Env)
+	sys := &syscall.SysProcAttr{Setpgid: true}
+	if useCgroupFD {
+		sys.UseCgroupFD = true
+		sys.CgroupFD = cgroupFD
+	}
+	if os.Geteuid() == 0 && p.UID >= 0 && p.GID >= 0 {
+		sys.Credential = &syscall.Credential{Uid: uint32(p.UID), Gid: uint32(p.GID), Groups: p.Groups}
+	}
+	cmd.SysProcAttr = sys
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return cmd, stdout, stderr, nil
+}
+
 func (s *Server) runCommand(ctx context.Context, conn net.Conn, reqID string, token model.Token, tokenHash string, p peer, args protocol.RunArgs) (model.RunResult, error) {
 	if err := s.ensureTokenCanAuthorize(tokenHash, token, time.Now()); err != nil {
 		return model.RunResult{}, err
@@ -425,27 +451,45 @@ func (s *Server) runCommand(ctx context.Context, conn net.Conn, reqID string, to
 	}
 	authorization.CgroupPath = cgroupPath
 	authorization.CgroupRel = cgroupRel
-	cmd := exec.CommandContext(ctx, args.Command[0], args.Command[1:]...)
-	cmd.Dir = args.Workdir
-	cmd.Env = commandEnv(args.Env)
-	sys := &syscall.SysProcAttr{Setpgid: true}
-	if os.Geteuid() == 0 && p.UID >= 0 && p.GID >= 0 {
-		sys.Credential = &syscall.Credential{Uid: uint32(p.UID), Gid: uint32(p.GID), Groups: p.Groups}
-	}
-	cmd.SysProcAttr = sys
-	stdout, err := cmd.StdoutPipe()
+	cgroupFD, useCgroupFD, err := openCgroupFD(cgroupPath)
 	if err != nil {
 		return model.RunResult{}, err
 	}
-	stderr, err := cmd.StderrPipe()
+	closeCgroupFD := func() {
+		if cgroupFD >= 0 {
+			_ = syscall.Close(cgroupFD)
+			cgroupFD = -1
+		}
+	}
+	defer closeCgroupFD()
+
+	cmd, stdout, stderr, err := prepareRunCommand(ctx, args, p, useCgroupFD, cgroupFD)
 	if err != nil {
 		return model.RunResult{}, err
 	}
+	startedWithCgroupFD := useCgroupFD
 	if err := cmd.Start(); err != nil {
-		return model.RunResult{}, err
+		if !useCgroupFD {
+			return model.RunResult{}, err
+		}
+		closeCgroupFD()
+		cmd, stdout, stderr, err = prepareRunCommand(ctx, args, p, false, -1)
+		if err != nil {
+			return model.RunResult{}, err
+		}
+		startedWithCgroupFD = false
+		if err := cmd.Start(); err != nil {
+			return model.RunResult{}, err
+		}
+	}
+	if startedWithCgroupFD {
+		closeCgroupFD()
 	}
 	authorization.RootPID = cmd.Process.Pid
-	if err := s.movePIDToCgroup(cgroupPath, authorization.RootPID); err != nil {
+	if !startedWithCgroupFD {
+		err = s.movePIDToCgroup(cgroupPath, authorization.RootPID)
+	}
+	if err != nil {
 		_ = cmd.Process.Kill()
 		return model.RunResult{}, err
 	}
@@ -860,6 +904,20 @@ func (s *Server) createCgroup(leaseID string) (string, string, error) {
 		rel = filepath.Join(filepath.Base(s.Cfg.CgroupRoot), leaseID)
 	}
 	return path, filepath.ToSlash(rel), nil
+}
+
+func openCgroupFD(cgroupPath string) (int, bool, error) {
+	if _, err := os.Stat(filepath.Join(cgroupPath, "cgroup.procs")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return -1, false, nil
+		}
+		return -1, false, err
+	}
+	fd, err := syscall.Open(cgroupPath, openPath, 0)
+	if err != nil {
+		return -1, false, &os.PathError{Op: "open", Path: cgroupPath, Err: err}
+	}
+	return fd, true, nil
 }
 
 func (s *Server) movePIDToCgroup(cgroupPath string, pid int) error {

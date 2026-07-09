@@ -7,6 +7,15 @@ import sys
 import time
 
 
+def install_fast_exit_handlers():
+    def handle_signal(signum, _frame):
+        print(f"received signal {signum}; exiting immediately", file=sys.stderr, flush=True)
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Hold one or more AMD/ROCm GPUs with PyTorch.")
     parser.add_argument(
@@ -65,6 +74,8 @@ def main():
     if args.children > 0:
         return spawn_children(args)
 
+    install_fast_exit_handlers()
+
     # Must be set before importing torch. PyTorch on ROCm still uses torch.cuda.
     visible_gpus = ",".join(str(gpu) for gpu in args.gpus)
     os.environ["HIP_VISIBLE_DEVICES"] = visible_gpus
@@ -86,15 +97,6 @@ def main():
             file=sys.stderr,
         )
         return 1
-
-    stop = False
-
-    def handle_signal(_signum, _frame):
-        nonlocal stop
-        stop = True
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
 
     chunk_mb = min(64, args.mem_mb)
     element_size = torch.empty((), dtype=torch.float32, device="cuda:0").element_size()
@@ -126,7 +128,7 @@ def main():
     deadline = None if args.duration <= 0 else time.monotonic() + args.duration
 
     iterations = 0
-    while not stop and (deadline is None or time.monotonic() < deadline):
+    while deadline is None or time.monotonic() < deadline:
         for holder in holders:
             holder["a"] = (holder["a"] @ holder["b"]).relu()
         iterations += 1
@@ -167,6 +169,36 @@ def spawn_children(args):
         print(f"starting child {idx + 1}/{args.children}: {' '.join(cmd)}", flush=True)
         children.append(subprocess.Popen(cmd))
 
+    def stop_children():
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+        deadline = time.monotonic() + 2
+        for child in children:
+            if child.poll() is not None:
+                continue
+            timeout = max(0.0, deadline - time.monotonic())
+            try:
+                child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+        for child in children:
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def handle_signal(signum, _frame):
+        print(f"received signal {signum}; stopping children", file=sys.stderr, flush=True)
+        stop_children()
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
     exit_code = 0
     try:
         for child in children:
@@ -174,10 +206,7 @@ def spawn_children(args):
             if rc != 0 and exit_code == 0:
                 exit_code = rc
     except KeyboardInterrupt:
-        for child in children:
-            child.terminate()
-        for child in children:
-            child.wait()
+        stop_children()
         return 130
     return exit_code
 

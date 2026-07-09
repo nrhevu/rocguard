@@ -32,14 +32,37 @@ func (k RealKiller) Kill(info model.ProcInfo, message string) error {
 	if grace <= 0 {
 		grace = 2 * time.Second
 	}
-	time.Sleep(grace)
-	if err := syscall.Kill(info.PID, 0); err != nil {
+	if waitForProcessExit(info.PID, grace) {
 		return nil
 	}
 	if err := syscall.Kill(info.PID, syscall.SIGKILL); err != nil && !isNoSuchProcess(err) {
 		return err
 	}
+	_ = waitForProcessExit(info.PID, 500*time.Millisecond)
 	return nil
+}
+
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !processAlive(pid) {
+			return true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		sleep := 100 * time.Millisecond
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+	}
+}
+
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || !isNoSuchProcess(err)
 }
 
 type Authorizer struct {
