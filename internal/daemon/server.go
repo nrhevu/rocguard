@@ -109,7 +109,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		}
 		if req.Method == "run" {
 			s.handleRun(ctx, conn, p, req)
-			continue
+			return
 		}
 		result, err := s.dispatch(ctx, p, req)
 		if err != nil {
@@ -272,13 +272,33 @@ func (s *Server) handleRun(ctx context.Context, conn net.Conn, p peer, req proto
 		writeResult(conn, protocol.Response{ID: req.ID, Kind: protocol.KindResult, OK: false, Error: err.Error()})
 		return
 	}
-	result, err := s.runCommand(ctx, conn, req.ID, token, tokenHash, p, args)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go cancelOnConnClose(runCtx, conn, cancel)
+	result, err := s.runCommand(runCtx, conn, req.ID, token, tokenHash, p, args)
 	if err != nil {
 		writeResult(conn, protocol.Response{ID: req.ID, Kind: protocol.KindResult, OK: false, Error: err.Error()})
 		return
 	}
 	data, _ := json.Marshal(result)
 	writeResult(conn, protocol.Response{ID: req.ID, Kind: protocol.KindResult, OK: true, Result: data})
+}
+
+func cancelOnConnClose(ctx context.Context, conn net.Conn, cancel context.CancelFunc) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-done:
+		}
+		_ = conn.SetReadDeadline(time.Now())
+	}()
+	var one [1]byte
+	_, _ = conn.Read(one[:])
+	close(done)
+	if ctx.Err() == nil {
+		cancel()
+	}
 }
 
 func (s *Server) validateToken(secret string, now time.Time) (model.Token, string, error) {
@@ -404,6 +424,10 @@ func prepareRunCommand(ctx context.Context, args protocol.RunArgs, p peer, useCg
 	cmd := exec.CommandContext(ctx, args.Command[0], args.Command[1:]...)
 	cmd.Dir = args.Workdir
 	cmd.Env = commandEnv(args.Env)
+	cmd.Cancel = func() error {
+		return terminateProcessGroup(cmd.Process)
+	}
+	cmd.WaitDelay = 3 * time.Second
 	sys := &syscall.SysProcAttr{Setpgid: true}
 	if useCgroupFD {
 		sys.UseCgroupFD = true
@@ -422,6 +446,36 @@ func prepareRunCommand(ctx context.Context, args protocol.RunArgs, p peer, useCg
 		return nil, nil, nil, err
 	}
 	return cmd, stdout, stderr, nil
+}
+
+func terminateProcessGroup(process *os.Process) error {
+	if process == nil {
+		return nil
+	}
+	pid := process.Pid
+	if pid <= 0 {
+		return nil
+	}
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+		_ = process.Kill()
+		return err
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for processGroupAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if processGroupAlive(pid) {
+		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			_ = process.Kill()
+			return err
+		}
+	}
+	return nil
+}
+
+func processGroupAlive(pid int) bool {
+	err := syscall.Kill(-pid, 0)
+	return err != syscall.ESRCH
 }
 
 func (s *Server) runCommand(ctx context.Context, conn net.Conn, reqID string, token model.Token, tokenHash string, p peer, args protocol.RunArgs) (model.RunResult, error) {

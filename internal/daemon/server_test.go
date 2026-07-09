@@ -7,7 +7,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -460,6 +462,52 @@ func TestRunCommandAllowsNoGPU(t *testing.T) {
 	}
 }
 
+func TestRunConnectionCloseKillsProcessGroup(t *testing.T) {
+	server := testServer(t)
+	key, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _, err := server.Store.RegisterSoftToken(key, "alice", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	childFile := filepath.Join(dir, "child.pid")
+	script := "trap 'kill \"$child\" 2>/dev/null; wait \"$child\"; exit 0' TERM; sleep 30 & child=$!; echo $child > " + strconv.Quote(childFile) + "; wait $child"
+
+	client, srv := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.handleConn(context.Background(), srv)
+	}()
+	args, _ := json.Marshal(protocol.RunArgs{Command: []string{"/bin/sh", "-c", script}, Workdir: dir})
+	req, _ := json.Marshal(protocol.Request{ID: "run1", Method: "run", Token: secret, Args: args})
+	if _, err := client.Write(append(req, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	childPID := waitForPIDFile(t, childFile)
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !waitForPIDExit(childPID, 5*time.Second) {
+		t.Fatalf("child pid %d still alive after client close", childPID)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server connection handler did not exit")
+	}
+	status, err := server.Store.Status(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Authorizations) != 0 {
+		t.Fatalf("authorization should be released after client close: %+v", status.Authorizations)
+	}
+}
+
 func TestPeerGroupsIncludesSupplementaryGroups(t *testing.T) {
 	dir := t.TempDir()
 	statusDir := filepath.Join(dir, "1234")
@@ -480,6 +528,40 @@ func TestPeerGroupsIncludesSupplementaryGroups(t *testing.T) {
 			t.Fatalf("groups=%v want=%v", groups, want)
 		}
 	}
+}
+
+func waitForPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil && strings.TrimSpace(string(data)) != "" {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return pid
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for pid file %s", path)
+	return 0
+}
+
+func waitForPIDExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !pidAlive(pid) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return !pidAlive(pid)
+}
+
+func pidAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err != syscall.ESRCH
 }
 
 func TestCleanupFinishedBareLeaseReleasesDeadProcess(t *testing.T) {
