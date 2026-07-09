@@ -212,7 +212,7 @@ func TestSoftRegisterCreatesTokenOnly(t *testing.T) {
 	}
 }
 
-func TestClaimedMonitorClaimsRunGPUAndKillsUnauthorized(t *testing.T) {
+func TestClaimedMonitorRejectsRunGPUWhenBusy(t *testing.T) {
 	server := testServer(t)
 	key, err := server.Store.ReadOrCreateRootKey()
 	if err != nil {
@@ -261,11 +261,11 @@ func TestClaimedMonitorClaimsRunGPUAndKillsUnauthorized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(status.SoftClaims) != 1 || status.SoftClaims[0].GPU != 0 || status.SoftClaims[0].AuthorizationID != auth.ID {
-		t.Fatalf("expected claimed GPU to be stored, got %+v", status.SoftClaims)
+	if len(status.SoftClaims) != 0 {
+		t.Fatalf("busy GPU should not be claimed, got %+v", status.SoftClaims)
 	}
-	if len(killer.killed) != 1 || killer.killed[0] != 200 {
-		t.Fatalf("expected unauthorized pid to be killed, got %v", killer.killed)
+	if len(killer.killed) != 1 || killer.killed[0] != 100 {
+		t.Fatalf("expected rocguard pid to be killed, got %v", killer.killed)
 	}
 }
 

@@ -327,6 +327,20 @@ func (a Authorizer) enforceSoft(ctx context.Context, state model.State, gpu int,
 		}
 		return nil
 	}
+	if len(unauthorized) > 0 {
+		msg := fmt.Sprintf("claimed-mode authorization rejected on gpu=%d because non-authorized GPU processes are already present", gpu)
+		a.audit(model.AuditEvent{Time: now.UTC(), Kind: "claim_rejected", Message: msg, GPU: gpu, User: authorized[0].auth.Holder})
+		for _, view := range unauthorized {
+			*decisions = append(*decisions, Decision{Process: view.Process, Info: view.Info, Action: "skip", Reason: "gpu already has non-authorized process"})
+		}
+		for _, item := range authorized {
+			reason := fmt.Sprintf("claimed GPU access rejected on gpu=%d pid=%d; gpu already has non-authorized process", gpu, item.view.Process.PID)
+			if err := a.kill(decisions, item.view, reason, "", item.auth.ID, "existing GPU process", item.auth.TokenHash, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	claimAuth := authorized[0].auth
 	claim := model.SoftClaim{
@@ -390,7 +404,7 @@ func (a Authorizer) kill(decisions *[]Decision, view processView, reason, leaseI
 	if a.DryRun || a.Killer == nil {
 		return nil
 	}
-	msg := fmt.Sprintf("rocguard killed pid=%d on gpu=%d: unauthorized GPU access; gpu is held by %s; use KEY=... rocguard run -- <command>", view.Process.PID, view.Process.GPU, holder)
+	msg := fmt.Sprintf("rocguard killed pid=%d on gpu=%d: %s", view.Process.PID, view.Process.GPU, reason)
 	return a.Killer.Kill(view.Info, msg)
 }
 

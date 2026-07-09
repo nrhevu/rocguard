@@ -16,6 +16,9 @@ The enforcement model is intentionally simple:
 - `claimed` registration creates a non-expiring key. A claimed-mode
   authorization claims any GPU where an authorized process is observed using
   non-zero GPU memory.
+- If that GPU already has a non-authorized process using GPU memory before the
+  claim is created, Rocguard rejects the new claimed process and leaves the
+  existing workload alone.
 - Once a GPU is claimed, non-bypassed processes on that GPU must match the
   claiming authorization token or they are killed.
 
