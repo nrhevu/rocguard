@@ -131,7 +131,7 @@ rocguard register (--reserved | --claimed)
 KEY=... rocguard run -- <command>
 KEY=... rocguard allow docker --container <name-or-id>
 KEY=... rocguard allow k8s --namespace <name>
-KEY=... rocguard allow user --user <name>
+KEY=... rocguard allow user --name <name>
 rocguard status
 rocguard ps
 KEY=... rocguard token info
@@ -213,7 +213,7 @@ authorization.
 Authorize all processes for one Linux user:
 
 ```bash
-KEY=rg_xxx ./rocguard allow user --user alice
+KEY=rg_xxx ./rocguard allow user --name alice
 ```
 
 User values support wildcards such as `codex*`.

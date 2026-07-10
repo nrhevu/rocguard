@@ -254,7 +254,7 @@ func allowCommand(cfg config.Config, args []string) error {
 	case "user":
 		fs := flag.NewFlagSet("allow user", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)
-		username := fs.String("user", "", "username")
+		username := fs.String("name", "", "username")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -587,7 +587,7 @@ func usageText() string {
   KEY=... rocguard run -- <command>
   KEY=... rocguard allow docker --container <name-or-id>
   KEY=... rocguard allow k8s --namespace <name>
-  KEY=... rocguard allow user --user <name>
+  KEY=... rocguard allow user --name <name>
   rocguard status
   rocguard ps
   KEY=... rocguard token info

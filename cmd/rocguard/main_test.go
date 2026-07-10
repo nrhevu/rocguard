@@ -59,6 +59,7 @@ func TestUsageTextShowsOnlyCurrentCommands(t *testing.T) {
 		"rocguard register (--reserved | --claimed)",
 		"KEY=... rocguard run -- <command>",
 		"KEY=... rocguard allow docker --container <name-or-id>",
+		"KEY=... rocguard allow user --name <name>",
 		"ROOT_KEY=... rocguard show-keys",
 	} {
 		if !strings.Contains(out, want) {
@@ -70,6 +71,7 @@ func TestUsageTextShowsOnlyCurrentCommands(t *testing.T) {
 		"--" + "hard",
 		"--" + "soft",
 		"--" + "gpu",
+		"--" + "user",
 		"rocguard " + "docker allow",
 		"rocguard " + "k8s allow",
 	} {
