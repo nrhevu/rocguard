@@ -755,31 +755,35 @@ h2 {
   appearance: none;
   box-sizing: border-box;
   display: grid;
+  grid-template-rows: auto 1fr auto;
   width: max-content;
-  align-content: center;
-  gap: 2px;
+  align-content: stretch;
+  gap: 1px;
   overflow: hidden;
   border: 1px solid #fecaca;
   border-radius: 8px;
-  padding: 7px 10px;
+  padding: 5px 8px;
   color: #991b1b;
   background: #fee2e2;
   box-shadow: 0 1px 2px rgba(153, 27, 27, 0.08);
   text-align: left;
 }
 
+.booking-block.has-holder {
+  align-content: stretch;
+}
+
 .booking-block.compact {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
+  gap: 6px;
+  min-height: 0;
+  padding: 0 6px;
 }
 
-.booking-block.compact strong::after {
-  content: "·";
-  margin-left: 8px;
-  color: #b91c1c;
-  font-weight: 500;
+.booking-block.compact.has-holder {
+  align-content: center;
+  padding-right: var(--holder-space, 56px);
 }
 
 .booking-block:hover {
@@ -792,28 +796,70 @@ h2 {
   outline-offset: 2px;
 }
 
-.booking-block strong {
+.booking-topline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 6px;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+.booking-block.compact .booking-topline {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.booking-block strong {
+  display: block;
+  min-width: max-content;
+  overflow: visible;
   white-space: nowrap;
   font-size: 12px;
   font-weight: 600;
-}
-
-.booking-block span {
-  min-width: 0;
-  color: #b91c1c;
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-.booking-block.compact span {
-  flex: 0 0 auto;
+  line-height: 1.15;
 }
 
 .booking-block.compact strong {
-  flex: 0 1 auto;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.booking-block .booking-time {
+  align-self: end;
+  min-width: max-content;
+  color: #b91c1c;
+  font-size: 11px;
+  line-height: 1.15;
+  white-space: nowrap;
+}
+
+.booking-block.compact .booking-time {
+  align-self: auto;
+  flex: 0 0 auto;
+  line-height: 1;
+}
+
+.booking-block .booking-holder {
+  max-width: none;
+  overflow: visible;
+  color: #991b1b;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.15;
+  opacity: 0.72;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.booking-block.compact .booking-holder {
+  position: absolute;
+  top: 1px;
+  right: 6px;
+  max-width: none;
+  pointer-events: none;
 }
 
 .schedule-detail {
@@ -1004,6 +1050,16 @@ input:focus {
   display: grid;
   gap: 16px;
   padding: 20px 22px 22px;
+}
+
+.modal-message {
+  max-width: 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .checkbox-line {

@@ -11,7 +11,7 @@ const statusLabels = {
 const showDevWarnings = import.meta.env.DEV;
 const calendarHourHeight = 28;
 const minCalendarHours = 10;
-const scheduleLaneGap = 4;
+const scheduleLaneGap = 2;
 const hourMs = 60 * 60 * 1000;
 const dayMs = 24 * hourMs;
 
@@ -164,6 +164,15 @@ function App() {
     });
   }
 
+  function showBusyGPUHint(conflict) {
+    const gpuLabel = conflict.gpus.join(", ");
+    const multiple = conflict.gpus.length > 1;
+    setReserveHint({
+      title: "Reservation unavailable",
+      message: `GPU ${gpuLabel} ${multiple ? "are" : "is"} busy. ${multiple ? "Processes are" : "A process is"} already running on ${multiple ? "these GPUs" : "this GPU"}. Stop ${multiple ? "them" : "it"} or choose another GPU/time window.`,
+    });
+  }
+
   async function addServer(values) {
     await api("/api/servers", {
       method: "POST",
@@ -200,7 +209,7 @@ function App() {
     } catch (err) {
       setReserveHint({
         title: "Reservation unavailable",
-        message: err.message,
+        message: formatReservationError(err.message),
       });
     }
   }
@@ -233,6 +242,7 @@ function App() {
       });
       setError("");
       setRevokeTarget(null);
+      setScheduleTarget(null);
       await refresh();
     } catch (err) {
       setError(err.message);
@@ -344,10 +354,12 @@ function App() {
               />
               <ReserveForm
                 selected={selectedGPUList}
+                gpus={gpus}
                 reservations={reservations}
                 onMissingSelection={showSelectGPUHint}
                 onMissingDetails={showReservationDetailsHint}
                 onConflict={showReservationConflictHint}
+                onBusy={showBusyGPUHint}
                 onSubmit={reserve}
               />
             </aside>
@@ -378,13 +390,12 @@ function App() {
           onSubmit={() => revokeTargetItem(revokeTarget)}
         />
       )}
-      {scheduleTarget && (
+      {scheduleTarget && !revokeTarget && (
         <ScheduleDetailModal
           target={scheduleTarget}
           onClose={() => setScheduleTarget(null)}
           onRevoke={() => {
             setRevokeTarget(scheduleTarget);
-            setScheduleTarget(null);
           }}
         />
       )}
@@ -566,14 +577,23 @@ function Schedule({ gpu, allGPUs = [], selected, reservations, onOpen }) {
             {blocks.map((block) => (
               <button
                 type="button"
-                className={`booking-block ${block.compact ? "compact" : ""}`}
+                className={`booking-block ${block.compact ? "compact" : ""} ${block.holder ? "has-holder" : ""}`}
                 key={block.id}
-                title={`${block.label} · ${timeLabel(block.start)} - ${timeLabel(block.end)}`}
-                style={{ top: block.top, height: block.height, left: block.left, width: block.width }}
+                title={`${block.holder ? `${block.holder} · ` : ""}${block.label} · ${timeLabel(block.start)} - ${timeLabel(block.end)}`}
+                style={{
+                  top: block.top,
+                  height: block.height,
+                  left: block.left,
+                  width: block.width,
+                  "--holder-space": block.holder ? `${Math.ceil(estimateTextWidth(block.holder, 9) + 12)}px` : "0px",
+                }}
                 onClick={() => onOpen(block)}
               >
-                <strong>{block.label}</strong>
-                <span>{timeLabel(block.start)} - {timeLabel(block.end)}</span>
+                <div className="booking-topline">
+                  <strong>{block.label}</strong>
+                  {block.holder && <span className="booking-holder">{block.holder}</span>}
+                </div>
+                <span className="booking-time">{timeLabel(block.start)} - {timeLabel(block.end)}</span>
               </button>
             ))}
           </div>
@@ -584,7 +604,7 @@ function Schedule({ gpu, allGPUs = [], selected, reservations, onOpen }) {
   );
 }
 
-function ReserveForm({ selected, reservations, onMissingSelection, onMissingDetails, onConflict, onSubmit }) {
+function ReserveForm({ selected, gpus, reservations, onMissingSelection, onMissingDetails, onConflict, onBusy, onSubmit }) {
   const defaults = defaultWindow();
   const [form, setForm] = useState({
     name: "",
@@ -595,7 +615,8 @@ function ReserveForm({ selected, reservations, onMissingSelection, onMissingDeta
   const targetLabel = selected.length ? ` ${selected.join(", ")}` : "";
   const hasDetails = reservationDetailsComplete(form);
   const conflict = hasDetails ? reservationConflict(selected, reservations, form) : null;
-  const canSubmit = selected.length > 0 && hasDetails && !conflict;
+  const busyConflict = hasDetails ? busyGPUConflict(selected, gpus, form) : null;
+  const canSubmit = selected.length > 0 && hasDetails && !conflict && !busyConflict;
   function explainBlockedSubmit() {
     if (selected.length === 0) {
       onMissingSelection();
@@ -607,6 +628,10 @@ function ReserveForm({ selected, reservations, onMissingSelection, onMissingDeta
     }
     if (conflict) {
       onConflict(conflict);
+      return;
+    }
+    if (busyConflict) {
+      onBusy(busyConflict);
     }
   }
   return (
@@ -629,6 +654,11 @@ function ReserveForm({ selected, reservations, onMissingSelection, onMissingDeta
       {conflict && (
         <div className="form-warning">
           GPU {conflict.gpus.join(", ")} already reserved for this window.
+        </div>
+      )}
+      {busyConflict && (
+        <div className="form-warning">
+          GPU {busyConflict.gpus.join(", ")} {busyConflict.gpus.length > 1 ? "are" : "is"} busy now.
         </div>
       )}
       <div
@@ -742,7 +772,7 @@ function RootKeyModal({ title, onClose, onSubmit }) {
 
 function ScheduleDetailModal({ target, onClose, onRevoke }) {
   return (
-    <Modal title="Reservation details" onClose={onClose}>
+    <Modal title="Reservation details" onClose={onClose} hideClose>
       <div className="schedule-detail">
         <div className="revoke-summary">
           <strong>{target.label}</strong>
@@ -779,7 +809,7 @@ function RevokeModal({ target, onClose, onSubmit }) {
     ? `${target.label} · GPU ${target.gpus.join(", ")}`
     : target.label;
   return (
-    <Modal title={isKey ? "Revoke key" : "Revoke reservation"} onClose={onClose}>
+    <Modal title={isKey ? "Revoke key" : "Revoke reservation"} onClose={onClose} hideClose>
       <form
         className="modal-form"
         onSubmit={(event) => {
@@ -811,9 +841,9 @@ function RevokeModal({ target, onClose, onSubmit }) {
 
 function ReserveHintModal({ title, message, onClose }) {
   return (
-    <Modal title={title} onClose={onClose}>
+    <Modal title={title} onClose={onClose} hideClose>
       <div className="modal-note">
-        <p className="muted">{message}</p>
+        <p className="modal-message">{message}</p>
         <div className="modal-actions">
           <button type="button" className="primary-button" onClick={onClose}>OK</button>
         </div>
@@ -836,13 +866,13 @@ function SuccessKey({ token, onClose }) {
   );
 }
 
-function Modal({ title, children, onClose }) {
+function Modal({ title, children, onClose, hideClose = false }) {
   return (
     <div className="modal-backdrop">
       <section className="modal">
         <header>
           <h2>{title}</h2>
-          <button className="plain-button" onClick={onClose}>Close</button>
+          {!hideClose && <button className="plain-button" onClick={onClose}>Close</button>}
         </header>
         {children}
       </section>
@@ -919,6 +949,50 @@ function reservationConflict(selected, reservations = [], values) {
   };
 }
 
+function busyGPUConflict(selected, gpus = [], values) {
+  if (selected.length === 0) {
+    return null;
+  }
+  const start = new Date(values.start);
+  const end = new Date(values.end);
+  const now = new Date();
+  if (
+    !Number.isFinite(start.getTime()) ||
+    !Number.isFinite(end.getTime()) ||
+    start >= end ||
+    start > now ||
+    end <= now
+  ) {
+    return null;
+  }
+  const selectedSet = new Set(selected);
+  const busy = gpus
+    .filter((gpu) => selectedSet.has(gpu.id) && (gpu.processes || []).some(usesGPUResources))
+    .map((gpu) => gpu.id)
+    .sort((left, right) => left - right);
+  if (busy.length === 0) {
+    return null;
+  }
+  return { gpus: busy };
+}
+
+function usesGPUResources(process) {
+  return Number(process?.mem_bytes || 0) > 0;
+}
+
+function formatReservationError(message) {
+  const text = message || "Reservation could not be created.";
+  const busyMatch = text.match(/gpu\s+(\d+)\s+is busy:\s+pid=(\d+)/i);
+  if (busyMatch) {
+    return `GPU ${busyMatch[1]} is busy. A process is already running on this GPU (PID ${busyMatch[2]}). Stop it or choose another GPU/time window.`;
+  }
+  const overlapMatch = text.match(/gpu\s+(\d+)\s+.*overlaps/i);
+  if (overlapMatch) {
+    return `GPU ${overlapMatch[1]} already has a reservation in this time window. Choose another GPU or time.`;
+  }
+  return text;
+}
+
 function datetimeLocal(date) {
   return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 }
@@ -990,8 +1064,9 @@ function scheduleBlock(job, dayStart, dayEnd) {
   const visibleEnd = new Date(Math.min(end.getTime(), dayEnd.getTime()));
   const startMinutes = (visibleStart.getTime() - dayStart.getTime()) / 60000;
   const endMinutes = (visibleEnd.getTime() - dayStart.getTime()) / 60000;
-  const durationMinutes = Math.max((visibleEnd.getTime() - visibleStart.getTime()) / 60000, 15);
-  const compact = durationMinutes <= 45;
+  const durationMinutes = (visibleEnd.getTime() - visibleStart.getTime()) / 60000;
+  const heightPx = (durationMinutes / 60) * calendarHourHeight;
+  const compact = heightPx < 42;
   return {
     id: job.id,
     gpus: job.gpus,
@@ -1003,7 +1078,7 @@ function scheduleBlock(job, dayStart, dayEnd) {
     startMinutes,
     endMinutes,
     top: `${(startMinutes / 60) * calendarHourHeight}px`,
-    height: `${Math.max((durationMinutes / 60) * calendarHourHeight, compact ? 36 : 54)}px`,
+    height: `${heightPx}px`,
     compact,
     label: job.label,
   };
@@ -1054,7 +1129,7 @@ function layoutScheduleGroup(group) {
   return assigned.map((block) => ({
     ...block,
     laneCount: lanes,
-    compact: block.compact || lanes > 1,
+    compact: block.compact,
     left: lanes === 1 ? "0" : `${laneOffsets[block.lane]}px`,
     width: lanes === 1 ? `${laneWidths[block.lane]}px` : `${laneWidths[block.lane]}px`,
     timelineWidth,
@@ -1063,15 +1138,24 @@ function layoutScheduleGroup(group) {
 
 function estimateScheduleBlockWidth(block, laneCount) {
   const label = block.label || "";
+  const holder = block.holder || "";
   const time = `${timeLabel(block.start)} - ${timeLabel(block.end)}`;
-  if (block.compact || laneCount > 1) {
-    return clamp(estimateTextWidth(`${label} · ${time}`, 11) + 36, 120, 260);
+  const compact = block.compact;
+  const labelWidth = estimateTextWidth(label, compact ? 11 : 12);
+  const holderWidth = holder ? estimateTextWidth(holder, compact ? 9 : 9) : 0;
+  const timeWidth = estimateTextWidth(time, 11);
+  const topLineWidth = labelWidth + (holder ? holderWidth + 6 : 0);
+  const contentWidth = compact
+    ? labelWidth + timeWidth + (holder ? holderWidth + 12 : 0) + 24
+    : Math.max(topLineWidth, timeWidth) + 18;
+  if (block.compact) {
+    return Math.max(86, Math.ceil(contentWidth));
   }
-  return clamp(Math.max(estimateTextWidth(label, 12), estimateTextWidth(time, 11)) + 28, 130, 280);
+  return Math.max(104, Math.ceil(contentWidth));
 }
 
 function estimateTextWidth(text, fontSize) {
-  return text.length * fontSize * 0.58;
+  return text.length * fontSize * 0.56;
 }
 
 function memoryMetric(gpu) {
