@@ -80,11 +80,15 @@ function App() {
         api("/api/servers"),
         api("/api/fleet/snapshot"),
       ]);
+      const nextFleet = snapshot.servers || [];
       setServers(serverList);
-      setFleet(snapshot.servers || []);
-      if (!selectedServerId && serverList.length > 0) {
-        setSelectedServerId(serverList[0].id);
-      }
+      setFleet(nextFleet);
+      setSelectedServerId((currentId) => {
+        if (currentId && serverList.some((server) => server.id === currentId)) {
+          return currentId;
+        }
+        return serverList[0]?.id || nextFleet[0]?.server?.id || "";
+      });
     } catch (err) {
       if (err.status === 401) {
         setAuth({ checking: false, authenticated: false, user: "" });
