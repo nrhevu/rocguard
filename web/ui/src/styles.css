@@ -77,6 +77,9 @@ button {
 }
 
 .login-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
   margin-bottom: 18px;
   color: #0f172a;
   font-size: 15px;
@@ -115,10 +118,24 @@ button {
 }
 
 .brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   padding: 0 8px 14px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.09);
   font-size: 22px;
   font-weight: 700;
+}
+
+.brand-mark {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+}
+
+.login-brand .brand-mark {
+  width: 24px;
+  height: 24px;
 }
 
 .sidebar-search {
@@ -1115,6 +1132,17 @@ input:focus {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
   margin-bottom: 18px;
+}
+
+.copy-button {
+  min-width: 68px;
+}
+
+.copy-button.copied {
+  border-color: #86efac;
+  color: #15803d;
+  background: #f0fdf4;
+  font-weight: 700;
 }
 
 .key-output {

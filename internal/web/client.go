@@ -20,6 +20,15 @@ type NodeClient struct {
 	Timeout time.Duration
 }
 
+type NodeAPI interface {
+	Health(ctx context.Context, server ServerRecord, rootKey string) error
+	Snapshot(ctx context.Context, server ServerRecord) (model.NodeSnapshot, error)
+	CreateReservation(ctx context.Context, server ServerRecord, args protocol.RegisterArgs) (model.RegisterResult, error)
+	CreateClaimKey(ctx context.Context, server ServerRecord, args protocol.RegisterArgs) (model.RegisterResult, error)
+	ShowKeys(ctx context.Context, server ServerRecord, rootKey string) (model.KeyStatus, error)
+	Revoke(ctx context.Context, server ServerRecord, args protocol.RevokeArgs) (map[string]string, error)
+}
+
 func (c NodeClient) Health(ctx context.Context, server ServerRecord, rootKey string) error {
 	var out map[string]bool
 	return c.call(ctx, server, rootKey, http.MethodGet, "/healthz", nil, &out)

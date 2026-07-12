@@ -265,7 +265,7 @@ function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand">RocGuard</div>
+        <BrandLockup className="brand" />
         <input
           className="sidebar-search"
           placeholder="Search nodes..."
@@ -415,7 +415,7 @@ function LoadingScreen() {
   return (
     <div className="login-shell">
       <div className="login-panel">
-        <div className="login-brand">RocGuard</div>
+        <BrandLockup className="login-brand" />
       </div>
     </div>
   );
@@ -433,7 +433,7 @@ function LoginScreen({ error, onSubmit }) {
         }}
       >
         <div>
-          <div className="login-brand">RocGuard</div>
+          <BrandLockup className="login-brand" />
           <h1>Sign in</h1>
         </div>
         <label>
@@ -460,6 +460,15 @@ function LoginScreen({ error, onSubmit }) {
         {error && <div className="login-error">{error}</div>}
         <button className="primary-button">Sign in</button>
       </form>
+    </div>
+  );
+}
+
+function BrandLockup({ className }) {
+  return (
+    <div className={className}>
+      <img className="brand-mark" src="/rocguard-icon.svg" alt="" />
+      <span>RocGuard</span>
     </div>
   );
 }
@@ -747,7 +756,7 @@ function AddServerModal({ onClose, onSubmit }) {
 function ClaimKeyModal({ onClose, onSubmit }) {
   const [name, setName] = useState("research-team");
   return (
-    <Modal title="Create claim key" onClose={onClose}>
+    <Modal title="Create claim key" onClose={onClose} hideClose>
       <form
         className="modal-form"
         onSubmit={(event) => {
@@ -869,13 +878,38 @@ function ReserveHintModal({ title, message, onClose }) {
 }
 
 function SuccessKey({ token, onClose }) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setCopied(false), 1200);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  async function copyToken() {
+    if (!token) {
+      return;
+    }
+    await navigator.clipboard?.writeText(token);
+    setCopied(true);
+  }
+
   return (
     <div className="success-panel">
       <h2>Reserve Success</h2>
       <p>Your key</p>
       <div className="copy-row">
         <input className="key-output" readOnly spellCheck="false" value={token || "rg ..."} aria-label="Reserved API key" />
-        <button type="button" className="small-button" onClick={() => navigator.clipboard?.writeText(token)}>Copy</button>
+        <button
+          type="button"
+          className={`small-button copy-button ${copied ? "copied" : ""}`}
+          onClick={copyToken}
+          aria-label={copied ? "Copied" : "Copy key"}
+        >
+          {copied ? "✓" : "Copy"}
+        </button>
       </div>
       <button className="primary-button" onClick={onClose}>Done</button>
     </div>

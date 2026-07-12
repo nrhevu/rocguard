@@ -19,7 +19,14 @@ import (
 type Server struct {
 	Cfg      config.Config
 	Registry *Registry
-	Client   NodeClient
+	Client   NodeAPI
+
+	fleetCacheMu  sync.Mutex
+	fleetCache    fleetSnapshot
+	fleetCacheAt  time.Time
+	fleetCacheOK  bool
+	fleetCacheTTL time.Duration
+	now           func() time.Time
 }
 
 type addServerRequest struct {
@@ -46,9 +53,11 @@ type serverSnapshot struct {
 
 func New(cfg config.Config) *Server {
 	return &Server{
-		Cfg:      cfg,
-		Registry: NewRegistry(cfg.WebRegistry),
-		Client:   NodeClient{Timeout: 4 * time.Second},
+		Cfg:           cfg,
+		Registry:      NewRegistry(cfg.WebRegistry),
+		Client:        NodeClient{Timeout: 4 * time.Second},
+		fleetCacheTTL: time.Second,
+		now:           time.Now,
 	}
 }
 
@@ -199,10 +208,36 @@ func (s *Server) handleFleetSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	records, err := s.Registry.List()
+	out, err := s.cachedFleetSnapshot(r.Context())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) cachedFleetSnapshot(ctx context.Context) (fleetSnapshot, error) {
+	s.fleetCacheMu.Lock()
+	defer s.fleetCacheMu.Unlock()
+
+	now := s.nowTime()
+	if s.fleetCacheOK && now.Sub(s.fleetCacheAt) < s.fleetSnapshotCacheTTL() {
+		return s.fleetCache, nil
+	}
+	out, err := s.fetchFleetSnapshot(ctx)
+	if err != nil {
+		return fleetSnapshot{}, err
+	}
+	s.fleetCache = out
+	s.fleetCacheAt = now
+	s.fleetCacheOK = true
+	return out, nil
+}
+
+func (s *Server) fetchFleetSnapshot(ctx context.Context) (fleetSnapshot, error) {
+	records, err := s.Registry.List()
+	if err != nil {
+		return fleetSnapshot{}, err
 	}
 	out := fleetSnapshot{Servers: make([]serverSnapshot, len(records))}
 	var wg sync.WaitGroup
@@ -210,9 +245,9 @@ func (s *Server) handleFleetSnapshot(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, record ServerRecord) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			nodeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
-			snapshot, err := s.Client.Snapshot(ctx, record)
+			snapshot, err := s.Client.Snapshot(nodeCtx, record)
 			item := serverSnapshot{Server: publicServerRecord(record)}
 			if err != nil {
 				item.Error = err.Error()
@@ -224,7 +259,21 @@ func (s *Server) handleFleetSnapshot(w http.ResponseWriter, r *http.Request) {
 		}(i, record)
 	}
 	wg.Wait()
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
+}
+
+func (s *Server) nowTime() time.Time {
+	if s.now != nil {
+		return s.now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (s *Server) fleetSnapshotCacheTTL() time.Duration {
+	if s.fleetCacheTTL > 0 {
+		return s.fleetCacheTTL
+	}
+	return time.Second
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
