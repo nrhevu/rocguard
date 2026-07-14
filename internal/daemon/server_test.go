@@ -269,6 +269,58 @@ func TestNodeHTTPRequiresBearerRootKey(t *testing.T) {
 	}
 }
 
+func TestNodeHTTPReservationPreservesOwner(t *testing.T) {
+	server := testServer(t)
+	key, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	startsAt := now.Add(time.Hour)
+	expiresAt := startsAt.Add(time.Hour)
+	body, err := json.Marshal(protocol.RegisterArgs{
+		Name:      " alice ",
+		Purpose:   "training",
+		GPUs:      []int{0},
+		StartsAt:  &startsAt,
+		ExpiresAt: &expiresAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/reservations", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+key)
+	response := httptest.NewRecorder()
+	server.nodeHTTPHandler().ServeHTTP(response, req)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("reservation status = %d, body=%s", response.Code, response.Body.String())
+	}
+	status, err := server.Store.Status(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Reservations) != 1 || status.Reservations[0].Holder != "alice" {
+		t.Fatalf("reservations = %+v, want holder alice", status.Reservations)
+	}
+
+	missingOwner, err := json.Marshal(protocol.RegisterArgs{
+		GPUs:      []int{1},
+		StartsAt:  &startsAt,
+		ExpiresAt: &expiresAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/reservations", strings.NewReader(string(missingOwner)))
+	req.Header.Set("Authorization", "Bearer "+key)
+	response = httptest.NewRecorder()
+	server.nodeHTTPHandler().ServeHTTP(response, req)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("missing owner status = %d, body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestClaimedMonitorRejectsRunGPUWhenBusy(t *testing.T) {
 	server := testServer(t)
 	key, err := server.Store.ReadOrCreateRootKey()

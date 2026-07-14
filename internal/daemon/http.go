@@ -110,6 +110,11 @@ func (s *Server) handleNodeReservations(w http.ResponseWriter, r *http.Request, 
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	args.Name = strings.TrimSpace(args.Name)
+	if args.Name == "" {
+		writeHTTPError(w, http.StatusBadRequest, "name is required")
+		return
+	}
 	args.RootKey = rootKey
 	args.Mode = model.TokenModeReserved
 	result, err := s.dispatch(r.Context(), peer{}, protocolRequest("register", args))
@@ -128,6 +133,11 @@ func (s *Server) handleNodeClaimKeys(w http.ResponseWriter, r *http.Request, roo
 	var args protocol.RegisterArgs
 	if err := json.NewDecoder(r.Body).Decode(&args); err != nil && !errors.Is(err, io.EOF) {
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	args.Name = strings.TrimSpace(args.Name)
+	if args.Name == "" {
+		writeHTTPError(w, http.StatusBadRequest, "name is required")
 		return
 	}
 	args.RootKey = rootKey
