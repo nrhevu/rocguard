@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -16,23 +16,28 @@ const hourMs = 60 * 60 * 1000;
 const dayMs = 24 * hourMs;
 
 function App() {
-  const [auth, setAuth] = useState({ checking: true, authenticated: false, user: "" });
+  const [auth, setAuth] = useState({ checking: true, authenticated: false, user: "", role: "" });
   const [servers, setServers] = useState([]);
   const [fleet, setFleet] = useState([]);
+  const [users, setUsers] = useState([]);
   const [selectedServerId, setSelectedServerId] = useState("");
   const [selectedGPUs, setSelectedGPUs] = useState(new Set());
   const [activeGPU, setActiveGPU] = useState(null);
   const [view, setView] = useState("gpu");
   const [search, setSearch] = useState("");
   const [addOpen, setAddOpen] = useState(false);
-  const [keyPrompt, setKeyPrompt] = useState(null);
   const [claimOpen, setClaimOpen] = useState(false);
+  const [passwordOpen, setPasswordOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [userOpen, setUserOpen] = useState(false);
+  const [deleteUserTarget, setDeleteUserTarget] = useState(null);
   const [revokeTarget, setRevokeTarget] = useState(null);
   const [scheduleTarget, setScheduleTarget] = useState(null);
   const [reserveHint, setReserveHint] = useState(null);
   const [successKey, setSuccessKey] = useState("");
   const [error, setError] = useState("");
   const [loginError, setLoginError] = useState("");
+  const settingsRef = useRef(null);
 
   useEffect(() => {
     checkSession();
@@ -47,6 +52,40 @@ function App() {
     return () => window.clearInterval(timer);
   }, [auth.authenticated]);
 
+  useEffect(() => {
+    if (auth.authenticated && auth.role === "admin" && view === "users") {
+      loadUsers();
+    }
+    if (auth.authenticated && auth.role !== "admin" && view === "users") {
+      setView("gpu");
+    }
+  }, [auth.authenticated, auth.role, view]);
+
+  useEffect(() => {
+    if (!settingsOpen) {
+      return undefined;
+    }
+
+    function closeSettings(event) {
+      if (!settingsRef.current?.contains(event.target)) {
+        setSettingsOpen(false);
+      }
+    }
+
+    function closeSettingsOnEscape(event) {
+      if (event.key === "Escape") {
+        setSettingsOpen(false);
+      }
+    }
+
+    document.addEventListener("pointerdown", closeSettings);
+    document.addEventListener("keydown", closeSettingsOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeSettings);
+      document.removeEventListener("keydown", closeSettingsOnEscape);
+    };
+  }, [settingsOpen]);
+
   async function checkSession() {
     try {
       const session = await api("/api/session");
@@ -54,9 +93,10 @@ function App() {
         checking: false,
         authenticated: Boolean(session.authenticated),
         user: session.user || "",
+        role: session.role || "",
       });
     } catch {
-      setAuth({ checking: false, authenticated: false, user: "" });
+      setAuth({ checking: false, authenticated: false, user: "", role: "" });
     }
   }
 
@@ -68,9 +108,68 @@ function App() {
       });
       setLoginError("");
       setError("");
-      setAuth({ checking: false, authenticated: true, user: session.user || values.username });
+      setAuth({
+        checking: false,
+        authenticated: true,
+        user: session.user || values.username,
+        role: session.role || "user",
+      });
     } catch (err) {
       setLoginError(err.message);
+    }
+  }
+
+  async function register(values) {
+    try {
+      const session = await api("/api/register", {
+        method: "POST",
+        body: JSON.stringify({ username: values.username, password: values.password }),
+      });
+      setLoginError("");
+      setError("");
+      setAuth({
+        checking: false,
+        authenticated: true,
+        user: session.user || values.username,
+        role: session.role || "user",
+      });
+    } catch (err) {
+      setLoginError(err.message);
+    }
+  }
+
+  async function logout() {
+    try {
+      await api("/api/logout", { method: "POST" });
+    } finally {
+      setAuth({ checking: false, authenticated: false, user: "", role: "" });
+      setServers([]);
+      setFleet([]);
+      setUsers([]);
+      setSelectedServerId("");
+      setSelectedGPUs(new Set());
+      setActiveGPU(null);
+      setView("gpu");
+      setPasswordOpen(false);
+      setSettingsOpen(false);
+      setDeleteUserTarget(null);
+      setSuccessKey("");
+    }
+  }
+
+  async function changePassword(values) {
+    await api("/api/password", {
+      method: "POST",
+      body: JSON.stringify(values),
+    });
+  }
+
+  async function loadUsers() {
+    try {
+      const list = await api("/api/users");
+      setUsers(list);
+    } catch (err) {
+      setError(err.message);
     }
   }
 
@@ -91,7 +190,7 @@ function App() {
       });
     } catch (err) {
       if (err.status === 401) {
-        setAuth({ checking: false, authenticated: false, user: "" });
+        setAuth({ checking: false, authenticated: false, user: "", role: "" });
         return;
       }
       setError(err.message);
@@ -106,6 +205,7 @@ function App() {
   const gpus = current?.snapshot?.gpus || [];
   const tokens = current?.snapshot?.tokens || [];
   const reservations = current?.snapshot?.reservations || [];
+  const isAdmin = auth.role === "admin";
   const selectedGPUList = Array.from(selectedGPUs).sort((a, b) => a - b);
   const allGPUIds = gpus.map((gpu) => gpu.id);
   const availableGPUIds = gpus
@@ -157,7 +257,7 @@ function App() {
   function showReservationDetailsHint() {
     setReserveHint({
       title: "Complete reservation",
-      message: "Fill User, Purpose, Start, and End before submitting a reservation.",
+      message: "Fill Purpose, Start, and End before submitting a reservation.",
     });
   }
 
@@ -200,7 +300,7 @@ function App() {
       const result = await api(`/api/servers/${currentServerId}/reservations`, {
         method: "POST",
         body: JSON.stringify({
-          name: values.name,
+          name: auth.user,
           purpose: values.purpose,
           gpus: targets,
           starts_at: new Date(values.start).toISOString(),
@@ -218,24 +318,48 @@ function App() {
     }
   }
 
-  async function createClaimKey(name) {
+  async function createClaimKey() {
     const result = await api(`/api/servers/${currentServerId}/claim-keys`, {
       method: "POST",
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name: auth.user }),
     });
     setClaimOpen(false);
     setSuccessKey(result.token || "");
     await refresh();
   }
 
-  async function showKey(tokenId, rootKey) {
-    const status = await api(`/api/servers/${currentServerId}/show-key`, {
-      method: "POST",
-      body: JSON.stringify({ root_key: rootKey }),
+  async function showKey(tokenId) {
+    try {
+      const status = await api(`/api/servers/${currentServerId}/show-key`, {
+        method: "POST",
+        body: JSON.stringify({ id: tokenId }),
+      });
+      const token = (status.tokens || []).find((item) => item.id === tokenId);
+      setSuccessKey(token?.key || "");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function createUser(values) {
+    try {
+      const user = await api("/api/users", {
+        method: "POST",
+        body: JSON.stringify(values),
+      });
+      setUserOpen(false);
+      setUsers((previous) => [...previous, user]);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function deleteUser(username) {
+    await api("/api/users", {
+      method: "DELETE",
+      body: JSON.stringify({ username }),
     });
-    const token = (status.tokens || []).find((item) => item.id === tokenId);
-    setKeyPrompt(null);
-    setSuccessKey(token?.key || "");
+    setUsers((previous) => previous.filter((user) => !sameText(user.username, username)));
   }
 
   async function revokeTargetItem(target) {
@@ -263,13 +387,50 @@ function App() {
   }
 
   if (!auth.authenticated) {
-    return <LoginScreen error={loginError} onSubmit={login} />;
+    return (
+      <LoginScreen
+        error={loginError}
+        onLogin={login}
+        onRegister={register}
+        onResetError={() => setLoginError("")}
+      />
+    );
   }
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <BrandLockup className="brand" showMark={false} />
+        <div className="brand-row">
+          <BrandLockup className="brand" showMark={false} />
+          <div className="settings-menu" ref={settingsRef}>
+            <button
+              type="button"
+              className="settings-button"
+              aria-expanded={settingsOpen}
+              aria-haspopup="menu"
+              onClick={() => setSettingsOpen((open) => !open)}
+            >
+              Settings
+            </button>
+            {settingsOpen && (
+              <div className="settings-popover" role="menu">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setSettingsOpen(false);
+                    setPasswordOpen(true);
+                  }}
+                >
+                  Change password
+                </button>
+                <button type="button" role="menuitem" onClick={logout}>
+                  Log out
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
         <input
           className="sidebar-search"
           placeholder="Search nodes..."
@@ -292,9 +453,11 @@ function App() {
             );
           })}
         </div>
-        <button className="sidebar-add" onClick={() => setAddOpen(true)}>
-          Add server
-        </button>
+        {isAdmin && (
+          <button className="sidebar-add" onClick={() => setAddOpen(true)}>
+            Add server
+          </button>
+        )}
       </aside>
 
       <main className="workspace">
@@ -311,6 +474,11 @@ function App() {
             <button className={view === "keys" ? "tab active" : "tab"} onClick={() => setView("keys")}>
               Key
             </button>
+            {isAdmin && (
+              <button className={view === "users" ? "tab active" : "tab"} onClick={() => setView("users")}>
+                Users
+              </button>
+            )}
           </div>
         </header>
 
@@ -357,6 +525,7 @@ function App() {
                 onOpen={setScheduleTarget}
               />
               <ReserveForm
+                owner={auth.user}
                 selected={selectedGPUList}
                 gpus={gpus}
                 reservations={reservations}
@@ -368,23 +537,32 @@ function App() {
               />
             </aside>
           </div>
-        ) : (
+        ) : view === "keys" ? (
           <KeysView
             tokens={tokens}
             onCreate={() => setClaimOpen(true)}
-            onShow={(tokenId) => setKeyPrompt({ tokenId })}
+            onShow={showKey}
             onRevoke={(token) => setRevokeTarget({ ...token, kind: "key" })}
+          />
+        ) : (
+          <UsersView
+            users={users}
+            currentUser={auth.user}
+            onCreate={() => setUserOpen(true)}
+            onDelete={setDeleteUserTarget}
           />
         )}
       </main>
 
-      {addOpen && <AddServerModal onClose={() => setAddOpen(false)} onSubmit={addServer} />}
-      {claimOpen && <ClaimKeyModal onClose={() => setClaimOpen(false)} onSubmit={createClaimKey} />}
-      {keyPrompt && (
-        <RootKeyModal
-          title="Show key"
-          onClose={() => setKeyPrompt(null)}
-          onSubmit={(rootKey) => showKey(keyPrompt.tokenId, rootKey)}
+      {isAdmin && addOpen && <AddServerModal onClose={() => setAddOpen(false)} onSubmit={addServer} />}
+      {claimOpen && <ClaimKeyModal owner={auth.user} onClose={() => setClaimOpen(false)} onSubmit={createClaimKey} />}
+      {passwordOpen && <ChangePasswordModal onClose={() => setPasswordOpen(false)} onSubmit={changePassword} />}
+      {isAdmin && userOpen && <CreateUserModal onClose={() => setUserOpen(false)} onSubmit={createUser} />}
+      {isAdmin && deleteUserTarget && (
+        <DeleteUserModal
+          user={deleteUserTarget}
+          onClose={() => setDeleteUserTarget(null)}
+          onSubmit={() => deleteUser(deleteUserTarget.username)}
         />
       )}
       {revokeTarget && (
@@ -397,6 +575,7 @@ function App() {
       {scheduleTarget && !revokeTarget && (
         <ScheduleDetailModal
           target={scheduleTarget}
+          canRevoke={isAdmin || sameText(scheduleTarget.holder, auth.user)}
           onClose={() => setScheduleTarget(null)}
           onRevoke={() => {
             setRevokeTarget(scheduleTarget);
@@ -425,20 +604,39 @@ function LoadingScreen() {
   );
 }
 
-function LoginScreen({ error, onSubmit }) {
-  const [form, setForm] = useState({ username: "", password: "" });
+function LoginScreen({ error, onLogin, onRegister, onResetError }) {
+  const [creating, setCreating] = useState(false);
+  const [form, setForm] = useState({ username: "", password: "", confirmPassword: "" });
+  const [localError, setLocalError] = useState("");
+
+  function switchMode() {
+    setCreating((value) => !value);
+    setForm((value) => ({ ...value, password: "", confirmPassword: "" }));
+    setLocalError("");
+    onResetError();
+  }
+
   return (
     <div className="login-shell">
       <form
         className="login-panel"
         onSubmit={(event) => {
           event.preventDefault();
-          onSubmit(form);
+          setLocalError("");
+          if (creating && form.password !== form.confirmPassword) {
+            setLocalError("Passwords do not match");
+            return;
+          }
+          if (creating) {
+            onRegister(form);
+          } else {
+            onLogin(form);
+          }
         }}
       >
         <div>
           <BrandLockup className="login-brand" showMark={false} />
-          <h1>Sign in</h1>
+          <h1>{creating ? "Create account" : "Sign in"}</h1>
         </div>
         <label>
           Username
@@ -446,14 +644,14 @@ function LoginScreen({ error, onSubmit }) {
             autoComplete="username"
             value={form.username}
             onChange={(event) => setForm({ ...form, username: event.target.value })}
-            placeholder="Admin"
+            placeholder="Username"
             required
           />
         </label>
         <label>
           Password
           <input
-            autoComplete="current-password"
+            autoComplete={creating ? "new-password" : "current-password"}
             type="password"
             value={form.password}
             onChange={(event) => setForm({ ...form, password: event.target.value })}
@@ -461,8 +659,27 @@ function LoginScreen({ error, onSubmit }) {
             required
           />
         </label>
-        {error && <div className="login-error">{error}</div>}
-        <button className="primary-button">Sign in</button>
+        {creating && (
+          <label>
+            Confirm password
+            <input
+              autoComplete="new-password"
+              type="password"
+              value={form.confirmPassword}
+              onChange={(event) => setForm({ ...form, confirmPassword: event.target.value })}
+              placeholder="Confirm password"
+              required
+            />
+          </label>
+        )}
+        {(localError || error) && <div className="login-error">{localError || error}</div>}
+        <button className="primary-button">{creating ? "Create account" : "Sign in"}</button>
+        <div className="login-switch-row">
+          <span>{creating ? "Already have an account?" : "New to RocGuard?"}</span>
+          <button type="button" className="login-switch-button" onClick={switchMode}>
+            {creating ? "Sign in" : "Create account"}
+          </button>
+        </div>
       </form>
     </div>
   );
@@ -633,10 +850,9 @@ function ScheduleBlockButton({ block, colors = reservationPalette[0], onOpen }) 
   );
 }
 
-function ReserveForm({ selected, gpus, reservations, onMissingSelection, onMissingDetails, onConflict, onBusy, onSubmit }) {
+function ReserveForm({ owner, selected, gpus, reservations, onMissingSelection, onMissingDetails, onConflict, onBusy, onSubmit }) {
   const defaults = defaultWindow();
   const [form, setForm] = useState({
-    name: "",
     purpose: "",
     start: defaults.start,
     end: defaults.end,
@@ -676,7 +892,10 @@ function ReserveForm({ selected, gpus, reservations, onMissingSelection, onMissi
       }}
     >
       <h3>Reserve GPU{targetLabel}</h3>
-      <label>User<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Research team" /></label>
+      <div className="owner-row">
+        <span>User</span>
+        <strong>{owner}</strong>
+      </div>
       <label>Purpose<input value={form.purpose} onChange={(event) => setForm({ ...form, purpose: event.target.value })} placeholder="Training" /></label>
       <label>Start<input type="datetime-local" value={form.start} onChange={(event) => setForm({ ...form, start: event.target.value })} /></label>
       <label>End<input type="datetime-local" value={form.end} onChange={(event) => setForm({ ...form, end: event.target.value })} /></label>
@@ -733,6 +952,36 @@ function KeysView({ tokens, onCreate, onShow, onRevoke }) {
   );
 }
 
+function UsersView({ users, currentUser, onCreate, onDelete }) {
+  return (
+    <section className="keys-panel users-panel">
+      <div className="section-heading">
+        <div>
+          <h2>Users</h2>
+          <p className="muted">View, create, and remove gateway users.</p>
+        </div>
+        <button className="primary-button" onClick={onCreate}>Create user</button>
+      </div>
+      <div className="key-list">
+        {users.map((user) => (
+          <div className="key-row" key={user.username}>
+            <div>
+              <strong>{user.username}</strong>
+              <span>{user.role} · {new Date(user.created_at).toLocaleDateString()}</span>
+            </div>
+            {!sameText(user.username, currentUser) && (
+              <button type="button" className="small-danger-button" onClick={() => onDelete(user)}>
+                Delete
+              </button>
+            )}
+          </div>
+        ))}
+        {users.length === 0 && <div className="empty">No users yet.</div>}
+      </div>
+    </section>
+  );
+}
+
 function AddServerModal({ onClose, onSubmit }) {
   const [form, setForm] = useState({ name: "", endpoint: "", root_key: "", tls_skip_verify: false });
   return (
@@ -757,18 +1006,59 @@ function AddServerModal({ onClose, onSubmit }) {
   );
 }
 
-function ClaimKeyModal({ onClose, onSubmit }) {
-  const [name, setName] = useState("research-team");
+function ChangePasswordModal({ onClose, onSubmit }) {
+  const [form, setForm] = useState({ current_password: "", new_password: "" });
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
   return (
-    <Modal title="Create claim key" onClose={onClose} hideClose>
+    <Modal title="Change password" onClose={onClose} hideClose>
+      <form
+        className="modal-form"
+        onSubmit={async (event) => {
+          event.preventDefault();
+          setPending(true);
+          setError("");
+          try {
+            await onSubmit(form);
+            onClose();
+          } catch (err) {
+            setError(err.message);
+          } finally {
+            setPending(false);
+          }
+        }}
+      >
+        <label>Current password<input type="password" autoComplete="current-password" value={form.current_password} onChange={(event) => setForm({ ...form, current_password: event.target.value })} required /></label>
+        <label>New password<input type="password" autoComplete="new-password" value={form.new_password} onChange={(event) => setForm({ ...form, new_password: event.target.value })} required /></label>
+        {error && <div className="modal-error">{error}</div>}
+        <div className="modal-actions">
+          <button type="button" className="small-button" onClick={onClose}>Cancel</button>
+          <button className="primary-button" disabled={pending}>{pending ? "Saving" : "Save"}</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function CreateUserModal({ onClose, onSubmit }) {
+  const [form, setForm] = useState({ username: "", password: "", role: "user" });
+  return (
+    <Modal title="Create user" onClose={onClose} hideClose>
       <form
         className="modal-form"
         onSubmit={(event) => {
           event.preventDefault();
-          onSubmit(name);
+          onSubmit(form);
         }}
       >
-        <label>Name<input value={name} onChange={(event) => setName(event.target.value)} /></label>
+        <label>Username<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} placeholder="researcher" required /></label>
+        <label>Password<input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password" required /></label>
+        <label>Role
+          <select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}>
+            <option value="user">User</option>
+            <option value="admin">Admin</option>
+          </select>
+        </label>
         <div className="modal-actions">
           <button type="button" className="small-button" onClick={onClose}>Cancel</button>
           <button className="primary-button">Create</button>
@@ -778,28 +1068,66 @@ function ClaimKeyModal({ onClose, onSubmit }) {
   );
 }
 
-function RootKeyModal({ title, onClose, onSubmit }) {
-  const [rootKey, setRootKey] = useState("");
+function DeleteUserModal({ user, onClose, onSubmit }) {
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
   return (
-    <Modal title={title} onClose={onClose}>
+    <Modal title="Delete user" onClose={onClose} hideClose>
       <form
         className="modal-form"
-        onSubmit={(event) => {
+        onSubmit={async (event) => {
           event.preventDefault();
-          onSubmit(rootKey);
+          setPending(true);
+          setError("");
+          try {
+            await onSubmit();
+            onClose();
+          } catch (err) {
+            setError(err.message);
+          } finally {
+            setPending(false);
+          }
         }}
       >
-        <label>Root key<input type="password" value={rootKey} onChange={(event) => setRootKey(event.target.value)} required /></label>
+        <div className="revoke-summary">
+          <strong>{user.username}</strong>
+          <span>{user.role}</span>
+        </div>
+        <p className="muted">This removes web access for this user. Existing keys and reservations remain.</p>
+        {error && <div className="modal-error">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="small-button" onClick={onClose}>Cancel</button>
-          <button className="primary-button">Verify</button>
+          <button className="danger-button" disabled={pending}>{pending ? "Deleting" : "Delete"}</button>
         </div>
       </form>
     </Modal>
   );
 }
 
-function ScheduleDetailModal({ target, onClose, onRevoke }) {
+function ClaimKeyModal({ owner, onClose, onSubmit }) {
+  return (
+    <Modal title="Create claim key" onClose={onClose} hideClose>
+      <form
+        className="modal-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSubmit();
+        }}
+      >
+        <div className="owner-row modal-owner">
+          <span>User</span>
+          <strong>{owner}</strong>
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="small-button" onClick={onClose}>Cancel</button>
+          <button className="primary-button">Create</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function ScheduleDetailModal({ target, canRevoke, onClose, onRevoke }) {
   return (
     <Modal title="Reservation details" onClose={onClose} hideClose>
       <div className="schedule-detail">
@@ -825,7 +1153,7 @@ function ScheduleDetailModal({ target, onClose, onRevoke }) {
         )}
         <div className="modal-actions">
           <button type="button" className="small-button" onClick={onClose}>Close</button>
-          <button type="button" className="danger-button" onClick={onRevoke}>Revoke</button>
+          {canRevoke && <button type="button" className="danger-button" onClick={onRevoke}>Revoke</button>}
         </div>
       </div>
     </Modal>
@@ -901,21 +1229,23 @@ function SuccessKey({ token, onClose }) {
   }
 
   return (
-    <div className="success-panel">
-      <h2>Reserve Success</h2>
-      <p>Your key</p>
-      <div className="copy-row">
-        <input className="key-output" readOnly spellCheck="false" value={token || "rg ..."} aria-label="Reserved API key" />
-        <button
-          type="button"
-          className={`small-button copy-button ${copied ? "copied" : ""}`}
-          onClick={copyToken}
-          aria-label={copied ? "Copied" : "Copy key"}
-        >
-          {copied ? "✓" : "Copy"}
-        </button>
-      </div>
-      <button className="primary-button" onClick={onClose}>Done</button>
+    <div className="modal-backdrop">
+      <section className="success-panel">
+        <h2>Reserve Success</h2>
+        <p>Your key</p>
+        <div className="copy-row">
+          <input className="key-output" readOnly spellCheck="false" value={token || "rg ..."} aria-label="Reserved API key" />
+          <button
+            type="button"
+            className={`small-button copy-button ${copied ? "copied" : ""}`}
+            onClick={copyToken}
+            aria-label={copied ? "Copied" : "Copy key"}
+          >
+            {copied ? "✓" : "Copy"}
+          </button>
+        </div>
+        <button className="primary-button" onClick={onClose}>Done</button>
+      </section>
     </div>
   );
 }
@@ -958,8 +1288,7 @@ function defaultWindow() {
 
 function reservationDetailsComplete(values) {
   return Boolean(
-    values.name?.trim() &&
-      values.purpose?.trim() &&
+    values.purpose?.trim() &&
       values.start &&
       values.end,
   );
@@ -1324,6 +1653,10 @@ function formatBytes(value) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function sameText(left, right) {
+  return String(left || "").trim().toLowerCase() === String(right || "").trim().toLowerCase();
 }
 
 function timeLabel(value) {

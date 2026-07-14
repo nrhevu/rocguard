@@ -49,7 +49,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -99,6 +100,38 @@ button {
   font-size: 13px;
 }
 
+.login-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.login-switch-button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #0f766e;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.login-switch-button:hover {
+  color: #115e59;
+  text-decoration: underline;
+}
+
+.modal-error {
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  padding: 9px 11px;
+  color: #991b1b;
+  background: var(--red-soft);
+  font-size: 13px;
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);
@@ -117,14 +150,77 @@ button {
   color: #fff;
 }
 
-.brand {
+.brand-row {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  gap: 8px;
   padding: 0 8px 14px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+}
+
+.brand {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
   font-size: 22px;
   font-weight: 700;
+}
+
+.settings-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.settings-button {
+  min-height: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  padding: 0 8px;
+  background: transparent;
+  color: #cbd5e1;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.settings-button:hover,
+.settings-button[aria-expanded="true"] {
+  border-color: rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.07);
+  color: #fff;
+}
+
+.settings-popover {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 8px);
+  right: 0;
+  display: grid;
+  width: 156px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  padding: 4px;
+  background: #17232f;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+}
+
+.settings-popover button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 5px;
+  padding: 0 10px;
+  background: transparent;
+  color: #e2e8f0;
+  font-size: 12px;
+  text-align: left;
+}
+
+.settings-popover button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
 }
 
 .brand-mark {
@@ -316,10 +412,23 @@ h2 {
   color: #fff;
 }
 
+.primary-button:disabled {
+  border-color: #cbd5e1;
+  background: #e2e8f0;
+  color: #94a3b8;
+  cursor: not-allowed;
+}
+
 .danger-button {
   border-color: #dc2626;
   background: #dc2626;
   color: #fff;
+}
+
+.danger-button:disabled {
+  border-color: #fca5a5;
+  background: #fca5a5;
+  cursor: not-allowed;
 }
 
 .small-danger-button {
@@ -714,6 +823,24 @@ h2 {
   overscroll-behavior: contain;
 }
 
+@media (min-width: 1081px) {
+  .inspector {
+    grid-template-rows: minmax(0, 1fr) auto;
+    align-content: stretch;
+  }
+
+  .schedule-card {
+    display: grid;
+    min-height: 0;
+    grid-template-rows: auto minmax(224px, 1fr);
+  }
+
+  .day-calendar {
+    height: auto;
+    max-height: none;
+  }
+}
+
 .timeline-canvas {
   position: relative;
   min-height: 100%;
@@ -941,6 +1068,33 @@ h2 {
   line-height: 1.35;
 }
 
+.owner-row {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.owner-row strong {
+  overflow: hidden;
+  color: #111827;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal-owner {
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: #f8fafc;
+}
+
 .submit-guard {
   display: grid;
 }
@@ -979,13 +1133,25 @@ input {
   outline: none;
 }
 
+select {
+  min-height: 40px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 0 11px;
+  background: #fff;
+  color: #111827;
+  font-weight: 400;
+  outline: none;
+}
+
 input::placeholder {
   color: #94a3b8;
   font-weight: 400;
   opacity: 1;
 }
 
-input:focus {
+input:focus,
+select:focus {
   border-color: #0f766e;
   box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
 }
@@ -1116,10 +1282,6 @@ input:focus {
 }
 
 .success-panel {
-  position: fixed;
-  right: 28px;
-  bottom: 28px;
-  z-index: 30;
   padding: 22px;
 }
 
