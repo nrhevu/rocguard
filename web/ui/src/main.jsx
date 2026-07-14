@@ -269,7 +269,7 @@ function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <BrandLockup className="brand" />
+        <BrandLockup className="brand" showMark={false} />
         <input
           className="sidebar-search"
           placeholder="Search nodes..."
@@ -419,7 +419,7 @@ function LoadingScreen() {
   return (
     <div className="login-shell">
       <div className="login-panel">
-        <BrandLockup className="login-brand" />
+        <BrandLockup className="login-brand" showMark={false} />
       </div>
     </div>
   );
@@ -437,7 +437,7 @@ function LoginScreen({ error, onSubmit }) {
         }}
       >
         <div>
-          <BrandLockup className="login-brand" />
+          <BrandLockup className="login-brand" showMark={false} />
           <h1>Sign in</h1>
         </div>
         <label>
@@ -468,10 +468,10 @@ function LoginScreen({ error, onSubmit }) {
   );
 }
 
-function BrandLockup({ className }) {
+function BrandLockup({ className, showMark = true }) {
   return (
     <div className={className}>
-      <img className="brand-mark" src="/rocguard-icon.svg" alt="" />
+      {showMark && <img className="brand-mark" src="/rocguard-icon.svg" alt="" />}
       <span>RocGuard</span>
     </div>
   );
@@ -736,7 +736,7 @@ function KeysView({ tokens, onCreate, onShow, onRevoke }) {
 function AddServerModal({ onClose, onSubmit }) {
   const [form, setForm] = useState({ name: "", endpoint: "", root_key: "", tls_skip_verify: false });
   return (
-    <Modal title="Add server" onClose={onClose}>
+    <Modal title="Add server" onClose={onClose} hideClose>
       <form
         className="modal-form"
         onSubmit={(event) => {
