@@ -1,9 +1,9 @@
 package web
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -21,10 +21,23 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
 type sessionPayload struct {
 	User    string `json:"user"`
+	Role    string `json:"role"`
 	Expires int64  `json:"expires"`
 }
+
+type sessionInfo struct {
+	User string
+	Role string
+}
+
+type sessionContextKey struct{}
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -36,15 +49,41 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if !constantEqual(strings.TrimSpace(req.Username), s.Cfg.WebUser) || !constantEqual(req.Password, s.Cfg.WebPassword) {
+	user, err := s.Users.Authenticate(req.Username, req.Password)
+	if err != nil {
 		writeJSONError(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
 	expires := time.Now().Add(sessionTTL)
-	http.SetCookie(w, s.sessionCookie(r, s.signSession(s.Cfg.WebUser, expires), expires))
+	http.SetCookie(w, s.sessionCookie(r, s.signSession(user.Username, user.Role, expires), expires))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
-		"user":          s.Cfg.WebUser,
+		"user":          user.Username,
+		"role":          user.Role,
+	})
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	user, err := s.Users.Create(req.Username, req.Password, RoleUser)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	expires := time.Now().Add(sessionTTL)
+	http.SetCookie(w, s.sessionCookie(r, s.signSession(user.Username, user.Role, expires), expires))
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"authenticated": true,
+		"user":          user.Username,
+		"role":          user.Role,
 	})
 }
 
@@ -53,10 +92,11 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	user, ok := s.sessionUser(r)
+	session, ok := s.sessionUser(r)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": ok,
-		"user":          user,
+		"user":          session.User,
+		"role":          session.Role,
 	})
 }
 
@@ -69,30 +109,74 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	session, _ := currentSession(r)
+	var req changePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	user, err := s.Users.ChangePassword(session.User, req.CurrentPassword, req.NewPassword)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":   true,
+		"user": user.Username,
+		"role": user.Role,
+	})
+}
+
 func (s *Server) requireSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := s.sessionUser(r); !ok {
+		session, ok := s.sessionUser(r)
+		if !ok {
 			writeJSONError(w, http.StatusUnauthorized, "authentication required")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), sessionContextKey{}, session)))
 	}
 }
 
-func (s *Server) sessionUser(r *http.Request) (string, bool) {
+func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return s.requireSession(func(w http.ResponseWriter, r *http.Request) {
+		session, _ := currentSession(r)
+		if session.Role != RoleAdmin {
+			writeJSONError(w, http.StatusForbidden, "admin access required")
+			return
+		}
+		next(w, r)
+	})
+}
+
+func currentSession(r *http.Request) (sessionInfo, bool) {
+	session, ok := r.Context().Value(sessionContextKey{}).(sessionInfo)
+	return session, ok
+}
+
+func (s *Server) sessionUser(r *http.Request) (sessionInfo, bool) {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil || cookie.Value == "" {
-		return "", false
+		return sessionInfo{}, false
 	}
 	payload, ok := s.verifySession(cookie.Value)
-	if !ok || payload.User != s.Cfg.WebUser || time.Now().Unix() > payload.Expires {
-		return "", false
+	if !ok || time.Now().Unix() > payload.Expires {
+		return sessionInfo{}, false
 	}
-	return payload.User, true
+	user, found, err := s.Users.Get(payload.User)
+	if err != nil || !found {
+		return sessionInfo{}, false
+	}
+	return sessionInfo{User: user.Username, Role: user.Role}, true
 }
 
-func (s *Server) signSession(user string, expires time.Time) string {
-	payload := sessionPayload{User: user, Expires: expires.Unix()}
+func (s *Server) signSession(user, role string, expires time.Time) string {
+	payload := sessionPayload{User: user, Role: role, Expires: expires.Unix()}
 	data, _ := json.Marshal(payload)
 	signature := s.sessionSignature(data)
 	return base64.RawURLEncoding.EncodeToString(data) + "." + base64.RawURLEncoding.EncodeToString(signature)
@@ -151,8 +235,4 @@ func (s *Server) clearSessionCookie(r *http.Request) *http.Cookie {
 		SameSite: http.SameSiteLaxMode,
 		Secure:   r.TLS != nil,
 	}
-}
-
-func constantEqual(left, right string) bool {
-	return len(left) == len(right) && subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
 }

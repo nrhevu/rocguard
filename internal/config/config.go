@@ -19,6 +19,7 @@ type Config struct {
 	NodeTLSKey  string
 	WebAddr     string
 	WebRegistry string
+	WebUsers    string
 	WebUIDir    string
 	WebUser     string
 	WebPassword string
@@ -39,6 +40,7 @@ func Default() Config {
 		NodeTLSKey:  env("ROCGUARD_NODE_TLS_KEY", ""),
 		WebAddr:     env("ROCGUARD_WEB_ADDR", "127.0.0.1:8080"),
 		WebRegistry: env("ROCGUARD_WEB_REGISTRY", "/var/lib/rocguard/web-servers.json"),
+		WebUsers:    env("ROCGUARD_WEB_USERS", "/var/lib/rocguard/web-users.json"),
 		WebUIDir:    env("ROCGUARD_WEB_UI_DIR", "web/ui/dist"),
 		WebUser:     env("ROCGUARD_WEB_USER", "admin"),
 		WebPassword: env("ROCGUARD_WEB_PASSWORD", ""),
