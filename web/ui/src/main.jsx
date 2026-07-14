@@ -342,16 +342,12 @@ function App() {
   }
 
   async function createUser(values) {
-    try {
-      const user = await api("/api/users", {
-        method: "POST",
-        body: JSON.stringify(values),
-      });
-      setUserOpen(false);
-      setUsers((previous) => [...previous, user]);
-    } catch (err) {
-      setError(err.message);
-    }
+    const user = await api("/api/users", {
+      method: "POST",
+      body: JSON.stringify(values),
+    });
+    setUserOpen(false);
+    setUsers((previous) => [...previous, user]);
   }
 
   async function deleteUser(username) {
@@ -1042,13 +1038,23 @@ function ChangePasswordModal({ onClose, onSubmit }) {
 
 function CreateUserModal({ onClose, onSubmit }) {
   const [form, setForm] = useState({ username: "", password: "", role: "user" });
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
   return (
     <Modal title="Create user" onClose={onClose} hideClose>
       <form
         className="modal-form"
-        onSubmit={(event) => {
+        onSubmit={async (event) => {
           event.preventDefault();
-          onSubmit(form);
+          setPending(true);
+          setError("");
+          try {
+            await onSubmit(form);
+          } catch (err) {
+            setError(err.message === "user already exists" ? "Username already exists." : err.message);
+          } finally {
+            setPending(false);
+          }
         }}
       >
         <label>Username<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} placeholder="researcher" required /></label>
@@ -1059,9 +1065,10 @@ function CreateUserModal({ onClose, onSubmit }) {
             <option value="admin">Admin</option>
           </select>
         </label>
+        {error && <div className="modal-error">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="small-button" onClick={onClose}>Cancel</button>
-          <button className="primary-button">Create</button>
+          <button className="primary-button" disabled={pending}>{pending ? "Creating" : "Create"}</button>
         </div>
       </form>
     </Modal>
