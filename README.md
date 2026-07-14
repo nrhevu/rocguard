@@ -227,6 +227,7 @@ Group=root
 EnvironmentFile=/etc/rocguard/web.env
 Environment=ROCGUARD_WEB_ADDR=0.0.0.0:8080
 Environment=ROCGUARD_WEB_USER=admin
+Environment=ROCGUARD_WEB_USERS=/var/lib/rocguard/web-users.json
 Environment=ROCGUARD_WEB_REGISTRY=/var/lib/rocguard/web-servers.json
 Environment=ROCGUARD_WEB_UI_DIR=/usr/local/share/rocguard/ui
 ExecStart=/usr/local/bin/rocguard web
@@ -252,6 +253,17 @@ http://<gateway-host>:8080
 
 Default login user is `admin`.
 
+The first admin account is created from `ROCGUARD_WEB_USER` and
+`ROCGUARD_WEB_PASSWORD` when the users file is empty. Admin can create more
+users in the `Users` tab.
+
+Web roles:
+
+- `admin`: add/delete servers, create users, view/revoke all keys and
+  reservations.
+- `user`: reserve GPUs, create claim keys, reveal/revoke only their own keys
+  and reservations.
+
 Add a node in the UI:
 
 ```text
@@ -266,8 +278,8 @@ ROCGUARD_NODE_TLS_CERT=/etc/rocguard/tls.crt
 ROCGUARD_NODE_TLS_KEY=/etc/rocguard/tls.key
 ```
 
-The gateway registry is written with mode `0600` because it contains node root
-keys.
+The gateway registry and users files are written with mode `0600` because they
+contain node root keys and password hashes.
 
 ## Docker, Kubernetes, and User Scopes
 
@@ -358,6 +370,7 @@ ROCGUARD_NODE_TLS_KEY=
 ROCGUARD_WEB_ADDR=127.0.0.1:8080
 ROCGUARD_WEB_USER=admin
 ROCGUARD_WEB_PASSWORD=
+ROCGUARD_WEB_USERS=/var/lib/rocguard/web-users.json
 ROCGUARD_WEB_REGISTRY=/var/lib/rocguard/web-servers.json
 ROCGUARD_WEB_UI_DIR=web/ui/dist
 ROCGUARD_GPU_COUNT=0
