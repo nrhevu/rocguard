@@ -31,6 +31,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [userOpen, setUserOpen] = useState(false);
   const [deleteUserTarget, setDeleteUserTarget] = useState(null);
+  const [allowTarget, setAllowTarget] = useState(null);
   const [revokeTarget, setRevokeTarget] = useState(null);
   const [scheduleTarget, setScheduleTarget] = useState(null);
   const [reserveHint, setReserveHint] = useState(null);
@@ -205,6 +206,7 @@ function App() {
   const gpus = current?.snapshot?.gpus || [];
   const tokens = current?.snapshot?.tokens || [];
   const reservations = current?.snapshot?.reservations || [];
+  const authorizations = current?.snapshot?.authorizations || [];
   const isAdmin = auth.role === "admin";
   const selectedGPUList = Array.from(selectedGPUs).sort((a, b) => a - b);
   const allGPUIds = gpus.map((gpu) => gpu.id);
@@ -339,6 +341,34 @@ function App() {
     } catch (err) {
       setError(err.message);
     }
+  }
+
+  async function allowKey(values) {
+    if (!allowTarget) {
+      return;
+    }
+    const result = await api(`/api/servers/${currentServerId}/allow`, {
+      method: "POST",
+      body: JSON.stringify({ id: allowTarget.id, ...values }),
+    });
+    void refresh();
+    return {
+      ...result,
+      id: result.authorization_id,
+      token_id: allowTarget.id,
+      mode: result.mode || values.mode,
+      container_pattern: result.container_pattern || values.container,
+      namespace: result.namespace || values.namespace,
+      username: result.username || values.user,
+    };
+  }
+
+  async function revokeRule(ruleId) {
+    await api(`/api/servers/${currentServerId}/revoke`, {
+      method: "POST",
+      body: JSON.stringify({ id: ruleId }),
+    });
+    void refresh();
   }
 
   async function createUser(values) {
@@ -539,6 +569,7 @@ function App() {
           <KeysView
             tokens={tokens}
             onCreate={() => setClaimOpen(true)}
+            onAllow={setAllowTarget}
             onShow={showKey}
             onRevoke={(token) => setRevokeTarget({ ...token, kind: "key" })}
           />
@@ -554,6 +585,15 @@ function App() {
 
       {isAdmin && addOpen && <AddServerModal onClose={() => setAddOpen(false)} onSubmit={addServer} />}
       {claimOpen && <ClaimKeyModal owner={auth.user} onClose={() => setClaimOpen(false)} onSubmit={createClaimKey} />}
+      {allowTarget && (
+        <AllowKeyModal
+          token={allowTarget}
+          rules={authorizations.filter((authorization) => authorization.token_id === allowTarget.id)}
+          onClose={() => setAllowTarget(null)}
+          onSubmit={allowKey}
+          onRemove={revokeRule}
+        />
+      )}
       {passwordOpen && <ChangePasswordModal onClose={() => setPasswordOpen(false)} onSubmit={changePassword} />}
       {isAdmin && userOpen && <CreateUserModal onClose={() => setUserOpen(false)} onSubmit={createUser} />}
       {isAdmin && deleteUserTarget && (
@@ -945,7 +985,7 @@ function ReserveForm({ owner, selected, gpus, reservations, onMissingSelection, 
   );
 }
 
-function KeysView({ tokens, onCreate, onShow, onRevoke }) {
+function KeysView({ tokens, onCreate, onAllow, onShow, onRevoke }) {
   return (
     <section className="keys-panel">
       <div className="section-heading">
@@ -963,6 +1003,7 @@ function KeysView({ tokens, onCreate, onShow, onRevoke }) {
               <span>{token.mode} · {new Date(token.created_at).toLocaleDateString()}</span>
             </div>
             <div className="key-actions">
+              <button className="small-button" onClick={() => onAllow(token)}>Authorize</button>
               <button className="small-button" onClick={() => onShow(token.id)}>Show key</button>
               <button type="button" className="small-danger-button" onClick={() => onRevoke(token)}>Revoke</button>
             </div>
@@ -972,6 +1013,204 @@ function KeysView({ tokens, onCreate, onShow, onRevoke }) {
       </div>
     </section>
   );
+}
+
+function AllowKeyModal({ token, rules, onClose, onSubmit, onRemove }) {
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
+  const [visibleRules, setVisibleRules] = useState(rules);
+  const [removedRuleIds, setRemovedRuleIds] = useState(new Set());
+  const [selectedRuleId, setSelectedRuleId] = useState("");
+  const [addOpen, setAddOpen] = useState(false);
+
+  useEffect(() => {
+    setVisibleRules((current) => (
+      mergeRules(current, rules).filter((rule) => !removedRuleIds.has(rule.id))
+    ));
+  }, [rules, removedRuleIds]);
+
+  async function addRule(values) {
+    const rule = await onSubmit(values);
+    setVisibleRules((current) => mergeRules(current, [rule]));
+    setAddOpen(false);
+  }
+
+  async function removeSelectedRule() {
+    if (!selectedRuleId) {
+      return;
+    }
+    const ruleId = selectedRuleId;
+    setPending(true);
+    setError("");
+    try {
+      await onRemove(ruleId);
+      setRemovedRuleIds((current) => new Set(current).add(ruleId));
+      setVisibleRules((current) => current.filter((rule) => rule.id !== ruleId));
+      setSelectedRuleId("");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <Modal title="Grant GPU access" onClose={onClose} hideClose className="rules-modal">
+      <div className="modal-form">
+        <div className="owner-row modal-owner">
+          <span>Key</span>
+          <strong>{token.name || token.id}</strong>
+        </div>
+        <div className="rules-table">
+          <div className="rules-table-header">
+            <span>Rule</span>
+            <span>Type</span>
+          </div>
+          <div className="rules-table-body" role="listbox" aria-label="Authorization rules">
+            {visibleRules.map((rule) => (
+              <button
+                type="button"
+                className={`rules-table-row ${selectedRuleId === rule.id ? "selected" : ""}`}
+                key={rule.id}
+                role="option"
+                aria-selected={selectedRuleId === rule.id}
+                onClick={() => setSelectedRuleId(rule.id)}
+              >
+                <strong title={authorizationRuleValue(rule)}>{authorizationRuleValue(rule)}</strong>
+                <span>{authorizationRuleLabel(rule.mode)}</span>
+              </button>
+            ))}
+            {visibleRules.length === 0 && <div className="rules-empty">No rules yet.</div>}
+          </div>
+          <div className="rules-toolbar">
+            <button
+              type="button"
+              className="rules-tool-button"
+              onClick={() => {
+                setError("");
+                setAddOpen(true);
+              }}
+              aria-label="Add rule"
+              title="Add rule"
+            >
+              +
+            </button>
+            <span className="rules-toolbar-divider" />
+            <button
+              type="button"
+              className="rules-tool-button"
+              onClick={removeSelectedRule}
+              disabled={!selectedRuleId || pending}
+              aria-label="Remove selected rule"
+              title="Remove selected rule"
+            >
+              {pending ? "…" : "−"}
+            </button>
+          </div>
+        </div>
+        {error && <div className="form-warning">{error}</div>}
+        <div className="modal-actions">
+          <button type="button" className="small-button" onClick={onClose} disabled={pending}>Done</button>
+        </div>
+        {addOpen && <AddRuleModal onClose={() => setAddOpen(false)} onSubmit={addRule} />}
+      </div>
+    </Modal>
+  );
+}
+
+function AddRuleModal({ onClose, onSubmit }) {
+  const [form, setForm] = useState({ mode: "docker", value: "" });
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
+  const modeFields = {
+    docker: { label: "Container", placeholder: "trainer or trainer-*", key: "container" },
+    k8s: { label: "Namespace", placeholder: "training or training-*", key: "namespace" },
+    user: { label: "User", placeholder: "alice or team-*", key: "user" },
+  };
+  const field = modeFields[form.mode] || modeFields.docker;
+
+  async function submit(event) {
+    event.preventDefault();
+    const value = form.value.trim();
+    if (!value) {
+      setError(`${field.label} is required`);
+      return;
+    }
+    setPending(true);
+    setError("");
+    try {
+      await onSubmit({ mode: form.mode, [field.key]: value });
+    } catch (err) {
+      setError(err.message);
+      setPending(false);
+    }
+  }
+
+  return (
+    <Modal title="Add rule" onClose={onClose} hideClose className="add-rule-modal">
+      <form className="modal-form" onSubmit={submit}>
+        <label>
+          Type
+          <select
+            value={form.mode}
+            onChange={(event) => {
+              setError("");
+              setForm({ mode: event.target.value, value: "" });
+            }}
+          >
+            <option value="docker">Docker container</option>
+            <option value="k8s">Kubernetes namespace</option>
+            <option value="user">Linux user</option>
+          </select>
+        </label>
+        <label>
+          {field.label}
+          <input
+            value={form.value}
+            onChange={(event) => setForm({ ...form, value: event.target.value })}
+            placeholder={field.placeholder}
+            autoFocus
+          />
+        </label>
+        {error && <div className="form-warning">{error}</div>}
+        <div className="modal-actions">
+          <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
+          <button className="primary-button" disabled={pending}>{pending ? "Adding" : "Add"}</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function authorizationRuleLabel(mode) {
+  return {
+    docker: "Docker container",
+    k8s: "Kubernetes namespace",
+    user: "Linux user",
+    bare: "Process",
+  }[mode] || mode;
+}
+
+function mergeRules(current, incoming) {
+  const merged = new Map(current.map((rule) => [rule.id, rule]));
+  incoming.filter(Boolean).forEach((rule) => merged.set(rule.id, rule));
+  return Array.from(merged.values());
+}
+
+function authorizationRuleValue(rule) {
+  if (rule.mode === "docker") {
+    return rule.container_pattern || rule.container_id || "Docker container";
+  }
+  if (rule.mode === "k8s") {
+    return rule.namespace || "Kubernetes namespace";
+  }
+  if (rule.mode === "user") {
+    return rule.username || `UID ${rule.uid}`;
+  }
+  if (rule.mode === "bare") {
+    return rule.command?.join(" ") || `PID ${rule.root_pid}`;
+  }
+  return rule.mode;
 }
 
 function UsersView({ users, currentUser, onCreate, onDelete }) {
@@ -1283,10 +1522,10 @@ function SuccessKey({ token, onClose }) {
   );
 }
 
-function Modal({ title, children, onClose, hideClose = false }) {
+function Modal({ title, children, onClose, hideClose = false, className = "" }) {
   return (
     <div className="modal-backdrop">
-      <section className="modal">
+      <section className={`modal ${className}`.trim()}>
         <header>
           <h2>{title}</h2>
           {!hideClose && <button className="plain-button" onClick={onClose}>Close</button>}

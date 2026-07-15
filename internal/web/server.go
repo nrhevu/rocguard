@@ -280,6 +280,34 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 			Now:    status.Now,
 			Tokens: []model.TokenView{token},
 		})
+	case action == "allow" && r.Method == http.MethodPost:
+		var args protocol.AllowArgs
+		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		args.ID = strings.TrimSpace(args.ID)
+		args.Mode = strings.TrimSpace(args.Mode)
+		if args.ID == "" {
+			writeJSONError(w, http.StatusBadRequest, "id is required")
+			return
+		}
+		allowed, err := s.canUseKey(r.Context(), record, session, args.ID)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !allowed {
+			writeJSONError(w, http.StatusForbidden, "key access denied")
+			return
+		}
+		result, err := s.Client.Allow(r.Context(), record, args)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.clearFleetCache()
+		writeJSON(w, http.StatusCreated, result)
 	case action == "revoke" && r.Method == http.MethodPost:
 		var args protocol.RevokeArgs
 		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
@@ -406,7 +434,22 @@ func (s *Server) canRevoke(ctx context.Context, record ServerRecord, session ses
 	if reservation, ok := findReservation(status.Reservations, id); ok {
 		return sameOwner(reservation.Holder, session.User), nil
 	}
+	if authorization, ok := findAuthorization(status.Authorizations, id); ok {
+		return sameOwner(authorization.Holder, session.User), nil
+	}
 	return false, nil
+}
+
+func (s *Server) canUseKey(ctx context.Context, record ServerRecord, session sessionInfo, id string) (bool, error) {
+	if session.Role == RoleAdmin {
+		return true, nil
+	}
+	status, err := s.Client.ShowKeys(ctx, record, record.RootKey)
+	if err != nil {
+		return false, err
+	}
+	token, ok := findToken(status.Tokens, id)
+	return ok && sameOwner(token.Name, session.User), nil
 }
 
 func filterFleetSnapshot(in fleetSnapshot, session sessionInfo) fleetSnapshot {
@@ -508,6 +551,15 @@ func findReservation(reservations []model.ReservationView, id string) (model.Res
 		}
 	}
 	return model.ReservationView{}, false
+}
+
+func findAuthorization(authorizations []model.AuthorizationView, id string) (model.AuthorizationView, bool) {
+	for _, authorization := range authorizations {
+		if authorization.ID == id {
+			return authorization, true
+		}
+	}
+	return model.AuthorizationView{}, false
 }
 
 func sameOwner(left, right string) bool {

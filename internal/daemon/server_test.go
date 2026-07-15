@@ -69,6 +69,20 @@ func (daemonFakeRuntime) NamespaceForContainer(context.Context, string) (string,
 	return "training", nil
 }
 
+type daemonMissingDockerRuntime struct{}
+
+func (daemonMissingDockerRuntime) ResolveDockerContainer(context.Context, string) (string, error) {
+	return "", errors.New("container not found")
+}
+
+func (daemonMissingDockerRuntime) DockerContainerName(context.Context, string) (string, error) {
+	return "future-container", nil
+}
+
+func (daemonMissingDockerRuntime) NamespaceForContainer(context.Context, string) (string, error) {
+	return "", errors.New("namespace not found")
+}
+
 func TestRegisterRPC(t *testing.T) {
 	server := testServer(t)
 	key, err := server.Store.ReadOrCreateRootKey()
@@ -214,7 +228,7 @@ func TestSoftRegisterCreatesTokenOnly(t *testing.T) {
 	}
 }
 
-func TestReservedTokenCannotAuthorizeBeforeStart(t *testing.T) {
+func TestReservedTokenCanAuthorizeBeforeStart(t *testing.T) {
 	server := testServer(t)
 	key, err := server.Store.ReadOrCreateRootKey()
 	if err != nil {
@@ -230,11 +244,14 @@ func TestReservedTokenCannotAuthorizeBeforeStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := server.ensureTokenCanAuthorize(tokenHash, token, now); err == nil {
-		t.Fatal("reserved token should not authorize before starts_at")
+	if err := server.ensureTokenCanAuthorize(tokenHash, token, now); err != nil {
+		t.Fatalf("reserved token should authorize before starts_at: %v", err)
 	}
 	if err := server.ensureTokenCanAuthorize(tokenHash, token, start.Add(time.Minute)); err != nil {
 		t.Fatalf("reserved token should authorize during window: %v", err)
+	}
+	if err := server.ensureTokenCanAuthorize(tokenHash, token, start.Add(2*time.Hour)); err == nil {
+		t.Fatal("reserved token should not authorize after reservation expires")
 	}
 }
 
@@ -318,6 +335,40 @@ func TestNodeHTTPReservationPreservesOwner(t *testing.T) {
 	server.nodeHTTPHandler().ServeHTTP(response, req)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("missing owner status = %d, body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestNodeHTTPAllowCreatesAuthorization(t *testing.T) {
+	server := testServer(t)
+	key, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := server.Store.RegisterSoftToken(key, "alice", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(protocol.AllowArgs{
+		ID:   token.ID,
+		Mode: model.ModeUser,
+		User: "alice*",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/allow", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+key)
+	response := httptest.NewRecorder()
+	server.nodeHTTPHandler().ServeHTTP(response, req)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("allow status = %d, body=%s", response.Code, response.Body.String())
+	}
+	status, err := server.Store.KeyStatus(key, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Authorizations) != 1 || status.Authorizations[0].Username != "alice*" {
+		t.Fatalf("authorizations = %+v, want alice* user authorization", status.Authorizations)
 	}
 }
 
@@ -541,6 +592,28 @@ func TestDockerAllowWildcardStoresPattern(t *testing.T) {
 	}
 	if len(status.Authorizations) != 1 || status.Authorizations[0].ContainerPattern != "codex*" {
 		t.Fatalf("expected wildcard docker authorization, got %+v", status.Authorizations)
+	}
+}
+
+func TestDockerAllowStoresNameWhenContainerDoesNotExist(t *testing.T) {
+	server := testServer(t)
+	server.Runtime = daemonMissingDockerRuntime{}
+	key, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _, err := server.Store.RegisterSoftToken(key, "alice", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, _ := json.Marshal(protocol.DockerAllowArgs{Container: "future-container"})
+	result, err := server.dispatch(context.Background(), peer{}, protocol.Request{ID: "1", Method: "allow_docker", Token: secret, Args: args})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allow := result.(model.AllowResult)
+	if allow.AuthorizationID == "" || allow.ContainerPattern != "future-container" || allow.ContainerID != "" {
+		t.Fatalf("unexpected allow result: %+v", allow)
 	}
 }
 

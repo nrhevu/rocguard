@@ -578,7 +578,7 @@ func (s *Store) Status(now time.Time) (model.Status, error) {
 	for _, authorization := range s.state.Authorizations {
 		if authorization.Active && !authorization.Revoked && !authorizationExpired(authorization, now) {
 			activeAuthorizationIDs[authorization.ID] = true
-			status.Authorizations = append(status.Authorizations, authorizationView(authorization))
+			status.Authorizations = append(status.Authorizations, authorizationView(authorization, tokenIDsByHash[authorization.TokenHash]))
 		}
 	}
 	for _, claim := range s.state.SoftClaims {
@@ -665,7 +665,7 @@ func (s *Store) KeyStatus(rootKey string, now time.Time) (model.KeyStatus, error
 	}
 	for _, authorization := range s.state.Authorizations {
 		if authorization.Active && !authorization.Revoked && !authorizationExpired(authorization, now) {
-			status.Authorizations = append(status.Authorizations, authorizationView(authorization))
+			status.Authorizations = append(status.Authorizations, authorizationView(authorization, tokenIDsByHash[authorization.TokenHash]))
 		}
 	}
 	for _, bypass := range s.state.Bypasses {
@@ -875,9 +875,10 @@ func NormalizeTokenMode(mode string) string {
 	}
 }
 
-func authorizationView(authorization model.Authorization) model.AuthorizationView {
+func authorizationView(authorization model.Authorization, tokenID string) model.AuthorizationView {
 	return model.AuthorizationView{
 		ID:               authorization.ID,
+		TokenID:          tokenID,
 		Mode:             authorization.Mode,
 		TokenMode:        NormalizeTokenMode(authorization.TokenMode),
 		Holder:           authorization.Holder,

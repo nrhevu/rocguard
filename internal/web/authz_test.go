@@ -22,6 +22,7 @@ type authzNodeClient struct {
 	keys            model.KeyStatus
 	lastReservation protocol.RegisterArgs
 	lastClaim       protocol.RegisterArgs
+	allowed         []protocol.AllowArgs
 	revoked         []string
 }
 
@@ -53,6 +54,13 @@ func (c *authzNodeClient) ShowKeys(context.Context, ServerRecord, string) (model
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.keys, nil
+}
+
+func (c *authzNodeClient) Allow(_ context.Context, _ ServerRecord, args protocol.AllowArgs) (model.AllowResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.allowed = append(c.allowed, args)
+	return model.AllowResult{AuthorizationID: "auth_" + args.ID, Mode: args.Mode}, nil
 }
 
 func (c *authzNodeClient) Revoke(_ context.Context, _ ServerRecord, args protocol.RevokeArgs) (map[string]string, error) {
@@ -150,6 +158,26 @@ func TestGatewayFiltersAndAuthorizesOwnedKeys(t *testing.T) {
 		t.Fatalf("other revoke = %d, body=%s", otherRevoke.Code, otherRevoke.Body.String())
 	}
 
+	otherAllow := requestJSON(handler, http.MethodPost, "/api/servers/"+serverID+"/allow", `{"id":"tok_bob","mode":"user","user":"alice"}`, userCookie)
+	if otherAllow.Code != http.StatusForbidden {
+		t.Fatalf("other allow = %d, body=%s", otherAllow.Code, otherAllow.Body.String())
+	}
+
+	ownAllow := requestJSON(handler, http.MethodPost, "/api/servers/"+serverID+"/allow", `{"id":"tok_alice","mode":"docker","container":"trainer"}`, userCookie)
+	if ownAllow.Code != http.StatusCreated {
+		t.Fatalf("own allow = %d, body=%s", ownAllow.Code, ownAllow.Body.String())
+	}
+
+	otherRuleRevoke := requestJSON(handler, http.MethodPost, "/api/servers/"+serverID+"/revoke", `{"id":"auth_bob"}`, userCookie)
+	if otherRuleRevoke.Code != http.StatusForbidden {
+		t.Fatalf("other rule revoke = %d, body=%s", otherRuleRevoke.Code, otherRuleRevoke.Body.String())
+	}
+
+	ownRuleRevoke := requestJSON(handler, http.MethodPost, "/api/servers/"+serverID+"/revoke", `{"id":"auth_alice"}`, userCookie)
+	if ownRuleRevoke.Code != http.StatusOK {
+		t.Fatalf("own rule revoke = %d, body=%s", ownRuleRevoke.Code, ownRuleRevoke.Body.String())
+	}
+
 	ownRevoke := requestJSON(handler, http.MethodPost, "/api/servers/"+serverID+"/revoke", `{"id":"tok_alice"}`, userCookie)
 	if ownRevoke.Code != http.StatusOK {
 		t.Fatalf("own revoke = %d, body=%s", ownRevoke.Code, ownRevoke.Body.String())
@@ -161,8 +189,11 @@ func TestGatewayFiltersAndAuthorizesOwnedKeys(t *testing.T) {
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if len(client.revoked) != 2 || client.revoked[0] != "tok_alice" || client.revoked[1] != "tok_bob" {
-		t.Fatalf("revoked ids = %+v, want tok_alice then tok_bob", client.revoked)
+	if len(client.revoked) != 3 || client.revoked[0] != "auth_alice" || client.revoked[1] != "tok_alice" || client.revoked[2] != "tok_bob" {
+		t.Fatalf("revoked ids = %+v, want auth_alice, tok_alice, then tok_bob", client.revoked)
+	}
+	if len(client.allowed) != 1 || client.allowed[0].ID != "tok_alice" || client.allowed[0].Container != "trainer" {
+		t.Fatalf("allowed args = %+v, want tok_alice docker trainer", client.allowed)
 	}
 }
 
@@ -203,6 +234,10 @@ func newAuthzServer(t *testing.T) (*Server, *authzNodeClient, string) {
 			Reservations: []model.ReservationView{
 				{ID: "res_alice", GroupID: "tok_alice", GPU: 0, Holder: "alice", CreatedAt: now, StartsAt: now, ExpiresAt: now.Add(time.Hour), Active: true},
 				{ID: "res_bob", GroupID: "tok_bob", GPU: 1, Holder: "bob", CreatedAt: now, StartsAt: now, ExpiresAt: now.Add(time.Hour), Active: true},
+			},
+			Authorizations: []model.AuthorizationView{
+				{ID: "auth_alice", TokenID: "tok_alice", Mode: model.ModeDocker, Holder: "alice", ContainerPattern: "trainer", CreatedAt: now, Active: true},
+				{ID: "auth_bob", TokenID: "tok_bob", Mode: model.ModeUser, Holder: "bob", Username: "bob", CreatedAt: now, Active: true},
 			},
 		},
 	}

@@ -343,10 +343,11 @@ func (s *Server) createDockerAuthorization(ctx context.Context, token model.Toke
 	if hasWildcard(container) {
 		containerPattern = container
 	} else {
-		var err error
-		containerID, err = s.Runtime.ResolveDockerContainer(ctx, container)
+		resolvedID, err := s.Runtime.ResolveDockerContainer(ctx, container)
 		if err != nil {
-			return model.AllowResult{}, fmt.Errorf("resolve docker container: %w", err)
+			containerPattern = container
+		} else {
+			containerID = resolvedID
 		}
 	}
 	now := time.Now()
@@ -652,11 +653,11 @@ func (s *Server) ensureTokenCanAuthorize(tokenHash string, token model.Token, no
 		return err
 	}
 	for _, reservation := range state.Reservations {
-		if reservation.TokenHash == tokenHash && model.ReservationActiveAt(reservation, now) {
+		if reservation.TokenHash == tokenHash && reservation.Active && !reservation.Revoked && now.Before(reservation.ExpiresAt) {
 			return nil
 		}
 	}
-	return errors.New("reserved token has no active reservation")
+	return errors.New("reserved token has no valid reservation")
 }
 
 func (s *Server) ps(ctx context.Context, now time.Time) ([]model.PSRow, error) {

@@ -53,6 +53,7 @@ func (s *Server) nodeHTTPHandler() http.Handler {
 	mux.HandleFunc("/api/v1/reservations", s.nodeAuth(s.handleNodeReservations))
 	mux.HandleFunc("/api/v1/claim-keys", s.nodeAuth(s.handleNodeClaimKeys))
 	mux.HandleFunc("/api/v1/show-keys", s.nodeAuth(s.handleNodeShowKeys))
+	mux.HandleFunc("/api/v1/allow", s.nodeAuth(s.handleNodeAllow))
 	mux.HandleFunc("/api/v1/revoke", s.nodeAuth(s.handleNodeRevoke))
 	return mux
 }
@@ -163,6 +164,56 @@ func (s *Server) handleNodeShowKeys(w http.ResponseWriter, r *http.Request, root
 	writeHTTPJSON(w, http.StatusOK, result)
 }
 
+func (s *Server) handleNodeAllow(w http.ResponseWriter, r *http.Request, rootKey string) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var args protocol.AllowArgs
+	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	tokenID := strings.TrimSpace(args.ID)
+	if tokenID == "" {
+		writeHTTPError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	status, err := s.Store.KeyStatus(rootKey, time.Now())
+	if err != nil {
+		writeDispatchError(w, err)
+		return
+	}
+	var secret string
+	for _, token := range status.Tokens {
+		if token.ID == tokenID {
+			secret = token.Key
+			break
+		}
+	}
+	if secret == "" {
+		writeHTTPError(w, http.StatusNotFound, "key not found or secret is not stored")
+		return
+	}
+	var result any
+	switch strings.TrimSpace(args.Mode) {
+	case model.ModeDocker:
+		result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_docker", protocol.DockerAllowArgs{Container: args.Container}, secret))
+	case model.ModeK8s:
+		result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_k8s", protocol.K8sAllowArgs{Namespace: args.Namespace}, secret))
+	case model.ModeUser:
+		result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_user", protocol.UserAllowArgs{User: args.User}, secret))
+	default:
+		writeHTTPError(w, http.StatusBadRequest, "mode must be docker, k8s, or user")
+		return
+	}
+	if err != nil {
+		writeDispatchError(w, err)
+		return
+	}
+	writeHTTPJSON(w, http.StatusCreated, result)
+}
+
 func (s *Server) handleNodeRevoke(w http.ResponseWriter, r *http.Request, rootKey string) {
 	if r.Method != http.MethodPost {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -182,9 +233,13 @@ func (s *Server) handleNodeRevoke(w http.ResponseWriter, r *http.Request, rootKe
 	writeHTTPJSON(w, http.StatusOK, result)
 }
 
-func protocolRequest(method string, args any) protocol.Request {
+func protocolRequest(method string, args any, token ...string) protocol.Request {
 	raw, _ := json.Marshal(args)
-	return protocol.Request{ID: "http", Method: method, Args: raw}
+	req := protocol.Request{ID: "http", Method: method, Args: raw}
+	if len(token) > 0 {
+		req.Token = token[0]
+	}
+	return req
 }
 
 func bearerToken(r *http.Request) (string, bool) {

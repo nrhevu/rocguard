@@ -1235,6 +1235,137 @@ select:focus {
   padding: 20px 22px 22px;
 }
 
+.rules-modal {
+  width: min(500px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow: hidden;
+}
+
+.rules-modal > .modal-form {
+  max-height: calc(100vh - 92px);
+  overflow-y: auto;
+}
+
+.rules-modal .modal-backdrop {
+  z-index: 30;
+  background: rgba(15, 23, 42, 0.46);
+}
+
+.add-rule-modal {
+  width: min(420px, calc(100vw - 32px));
+}
+
+.rules-table {
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.rules-table-header,
+.rules-table-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+}
+
+.rules-table-header {
+  min-height: 34px;
+  padding-right: 27px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.rules-table-body {
+  max-height: 220px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.rules-table-row {
+  width: 100%;
+  min-height: 42px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+  padding-bottom: 10px;
+  background: #fff;
+  color: var(--text);
+  text-align: left;
+}
+
+.rules-table-row:hover {
+  background: #f8fafc;
+}
+
+.rules-table-row.selected {
+  background: #eef2f7;
+  box-shadow: inset 3px 0 #0f766e;
+}
+
+.rules-table-row strong {
+  font-weight: 500;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.rules-table-row span,
+.rules-empty {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.rules-empty {
+  min-height: 58px;
+  border-top: 1px solid var(--line);
+  padding: 19px 12px;
+}
+
+.rules-toolbar {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 2px;
+  border-top: 1px solid var(--line);
+  padding: 2px 7px;
+  background: #f8fafc;
+}
+
+.rules-tool-button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  padding: 0;
+  background: transparent;
+  color: #334155;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.rules-tool-button:hover:not(:disabled) {
+  background: #e2e8f0;
+}
+
+.rules-tool-button:disabled {
+  color: #94a3b8;
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.rules-toolbar-divider {
+  height: 20px;
+  border-left: 1px solid var(--line-strong);
+  margin: 0 3px;
+}
+
 .modal-note {
   display: grid;
   gap: 16px;
@@ -1364,6 +1495,11 @@ select:focus {
 
   .gpu-grid {
     grid-template-columns: 1fr;
+  }
+
+  .rules-table-header,
+  .rules-table-row {
+    grid-template-columns: minmax(0, 1fr) 120px;
   }
 
   .dashboard-grid,

@@ -26,6 +26,7 @@ type NodeAPI interface {
 	CreateReservation(ctx context.Context, server ServerRecord, args protocol.RegisterArgs) (model.RegisterResult, error)
 	CreateClaimKey(ctx context.Context, server ServerRecord, args protocol.RegisterArgs) (model.RegisterResult, error)
 	ShowKeys(ctx context.Context, server ServerRecord, rootKey string) (model.KeyStatus, error)
+	Allow(ctx context.Context, server ServerRecord, args protocol.AllowArgs) (model.AllowResult, error)
 	Revoke(ctx context.Context, server ServerRecord, args protocol.RevokeArgs) (map[string]string, error)
 }
 
@@ -56,6 +57,12 @@ func (c NodeClient) ShowKeys(ctx context.Context, server ServerRecord, rootKey s
 	var status model.KeyStatus
 	err := c.call(ctx, server, rootKey, http.MethodPost, "/api/v1/show-keys", nil, &status)
 	return status, err
+}
+
+func (c NodeClient) Allow(ctx context.Context, server ServerRecord, args protocol.AllowArgs) (model.AllowResult, error) {
+	var result model.AllowResult
+	err := c.call(ctx, server, server.RootKey, http.MethodPost, "/api/v1/allow", args, &result)
+	return result, err
 }
 
 func (c NodeClient) Revoke(ctx context.Context, server ServerRecord, args protocol.RevokeArgs) (map[string]string, error) {

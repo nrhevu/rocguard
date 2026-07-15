@@ -192,6 +192,39 @@ func TestKeyStatusShowsStoredTokenKeys(t *testing.T) {
 	}
 }
 
+func TestStatusLinksAuthorizationToToken(t *testing.T) {
+	st := testStore(t)
+	rootKey, err := st.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	_, token, err := st.RegisterSoftToken(rootKey, "alice", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddAuthorization(model.Authorization{
+		ID:        NewAuthorizationID(),
+		Mode:      model.ModeUser,
+		TokenHash: token.Hash,
+		TokenMode: token.Mode,
+		Holder:    token.Name,
+		Username:  "alice",
+		CreatedAt: now,
+		Active:    true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := st.Status(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Authorizations) != 1 || status.Authorizations[0].TokenID != token.ID {
+		t.Fatalf("authorization token id = %+v, want %s", status.Authorizations, token.ID)
+	}
+}
+
 func TestKeyStatusMarksLegacyTokenKeysUnavailable(t *testing.T) {
 	st := testStore(t)
 	rootKey, err := st.ReadOrCreateRootKey()

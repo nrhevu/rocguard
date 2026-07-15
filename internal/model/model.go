@@ -231,6 +231,7 @@ type ReservationView struct {
 
 type AuthorizationView struct {
 	ID               string     `json:"id"`
+	TokenID          string     `json:"token_id,omitempty"`
 	Mode             string     `json:"mode"`
 	TokenMode        string     `json:"token_mode"`
 	Holder           string     `json:"holder"`

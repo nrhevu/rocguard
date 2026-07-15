@@ -259,6 +259,14 @@ func TestHardReservationAllowsMatchingAuthorizationScopes(t *testing.T) {
 			runtime: fakeRuntime{names: map[string]string{containerID: "codex-worker"}},
 		},
 		{
+			name: "docker deferred name",
+			auth: authorization("auth_docker_deferred", "hash_reserved", model.TokenModeReserved, model.ModeDocker, func(a *model.Authorization) {
+				a.ContainerPattern = "future-container"
+			}),
+			info:    model.ProcInfo{PID: 10, ContainerID: containerID},
+			runtime: fakeRuntime{names: map[string]string{containerID: "future-container"}},
+		},
+		{
 			name: "k8s wildcard",
 			auth: authorization("auth_k8s_wildcard", "hash_reserved", model.TokenModeReserved, model.ModeK8s, func(a *model.Authorization) {
 				a.Namespace = "train*"

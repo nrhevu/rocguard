@@ -43,6 +43,10 @@ func (c *cacheTestNodeClient) ShowKeys(context.Context, ServerRecord, string) (m
 	return model.KeyStatus{}, nil
 }
 
+func (c *cacheTestNodeClient) Allow(context.Context, ServerRecord, protocol.AllowArgs) (model.AllowResult, error) {
+	return model.AllowResult{}, nil
+}
+
 func (c *cacheTestNodeClient) Revoke(context.Context, ServerRecord, protocol.RevokeArgs) (map[string]string, error) {
 	return nil, nil
 }

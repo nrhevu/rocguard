@@ -56,6 +56,14 @@ type UserAllowArgs struct {
 	User string `json:"user"`
 }
 
+type AllowArgs struct {
+	ID        string `json:"id"`
+	Mode      string `json:"mode"`
+	Container string `json:"container,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	User      string `json:"user,omitempty"`
+}
+
 type WhoArgs struct {
 	GPU int `json:"gpu"`
 }
