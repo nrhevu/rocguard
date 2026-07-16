@@ -472,3 +472,7 @@ GOCACHE=/tmp/rocguard-go-build go build -buildvcs=false -o rocguard ./cmd/rocgua
   root-equivalent.
 - Do not share the root key with regular users.
 - Revoke keys and reservations that are no longer needed.
+
+## License
+
+RocGuard is licensed under the [Apache License 2.0](LICENSE).
