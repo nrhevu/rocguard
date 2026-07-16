@@ -1307,9 +1307,11 @@ function UsersView({ users, currentUser, onCreate, onDelete }) {
       <div className="key-list">
         {users.map((user) => (
           <div className="key-row" key={user.username}>
-            <div>
+            <div className="key-summary">
               <strong>{user.username}</strong>
-              <span>{user.role} · {new Date(user.created_at).toLocaleDateString()}</span>
+              <span className="key-subtitle">
+                {user.role} · {new Date(user.created_at).toLocaleDateString()}
+              </span>
             </div>
             {!sameText(user.username, currentUser) && (
               <button type="button" className="small-danger-button" onClick={() => onDelete(user)}>
