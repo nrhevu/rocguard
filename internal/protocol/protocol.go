@@ -33,6 +33,7 @@ type RegisterArgs struct {
 	Name              string     `json:"name"`
 	Purpose           string     `json:"purpose,omitempty"`
 	ExternalSessionID string     `json:"external_session_id,omitempty"`
+	UserKeyID         string     `json:"user_key_id,omitempty"`
 	GPUs              []int      `json:"gpus,omitempty"`
 	TTL               string     `json:"ttl"`
 	StartsAt          *time.Time `json:"starts_at,omitempty"`
@@ -59,10 +60,29 @@ type UserAllowArgs struct {
 
 type AllowArgs struct {
 	ID        string `json:"id"`
+	UserKeyID string `json:"user_key_id,omitempty"`
 	Mode      string `json:"mode"`
 	Container string `json:"container,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
 	User      string `json:"user,omitempty"`
+}
+
+type ManagedUserKey struct {
+	ID      string `json:"id"`
+	Owner   string `json:"owner"`
+	Version int64  `json:"version"`
+	Hash    string `json:"hash"`
+}
+
+type ManagedUserKeySnapshot struct {
+	SnapshotID string           `json:"snapshot_id"`
+	Keys       []ManagedUserKey `json:"keys"`
+}
+
+type ManagedUserKeySyncResult struct {
+	SnapshotID string `json:"snapshot_id"`
+	Applied    int    `json:"applied"`
+	Managed    bool   `json:"managed"`
 }
 
 type WhoArgs struct {

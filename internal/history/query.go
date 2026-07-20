@@ -27,8 +27,10 @@ func (s *Store) ListSessions(ctx context.Context, filter SessionFilter) ([]Sessi
 	now := time.Now().UTC().UnixMilli()
 	query := `SELECT r.session_id,r.server_id,r.server_name,r.node_id,r.owner_username,r.owner_editable,r.purpose,r.source,r.created_at_ms,r.starts_at_ms,
 		r.expires_at_ms,r.revoked_at_ms,r.finalized_at_ms,r.history_quality,
-		COUNT(DISTINCT j.job_id),MIN(j.started_at_ms),MAX(COALESCE(j.finished_at_ms,j.started_at_ms))
-		FROM reservation_sessions r LEFT JOIN jobs j ON j.session_id=r.session_id WHERE r.provisioning=0`
+		(SELECT COUNT(*) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)),
+		(SELECT MIN(j.started_at_ms) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)),
+		(SELECT MAX(COALESCE(j.finished_at_ms,j.started_at_ms)) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id))
+		FROM reservation_sessions r WHERE r.provisioning=0`
 	args := []any{}
 	if filter.ServerID != "" {
 		query += " AND r.server_id=?"
@@ -94,8 +96,10 @@ func (s *Store) ListSessions(ctx context.Context, filter SessionFilter) ([]Sessi
 func (s *Store) GetSession(ctx context.Context, id string) (Session, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT r.session_id,r.server_id,r.server_name,r.node_id,r.owner_username,r.owner_editable,r.purpose,r.source,r.created_at_ms,r.starts_at_ms,
 		r.expires_at_ms,r.revoked_at_ms,r.finalized_at_ms,r.history_quality,
-		COUNT(DISTINCT j.job_id),MIN(j.started_at_ms),MAX(COALESCE(j.finished_at_ms,j.started_at_ms))
-		FROM reservation_sessions r LEFT JOIN jobs j ON j.session_id=r.session_id WHERE r.session_id=? AND r.provisioning=0 GROUP BY r.session_id`, id)
+		(SELECT COUNT(*) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)),
+		(SELECT MIN(j.started_at_ms) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)),
+		(SELECT MAX(COALESCE(j.finished_at_ms,j.started_at_ms)) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id))
+		FROM reservation_sessions r WHERE r.session_id=? AND r.provisioning=0 GROUP BY r.session_id`, id)
 	item, err := scanSession(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Session{}, ErrNotFound
@@ -130,14 +134,15 @@ func (s *Store) ListJobs(ctx context.Context, sessionID string, limit int, after
 	if limit > 100 {
 		limit = 100
 	}
-	query := `SELECT node_id,job_id,source,mode,holder,command_json,started_at_ms,root_exited_at_ms,finished_at_ms,
-		start_precision,finish_precision,exit_code,end_reason FROM jobs WHERE session_id=?`
-	args := []any{sessionID}
+	query := `SELECT j.node_id,j.job_id,j.source,j.mode,j.holder,j.command_json,j.started_at_ms,j.root_exited_at_ms,j.finished_at_ms,
+		j.start_precision,j.finish_precision,j.exit_code,j.end_reason FROM jobs j WHERE
+		(j.session_id=? OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=?))`
+	args := []any{sessionID, sessionID}
 	if afterMS > 0 {
-		query += " AND (COALESCE(started_at_ms,0)>? OR (COALESCE(started_at_ms,0)=? AND job_id>?))"
+		query += " AND (COALESCE(j.started_at_ms,0)>? OR (COALESCE(j.started_at_ms,0)=? AND j.job_id>?))"
 		args = append(args, afterMS, afterMS, afterID)
 	}
-	query += " ORDER BY COALESCE(started_at_ms,0),job_id LIMIT ?"
+	query += " ORDER BY COALESCE(j.started_at_ms,0),j.job_id LIMIT ?"
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -253,7 +258,10 @@ func (s *Store) Summary(ctx context.Context, filter SessionFilter) (DashboardSum
 	if err := s.db.QueryRowContext(ctx, metricQuery, args...).Scan(&observed, &busy, &integral); err != nil {
 		return out, err
 	}
-	jobQuery := `SELECT COUNT(*) FROM jobs j JOIN reservation_sessions r ON r.session_id=j.session_id` + where
+	jobQuery := `SELECT COUNT(DISTINCT j.node_id||':'||j.job_id) FROM jobs j WHERE EXISTS (
+		SELECT 1 FROM reservation_sessions r` + where + ` AND (j.session_id=r.session_id OR EXISTS (
+			SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id
+		)))`
 	if err := s.db.QueryRowContext(ctx, jobQuery, args...).Scan(&out.Jobs); err != nil {
 		return out, err
 	}
@@ -521,7 +529,9 @@ func (s *Store) timeline(ctx context.Context, id string) ([]MinuteRollup, error)
 
 func (s *Store) authorizationScopes(ctx context.Context, id string) ([]AuthorizationScope, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT mode,holder,selector,command_json,created_at_ms,expires_at_ms,ended_at_ms,end_reason
-		FROM authorization_scopes WHERE session_id=? ORDER BY created_at_ms`, id)
+		FROM authorization_scopes a WHERE a.session_id=? OR EXISTS (
+			SELECT 1 FROM authorization_sessions s WHERE s.node_id=a.node_id AND s.authorization_id=a.authorization_id AND s.session_id=?
+		) ORDER BY created_at_ms`, id, id)
 	if err != nil {
 		return nil, err
 	}

@@ -407,7 +407,21 @@ func (s *Server) dispatch(ctx context.Context, p peer, req protocol.Request) (an
 			if err := s.ensureGPUsCanReserveWindow(ctx, args.GPUs, startsAt, expiresAt); err != nil {
 				return nil, err
 			}
-			secret, token, reservations, err := s.Store.RegisterScheduledReservationsWithSession(args.RootKey, args.Name, args.Purpose, args.ExternalSessionID, args.GPUs, startsAt, expiresAt, now)
+			var secret, groupID string
+			var token model.Token
+			var reservations []model.Reservation
+			if strings.TrimSpace(args.UserKeyID) != "" {
+				token, groupID, reservations, err = s.Store.RegisterManagedReservations(args.RootKey, args.UserKeyID, args.Purpose, args.ExternalSessionID, args.GPUs, startsAt, expiresAt, now)
+			} else {
+				managed, managedErr := s.Store.ManagedKeysEnabled()
+				if managedErr != nil {
+					return nil, managedErr
+				}
+				if managed {
+					return nil, errors.New("user_key_id is required; keys are managed by the web gateway")
+				}
+				secret, token, reservations, err = s.Store.RegisterScheduledReservationsWithSession(args.RootKey, args.Name, args.Purpose, args.ExternalSessionID, args.GPUs, startsAt, expiresAt, now)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -418,8 +432,16 @@ func (s *Server) dispatch(ctx context.Context, p peer, req protocol.Request) (an
 				ids = append(ids, reservation.ID)
 				gpus = append(gpus, reservation.GPU)
 			}
-			return model.RegisterResult{Token: secret, TokenID: token.ID, Mode: token.Mode, ReservationIDs: ids, GPUs: gpus, StartsAt: timePtrIfSet(startsAt), ExpiresAt: timePtrIfSet(token.ExpiresAt)}, nil
+			if groupID == "" {
+				groupID = token.ID
+			}
+			return model.RegisterResult{Token: secret, TokenID: token.ID, GroupID: groupID, Mode: token.Mode, ReservationIDs: ids, GPUs: gpus, StartsAt: timePtrIfSet(startsAt), ExpiresAt: timePtrIfSet(expiresAt)}, nil
 		case model.TokenModeClaimed:
+			if managed, managedErr := s.Store.ManagedKeysEnabled(); managedErr != nil {
+				return nil, managedErr
+			} else if managed {
+				return nil, errors.New("claim keys are managed by the web gateway")
+			}
 			secret, token, err := s.Store.RegisterSoftToken(args.RootKey, args.Name, now)
 			if err != nil {
 				return nil, err
@@ -628,6 +650,7 @@ func (s *Server) createDockerAuthorization(ctx context.Context, tokenSecret stri
 		Mode:             model.ModeDocker,
 		TokenHash:        tokenHash,
 		TokenMode:        store.NormalizeTokenMode(token.Mode),
+		TokenVersion:     token.Version,
 		Holder:           token.Name,
 		UID:              p.UID,
 		GID:              p.GID,
@@ -637,7 +660,7 @@ func (s *Server) createDockerAuthorization(ctx context.Context, tokenSecret stri
 		ExpiresAt:        token.ExpiresAt,
 		Active:           true,
 	}
-	if err := s.addAuthorization(tokenSecret, &authorization); err != nil {
+	if err := s.persistAuthorization(tokenSecret, token, &authorization); err != nil {
 		return model.AllowResult{}, err
 	}
 	return model.AllowResult{AuthorizationID: authorization.ID, Mode: authorization.Mode, ContainerID: containerID, ContainerPattern: containerPattern, ExpiresAt: timePtrIfSet(authorization.ExpiresAt)}, nil
@@ -680,19 +703,20 @@ func (s *Server) createK8sAuthorization(ctx context.Context, tokenSecret string,
 	}
 	now := time.Now()
 	authorization := model.Authorization{
-		ID:        store.NewAuthorizationID(),
-		Mode:      model.ModeK8s,
-		TokenHash: tokenHash,
-		TokenMode: store.NormalizeTokenMode(token.Mode),
-		Holder:    token.Name,
-		UID:       p.UID,
-		GID:       p.GID,
-		Namespace: strings.TrimSpace(args.Namespace),
-		CreatedAt: now.UTC(),
-		ExpiresAt: token.ExpiresAt,
-		Active:    true,
+		ID:           store.NewAuthorizationID(),
+		Mode:         model.ModeK8s,
+		TokenHash:    tokenHash,
+		TokenMode:    store.NormalizeTokenMode(token.Mode),
+		TokenVersion: token.Version,
+		Holder:       token.Name,
+		UID:          p.UID,
+		GID:          p.GID,
+		Namespace:    strings.TrimSpace(args.Namespace),
+		CreatedAt:    now.UTC(),
+		ExpiresAt:    token.ExpiresAt,
+		Active:       true,
 	}
-	if err := s.addAuthorization(tokenSecret, &authorization); err != nil {
+	if err := s.persistAuthorization(tokenSecret, token, &authorization); err != nil {
 		return model.AllowResult{}, err
 	}
 	return model.AllowResult{AuthorizationID: authorization.ID, Mode: authorization.Mode, Namespace: authorization.Namespace, ExpiresAt: timePtrIfSet(authorization.ExpiresAt)}, nil
@@ -722,19 +746,20 @@ func (s *Server) createUserAuthorization(tokenSecret string, token model.Token, 
 	}
 	now := time.Now()
 	authorization := model.Authorization{
-		ID:        store.NewAuthorizationID(),
-		Mode:      model.ModeUser,
-		TokenHash: tokenHash,
-		TokenMode: store.NormalizeTokenMode(token.Mode),
-		Holder:    token.Name,
-		UID:       uid,
-		GID:       p.GID,
-		Username:  username,
-		CreatedAt: now.UTC(),
-		ExpiresAt: token.ExpiresAt,
-		Active:    true,
+		ID:           store.NewAuthorizationID(),
+		Mode:         model.ModeUser,
+		TokenHash:    tokenHash,
+		TokenMode:    store.NormalizeTokenMode(token.Mode),
+		TokenVersion: token.Version,
+		Holder:       token.Name,
+		UID:          uid,
+		GID:          p.GID,
+		Username:     username,
+		CreatedAt:    now.UTC(),
+		ExpiresAt:    token.ExpiresAt,
+		Active:       true,
 	}
-	if err := s.addAuthorization(tokenSecret, &authorization); err != nil {
+	if err := s.persistAuthorization(tokenSecret, token, &authorization); err != nil {
 		return model.AllowResult{}, err
 	}
 	return model.AllowResult{AuthorizationID: authorization.ID, Mode: authorization.Mode, Username: authorization.Username, ExpiresAt: timePtrIfSet(authorization.ExpiresAt)}, nil
@@ -757,6 +782,31 @@ func (s *Server) addAuthorization(tokenSecret string, authorization *model.Autho
 	return s.addAuthorizationLocked(tokenSecret, authorization)
 }
 
+func (s *Server) persistAuthorization(tokenSecret string, token model.Token, authorization *model.Authorization) error {
+	if strings.TrimSpace(tokenSecret) != "" || !token.Managed {
+		return s.addAuthorization(tokenSecret, authorization)
+	}
+	s.enforceMu.Lock()
+	defer s.enforceMu.Unlock()
+	current, err := s.Store.ManagedTokenByID(token.ID, time.Now())
+	if err != nil {
+		return err
+	}
+	if current.Hash != token.Hash || current.Version != token.Version {
+		return errors.New("managed key identity changed during authorization")
+	}
+	authorization.TokenHash = current.Hash
+	authorization.TokenMode = model.TokenModeManaged
+	authorization.TokenVersion = current.Version
+	authorization.Holder = current.Name
+	authorization.ExpiresAt = time.Time{}
+	if err := s.Store.AddAuthorization(*authorization); err != nil {
+		return err
+	}
+	s.emitAuthorization(current.ID, *authorization)
+	return nil
+}
+
 func (s *Server) addAuthorizationLocked(tokenSecret string, authorization *model.Authorization) error {
 	now := time.Now()
 	token, tokenHash, err := s.validateToken(tokenSecret, now)
@@ -770,6 +820,7 @@ func (s *Server) addAuthorizationLocked(tokenSecret string, authorization *model
 		return err
 	}
 	authorization.TokenMode = store.NormalizeTokenMode(token.Mode)
+	authorization.TokenVersion = token.Version
 	authorization.Holder = token.Name
 	authorization.ExpiresAt = token.ExpiresAt
 	if err := s.Store.AddAuthorization(*authorization); err != nil {
@@ -860,17 +911,18 @@ func (s *Server) runCommand(ctx context.Context, conn net.Conn, reqID, tokenSecr
 	}
 	now := time.Now()
 	authorization := model.Authorization{
-		ID:        store.NewAuthorizationID(),
-		Mode:      model.ModeBare,
-		TokenHash: tokenHash,
-		TokenMode: store.NormalizeTokenMode(token.Mode),
-		Holder:    token.Name,
-		UID:       p.UID,
-		GID:       p.GID,
-		Command:   args.Command,
-		CreatedAt: now.UTC(),
-		ExpiresAt: token.ExpiresAt,
-		Active:    true,
+		ID:           store.NewAuthorizationID(),
+		Mode:         model.ModeBare,
+		TokenHash:    tokenHash,
+		TokenMode:    store.NormalizeTokenMode(token.Mode),
+		TokenVersion: token.Version,
+		Holder:       token.Name,
+		UID:          p.UID,
+		GID:          p.GID,
+		Command:      args.Command,
+		CreatedAt:    now.UTC(),
+		ExpiresAt:    token.ExpiresAt,
+		Active:       true,
 	}
 	cgroupPath, cgroupRel, err := s.createCgroup(authorization.ID)
 	if err != nil {
@@ -1726,6 +1778,9 @@ func (s *Server) cleanupExpiredReservationsState(state model.State) bool {
 			continue
 		}
 		groupID := tokenIDs[reservation.TokenHash]
+		if reservation.GroupID != "" {
+			groupID = reservation.GroupID
+		}
 		if groupID != "" && !emitted[groupID] {
 			reason := "expired"
 			if reservation.Revoked {

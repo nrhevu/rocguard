@@ -1724,6 +1724,26 @@ select:focus {
   font-size: 13px;
 }
 
+.key-sync {
+  display: inline-block;
+  margin: 8px 8px 0 0;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eef2f7;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.key-sync-synced {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.key-sync-error {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
 .reserved-key-details {
   display: grid;
   grid-template-columns: minmax(120px, 1.25fr) repeat(2, minmax(160px, 1fr)) minmax(70px, 0.5fr);

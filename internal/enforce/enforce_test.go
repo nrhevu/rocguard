@@ -1182,6 +1182,59 @@ func TestSoftClaimCreatedOnCleanAuthorizedGPU(t *testing.T) {
 	}
 }
 
+func TestManagedKeyUsesReservedEntitlementAndClaimsFreeGPU(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		reservations []model.Reservation
+		wantFirst    string
+	}{
+		{name: "own reservation", reservations: []model.Reservation{reservation("hash_managed", 0)}, wantFirst: "allow"},
+		{name: "free gpu", wantFirst: "claim"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			killer := &fakeKiller{}
+			authz := Authorizer{Proc: fakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000}}}, Killer: killer, Now: fixedNow}
+			managed := token("hash_managed", model.TokenModeManaged)
+			managed.Managed, managed.Version, managed.ExpiresAt = true, 1, time.Time{}
+			auth := authorization("auth_managed", managed.Hash, model.TokenModeManaged, model.ModeUser, func(a *model.Authorization) {
+				a.UID = 1000
+				a.TokenVersion = 1
+				a.ExpiresAt = time.Time{}
+			})
+			state := model.State{Tokens: []model.Token{managed}, Reservations: test.reservations, Authorizations: []model.Authorization{auth}}
+			decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(decisions) == 0 || decisions[0].Action != test.wantFirst || len(killer.killed) != 0 {
+				t.Fatalf("unexpected decisions=%+v killed=%v", decisions, killer.killed)
+			}
+		})
+	}
+}
+
+func TestManagedKeyCannotUseAnotherOwnersReservation(t *testing.T) {
+	killer := &fakeKiller{}
+	authz := Authorizer{Proc: fakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000}}}, Killer: killer, Now: fixedNow}
+	managed := token("hash_managed", model.TokenModeManaged)
+	managed.Managed, managed.Version, managed.ExpiresAt = true, 1, time.Time{}
+	auth := authorization("auth_managed", managed.Hash, model.TokenModeManaged, model.ModeUser, func(a *model.Authorization) {
+		a.UID = 1000
+		a.TokenVersion = 1
+		a.ExpiresAt = time.Time{}
+	})
+	other := reservation("hash_other", 0)
+	other.Holder = "bob"
+	state := model.State{Tokens: []model.Token{managed}, Reservations: []model.Reservation{other}, Authorizations: []model.Authorization{auth}}
+	decisions, err := authz.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Action != "kill" || len(killer.killed) != 1 {
+		t.Fatalf("managed key crossed reservation ownership: decisions=%+v killed=%v", decisions, killer.killed)
+	}
+}
+
 func TestSoftClaimRejectsAuthorizedProcessOnBusyGPU(t *testing.T) {
 	killer := &fakeKiller{}
 	authz := Authorizer{

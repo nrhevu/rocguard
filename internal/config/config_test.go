@@ -19,13 +19,14 @@ func TestDefaultLoadsSecuritySettings(t *testing.T) {
 	t.Setenv("ROCGUARD_WEB_TLS_CERT", "/tls/web.crt")
 	t.Setenv("ROCGUARD_WEB_TLS_KEY", "/tls/web.key")
 	t.Setenv("ROCGUARD_WEB_SESSION_KEY", "/state/session.key")
+	t.Setenv("ROCGUARD_WEB_USER_KEY", "/state/user-key.key")
 	t.Setenv("ROCGUARD_GPU_COUNT", "8")
 
 	cfg := Default()
 	if !cfg.NodeAllowInsecure || !cfg.WebAllowInsecure || !cfg.WebAllowInsecureNodes || !cfg.WebAllowRegistration || !cfg.WebSecureCookies || !cfg.WebTrustProxy {
 		t.Fatalf("boolean security settings were not loaded: %+v", cfg)
 	}
-	if cfg.WebTLSCert != "/tls/web.crt" || cfg.WebTLSKey != "/tls/web.key" || cfg.WebSessionKey != "/state/session.key" {
+	if cfg.WebTLSCert != "/tls/web.crt" || cfg.WebTLSKey != "/tls/web.key" || cfg.WebSessionKey != "/state/session.key" || cfg.WebUserKey != "/state/user-key.key" {
 		t.Fatalf("web security paths were not loaded: %+v", cfg)
 	}
 	if cfg.GPUCount != 8 {

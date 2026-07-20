@@ -86,6 +86,7 @@ func (s *Server) nodeHTTPHandler() http.Handler {
 	mux.HandleFunc("/api/v1/snapshot", s.nodeAuth(s.handleNodeSnapshot))
 	mux.HandleFunc("/api/v1/info", s.nodeAuth(s.handleNodeInfo))
 	mux.HandleFunc("/api/v1/telemetry", s.nodeAuth(s.handleNodeTelemetry))
+	mux.HandleFunc("/api/v1/user-keys/sync", s.nodeAuth(s.handleNodeUserKeySync))
 	mux.HandleFunc("/api/v1/reservations", s.nodeAuth(s.handleNodeReservations))
 	mux.HandleFunc("/api/v1/claim-keys", s.nodeAuth(s.handleNodeClaimKeys))
 	mux.HandleFunc("/api/v1/show-keys", s.nodeAuth(s.handleNodeShowKeys))
@@ -110,6 +111,26 @@ func (s *Server) nodeHTTPHandler() http.Handler {
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) handleNodeUserKeySync(w http.ResponseWriter, r *http.Request, rootKey string) {
+	if r.Method != http.MethodPut {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var snapshot protocol.ManagedUserKeySnapshot
+	if err := decodeNodeJSON(r, &snapshot); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.enforceMu.Lock()
+	result, err := s.Store.SyncManagedUserKeys(rootKey, snapshot, time.Now())
+	s.enforceMu.Unlock()
+	if err != nil {
+		writeDispatchError(w, err)
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) acquireNodeHTTPRequest() (func(), bool) {
@@ -293,35 +314,55 @@ func (s *Server) handleNodeAllow(w http.ResponseWriter, r *http.Request, rootKey
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	tokenID := strings.TrimSpace(args.ID)
+	tokenID := strings.TrimSpace(args.UserKeyID)
+	if tokenID == "" {
+		tokenID = strings.TrimSpace(args.ID)
+	}
 	if tokenID == "" {
 		writeHTTPError(w, http.StatusBadRequest, "id is required")
 		return
 	}
-	status, err := s.Store.KeyStatus(rootKey, time.Now())
-	if err != nil {
-		writeDispatchError(w, err)
-		return
-	}
-	var secret string
-	for _, token := range status.Tokens {
-		if token.ID == tokenID {
-			secret = token.Key
-			break
+	token, managedErr := s.Store.ManagedTokenByID(tokenID, time.Now())
+	secret := ""
+	managed := managedErr == nil
+	if !managed {
+		status, err := s.Store.KeyStatus(rootKey, time.Now())
+		if err != nil {
+			writeDispatchError(w, err)
+			return
+		}
+		for _, candidate := range status.Tokens {
+			if candidate.ID == tokenID {
+				secret = candidate.Key
+				break
+			}
+		}
+		if secret == "" {
+			writeHTTPError(w, http.StatusNotFound, "key not found or secret is not stored")
+			return
 		}
 	}
-	if secret == "" {
-		writeHTTPError(w, http.StatusNotFound, "key not found or secret is not stored")
-		return
-	}
 	var result any
+	var err error
 	switch strings.TrimSpace(args.Mode) {
 	case model.ModeDocker:
-		result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_docker", protocol.DockerAllowArgs{Container: args.Container}, secret))
+		if managed {
+			result, err = s.createDockerAuthorization(r.Context(), "", token, token.Hash, peer{}, protocol.DockerAllowArgs{Container: args.Container})
+		} else {
+			result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_docker", protocol.DockerAllowArgs{Container: args.Container}, secret))
+		}
 	case model.ModeK8s:
-		result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_k8s", protocol.K8sAllowArgs{Namespace: args.Namespace}, secret))
+		if managed {
+			result, err = s.createK8sAuthorization(r.Context(), "", token, token.Hash, peer{}, protocol.K8sAllowArgs{Namespace: args.Namespace})
+		} else {
+			result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_k8s", protocol.K8sAllowArgs{Namespace: args.Namespace}, secret))
+		}
 	case model.ModeUser:
-		result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_user", protocol.UserAllowArgs{User: args.User}, secret))
+		if managed {
+			result, err = s.createUserAuthorization("", token, token.Hash, peer{}, protocol.UserAllowArgs{User: args.User})
+		} else {
+			result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_user", protocol.UserAllowArgs{User: args.User}, secret))
+		}
 	default:
 		writeHTTPError(w, http.StatusBadRequest, "mode must be docker, k8s, or user")
 		return

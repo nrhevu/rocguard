@@ -28,9 +28,9 @@ const sessionFactsCTE = `WITH session_facts AS (
 			WHEN r.expires_at_ms>? THEN 'active' ELSE 'completed' END AS derived_status,
 		(SELECT COUNT(*) FROM session_gpus g WHERE g.session_id=r.session_id) AS gpu_count,
 		(SELECT MIN(g.gpu) FROM session_gpus g WHERE g.session_id=r.session_id) AS first_gpu,
-		(SELECT COUNT(*) FROM jobs j WHERE j.session_id=r.session_id) AS job_count,
-		(SELECT MIN(j.started_at_ms) FROM jobs j WHERE j.session_id=r.session_id) AS first_job_at_ms,
-		(SELECT MAX(COALESCE(j.finished_at_ms,j.started_at_ms)) FROM jobs j WHERE j.session_id=r.session_id) AS last_job_at_ms,
+		(SELECT COUNT(*) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)) AS job_count,
+		(SELECT MIN(j.started_at_ms) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)) AS first_job_at_ms,
+		(SELECT MAX(COALESCE(j.finished_at_ms,j.started_at_ms)) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)) AS last_job_at_ms,
 		COALESCE((SELECT SUM(s.observed_ms) FROM session_gpu_summaries s WHERE s.session_id=r.session_id),0) AS observed_ms,
 		COALESCE((SELECT SUM(s.busy_ms) FROM session_gpu_summaries s WHERE s.session_id=r.session_id),0) AS busy_ms,
 		(SELECT SUM(s.utilization_integral) FROM session_gpu_summaries s WHERE s.session_id=r.session_id) AS utilization_integral,
@@ -72,9 +72,18 @@ func (s *Store) Search(ctx context.Context, expression SearchExpression, sort Se
 	var integral sql.NullFloat64
 	summaryQuery := sessionFactsCTE + ` SELECT COUNT(*),
 		COALESCE(SUM(duration_ms*gpu_count),0),COALESCE(SUM(observed_ms),0),COALESCE(SUM(busy_ms),0),
-		SUM(utilization_integral),COALESCE(SUM(job_count),0) FROM session_facts f WHERE ` + predicate
+		SUM(utilization_integral) FROM session_facts f WHERE ` + predicate
 	summaryArgs := append(append([]any{}, cteArgs...), predicateArgs...)
-	if err := tx.QueryRowContext(ctx, summaryQuery, summaryArgs...).Scan(&summary.Sessions, &reserved, &observed, &busy, &integral, &summary.Jobs); err != nil {
+	if err := tx.QueryRowContext(ctx, summaryQuery, summaryArgs...).Scan(&summary.Sessions, &reserved, &observed, &busy, &integral); err != nil {
+		return DashboardSummary{}, nil, SearchCursor{}, err
+	}
+	jobSummaryQuery := sessionFactsCTE + `, matched_sessions AS (SELECT f.session_id FROM session_facts f WHERE ` + predicate + `)
+		SELECT COUNT(DISTINCT j.node_id||':'||j.job_id) FROM jobs j WHERE EXISTS (
+			SELECT 1 FROM matched_sessions m WHERE j.session_id=m.session_id OR EXISTS (
+				SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=m.session_id
+			)
+		)`
+	if err := tx.QueryRowContext(ctx, jobSummaryQuery, summaryArgs...).Scan(&summary.Jobs); err != nil {
 		return DashboardSummary{}, nil, SearchCursor{}, err
 	}
 	if reserved > 0 {
@@ -302,7 +311,8 @@ func compileJobRule(field, op string, raw json.RawMessage) (string, []any, error
 	textColumns := map[string]string{"source": "j.source", "mode": "j.mode", "holder": "j.holder", "end_reason": "j.end_reason", "start_precision": "j.start_precision", "finish_precision": "j.finish_precision"}
 	numberColumns := map[string]string{"exit_code": "j.exit_code"}
 	timeColumns := map[string]string{"started_at": "j.started_at_ms", "finished_at": "j.finished_at_ms"}
-	prefix := "SELECT 1 FROM jobs j WHERE j.session_id=f.session_id AND "
+	association := "(j.session_id=f.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=f.session_id))"
+	prefix := "SELECT 1 FROM jobs j WHERE " + association + " AND "
 	if column, ok := textColumns[field]; ok {
 		return compileExistsTextRule(prefix, column, op, raw)
 	}
@@ -314,13 +324,13 @@ func compileJobRule(field, op string, raw json.RawMessage) (string, []any, error
 	}
 	if field == "gpu" {
 		if op == "is_empty" {
-			return `EXISTS (SELECT 1 FROM jobs j WHERE j.session_id=f.session_id
+			return `EXISTS (SELECT 1 FROM jobs j WHERE (j.session_id=f.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=f.session_id))
 				AND NOT EXISTS (SELECT 1 FROM job_gpus jg WHERE jg.node_id=j.node_id AND jg.job_id=j.job_id))`, nil, nil
 		}
 		if op == "is_not_empty" {
-			return "EXISTS (SELECT 1 FROM jobs j JOIN job_gpus jg ON jg.node_id=j.node_id AND jg.job_id=j.job_id WHERE j.session_id=f.session_id)", nil, nil
+			return "EXISTS (SELECT 1 FROM jobs j JOIN job_gpus jg ON jg.node_id=j.node_id AND jg.job_id=j.job_id WHERE " + association + ")", nil, nil
 		}
-		return compileExistsNumberRule("SELECT 1 FROM jobs j JOIN job_gpus jg ON jg.node_id=j.node_id AND jg.job_id=j.job_id WHERE j.session_id=f.session_id AND ", "jg.gpu", op, raw)
+		return compileExistsNumberRule("SELECT 1 FROM jobs j JOIN job_gpus jg ON jg.node_id=j.node_id AND jg.job_id=j.job_id WHERE "+association+" AND ", "jg.gpu", op, raw)
 	}
 	if field == "command" {
 		if op == "is_empty" || op == "is_not_empty" {
@@ -328,7 +338,7 @@ func compileJobRule(field, op string, raw json.RawMessage) (string, []any, error
 			if op == "is_not_empty" {
 				compare = "COALESCE(json_array_length(j.command_json),0)>0"
 			}
-			return "EXISTS (SELECT 1 FROM jobs j WHERE j.session_id=f.session_id AND " + compare + ")", nil, nil
+			return "EXISTS (SELECT 1 FROM jobs j WHERE " + association + " AND " + compare + ")", nil, nil
 		}
 		negative := op == "not_contains" || op == "not_equals"
 		positiveOp := map[string]string{"not_contains": "contains", "not_equals": "equals"}[op]
@@ -346,7 +356,7 @@ func compileJobRule(field, op string, raw json.RawMessage) (string, []any, error
 		if positiveOp == "contains" {
 			compare = "INSTR(LOWER(CAST(a.value AS TEXT)),LOWER(?))>0"
 		}
-		query := "EXISTS (SELECT 1 FROM jobs j, json_each(j.command_json) a WHERE j.session_id=f.session_id AND " + compare + ")"
+		query := "EXISTS (SELECT 1 FROM jobs j, json_each(j.command_json) a WHERE " + association + " AND " + compare + ")"
 		if negative {
 			query = "NOT " + query
 		}

@@ -14,6 +14,7 @@ import (
 	"rocguard/internal/config"
 	"rocguard/internal/model"
 	"rocguard/internal/protocol"
+	"rocguard/internal/telemetry"
 )
 
 type authzNodeClient struct {
@@ -25,6 +26,30 @@ type authzNodeClient struct {
 	reservationResult model.RegisterResult
 	allowed           []protocol.AllowArgs
 	revoked           []string
+}
+
+type managedAuthzNodeClient struct {
+	*authzNodeClient
+	snapshot protocol.ManagedUserKeySnapshot
+}
+
+func (c *managedAuthzNodeClient) Info(context.Context, ServerRecord) (telemetry.Info, error) {
+	return telemetry.Info{NodeID: "node-managed", Capabilities: []string{"managed_user_keys_v1"}}, nil
+}
+
+func (c *managedAuthzNodeClient) Telemetry(context.Context, ServerRecord, string, int) (telemetry.Page, error) {
+	return telemetry.Page{}, nil
+}
+
+func (c *managedAuthzNodeClient) SyncManagedUserKeys(_ context.Context, _ ServerRecord, snapshot protocol.ManagedUserKeySnapshot) (protocol.ManagedUserKeySyncResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.snapshot = snapshot
+	c.keys.Tokens = nil
+	for _, key := range snapshot.Keys {
+		c.keys.Tokens = append(c.keys.Tokens, model.TokenView{ID: key.ID, Name: key.Owner, Mode: model.TokenModeManaged, Version: key.Version, Managed: true})
+	}
+	return protocol.ManagedUserKeySyncResult{SnapshotID: snapshot.SnapshotID, Applied: len(snapshot.Keys), Managed: true}, nil
 }
 
 func (c *authzNodeClient) Health(context.Context, ServerRecord, string) error {
@@ -134,8 +159,8 @@ func TestGatewayRoleAuthorization(t *testing.T) {
 	if err := json.Unmarshal(reserve.Body.Bytes(), &reserveResult); err != nil {
 		t.Fatal(err)
 	}
-	if reserveResult.Token != "" || reserveResult.TokenID != "tok_reserved" {
-		t.Fatalf("reserve result = %+v, want token ID without secret", reserveResult)
+	if reserveResult.Token != "" || reserveResult.TokenID != "" {
+		t.Fatalf("reserve result leaked credential identity: %+v", reserveResult)
 	}
 	client.mu.Lock()
 	gotOwner := client.lastReservation.Name
@@ -218,6 +243,93 @@ func TestGatewayFiltersAndAuthorizesOwnedKeys(t *testing.T) {
 	}
 	if len(client.allowed) != 1 || client.allowed[0].ID != "tok_alice" || client.allowed[0].Container != "trainer" {
 		t.Fatalf("allowed args = %+v, want tok_alice docker trainer", client.allowed)
+	}
+}
+
+func TestFixedKeyAPIRestrictsRevealAndRegenerate(t *testing.T) {
+	server, _, _ := newAuthzServer(t)
+	if err := server.Users.InitializeFixedKeys(bytes.Repeat([]byte{0x33}, 32)); err != nil {
+		t.Fatal(err)
+	}
+	handler := server.routes()
+	aliceCookie := testSessionCookie(t, server, "alice", RoleUser)
+	adminCookie := testSessionCookie(t, server, "admin", RoleAdmin)
+
+	list := requestJSON(handler, http.MethodGet, "/api/keys", "", aliceCookie)
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
+	}
+	var keys []FixedUserKey
+	if err := json.Unmarshal(list.Body.Bytes(), &keys); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 || keys[0].Owner != "alice" || keys[0].Secret != "" {
+		t.Fatalf("user list leaked or returned another key: %+v", keys)
+	}
+	if response := requestJSON(handler, http.MethodPost, "/api/keys/admin/reveal", "", aliceCookie); response.Code != http.StatusForbidden {
+		t.Fatalf("user revealed another key: %d %s", response.Code, response.Body.String())
+	}
+	reveal := requestJSON(handler, http.MethodPost, "/api/keys/alice/reveal", "", aliceCookie)
+	if reveal.Code != http.StatusOK {
+		t.Fatalf("reveal status=%d body=%s", reveal.Code, reveal.Body.String())
+	}
+	var first FixedUserKey
+	if err := json.Unmarshal(reveal.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	regenerate := requestJSON(handler, http.MethodPost, "/api/keys/alice/regenerate", "", adminCookie)
+	if regenerate.Code != http.StatusOK {
+		t.Fatalf("admin regenerate status=%d body=%s", regenerate.Code, regenerate.Body.String())
+	}
+	var replacement FixedUserKey
+	if err := json.Unmarshal(regenerate.Body.Bytes(), &replacement); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.Version != first.Version+1 || replacement.ID == first.ID || replacement.Secret == first.Secret {
+		t.Fatalf("key was not replaced: before=%+v after=%+v", first, replacement)
+	}
+}
+
+func TestManagedGatewayIgnoresClientKeyIdentity(t *testing.T) {
+	server, legacy, serverID := newAuthzServer(t)
+	if err := server.Users.InitializeFixedKeys(bytes.Repeat([]byte{0x66}, 32)); err != nil {
+		t.Fatal(err)
+	}
+	aliceKey, err := server.Users.FixedKeyForUser("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := &managedAuthzNodeClient{authzNodeClient: legacy}
+	server.Client = managed
+	legacy.reservationResult = model.RegisterResult{Token: "must-not-leak", TokenID: aliceKey.ID, GroupID: "grp_test", Mode: model.TokenModeManaged, ReservationIDs: []string{"res_test"}, GPUs: []int{0}}
+	handler := server.routes()
+	cookie := testSessionCookie(t, server, "alice", RoleUser)
+	reserve := requestJSON(handler, http.MethodPost, "/api/servers/"+serverID+"/reservations", `{"name":"mallory","user_key_id":"uk_attacker","gpus":[0]}`, cookie)
+	if reserve.Code != http.StatusCreated {
+		t.Fatalf("reserve status=%d body=%s", reserve.Code, reserve.Body.String())
+	}
+	var result model.RegisterResult
+	if err := json.Unmarshal(reserve.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Token != "" || result.GroupID != "grp_test" {
+		t.Fatalf("reservation response leaked secret or lost group: %+v", result)
+	}
+	legacy.mu.Lock()
+	gotReservation := legacy.lastReservation
+	legacy.mu.Unlock()
+	if gotReservation.Name != "alice" || gotReservation.UserKeyID != aliceKey.ID {
+		t.Fatalf("client selected managed identity: %+v", gotReservation)
+	}
+
+	allow := requestJSON(handler, http.MethodPost, "/api/servers/"+serverID+"/allow", `{"id":"uk_attacker","user_key_id":"uk_attacker","mode":"user","user":"alice"}`, cookie)
+	if allow.Code != http.StatusCreated {
+		t.Fatalf("allow status=%d body=%s", allow.Code, allow.Body.String())
+	}
+	legacy.mu.Lock()
+	defer legacy.mu.Unlock()
+	if len(legacy.allowed) != 1 || legacy.allowed[0].ID != aliceKey.ID || legacy.allowed[0].UserKeyID != aliceKey.ID {
+		t.Fatalf("client selected authorization identity: %+v", legacy.allowed)
 	}
 }
 

@@ -48,6 +48,9 @@ type Server struct {
 	activeNonAdmin int
 	historySyncMu  sync.Mutex
 	historySync    map[string]historySyncState
+	managedKeySync chan struct{}
+	managedKeyMu   sync.Mutex
+	managedKeyNode map[string]managedKeyNodeState
 }
 
 type addServerRequest struct {
@@ -115,17 +118,19 @@ type serverSnapshot struct {
 func New(cfg config.Config) *Server {
 	sessionKey, sessionKeyErr := loadOrCreateSessionKey(cfg.WebSessionKey)
 	return &Server{
-		Cfg:           cfg,
-		Registry:      NewRegistry(cfg.WebRegistry, cfg.WebAllowInsecureNodes),
-		Users:         NewUserStore(cfg.WebUsers),
-		Client:        NodeClient{Timeout: 4 * time.Second, AllowInsecureNodes: cfg.WebAllowInsecureNodes},
-		fleetCacheTTL: time.Second,
-		now:           time.Now,
-		sessionKey:    sessionKey,
-		sessionKeyErr: sessionKeyErr,
-		loginAttempts: make(map[string]loginAttempt),
-		activeUsers:   make(map[string]int),
-		historySync:   make(map[string]historySyncState),
+		Cfg:            cfg,
+		Registry:       NewRegistry(cfg.WebRegistry, cfg.WebAllowInsecureNodes),
+		Users:          NewUserStore(cfg.WebUsers),
+		Client:         NodeClient{Timeout: 4 * time.Second, AllowInsecureNodes: cfg.WebAllowInsecureNodes},
+		fleetCacheTTL:  time.Second,
+		now:            time.Now,
+		sessionKey:     sessionKey,
+		sessionKeyErr:  sessionKeyErr,
+		loginAttempts:  make(map[string]loginAttempt),
+		activeUsers:    make(map[string]int),
+		historySync:    make(map[string]historySyncState),
+		managedKeySync: make(chan struct{}, 1),
+		managedKeyNode: make(map[string]managedKeyNodeState),
 	}
 }
 
@@ -153,6 +158,13 @@ func (s *Server) Run(ctx context.Context) error {
 	if err := s.Users.BootstrapAdmin(s.Cfg.WebUser, s.Cfg.WebPassword); err != nil {
 		return err
 	}
+	userKeyMaster, err := loadOrCreateUserKeyMaster(s.Cfg.WebUserKey, s.Users)
+	if err != nil {
+		return fmt.Errorf("initialize web user-key master: %w", err)
+	}
+	if err := s.Users.InitializeFixedKeys(userKeyMaster); err != nil {
+		return fmt.Errorf("initialize fixed user keys: %w", err)
+	}
 	historyPath := strings.TrimSpace(s.Cfg.WebDB)
 	if historyPath == "" {
 		historyPath = filepath.Join(filepath.Dir(s.Cfg.WebRegistry), "history.db")
@@ -164,6 +176,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.History = historyStore
 	defer historyStore.Close()
 	go s.runHistoryCollector(ctx)
+	go s.runManagedKeySync(ctx)
 	httpServer := &http.Server{
 		Addr:              s.Cfg.WebAddr,
 		Handler:           s.routes(),
@@ -214,6 +227,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/logout", s.requireSession(s.handleLogout))
 	mux.HandleFunc("/api/password", s.requireSession(s.handleChangePassword))
 	mux.HandleFunc("/api/users", s.requireAdmin(s.handleUsers))
+	mux.HandleFunc("/api/keys", s.requireSession(s.handleKeys))
+	mux.HandleFunc("/api/keys/", s.requireSession(s.handleKeys))
 	mux.HandleFunc("/api/servers", s.requireSession(s.handleServers))
 	mux.HandleFunc("/api/servers/", s.requireSession(s.handleServerAction))
 	mux.HandleFunc("/api/fleet/snapshot", s.requireSession(s.handleFleetSnapshot))
@@ -223,6 +238,66 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/history/sessions/", s.requireSession(s.handleHistorySessionAction))
 	mux.HandleFunc("/", s.handleStatic)
 	return s.securityMiddleware(mux)
+}
+
+func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
+	session, _ := currentSession(r)
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/keys"), "/")
+	if path == "" {
+		if r.Method != http.MethodGet {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		keys, err := s.Users.FixedKeys()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if session.Role != RoleAdmin {
+			filtered := keys[:0]
+			for _, key := range keys {
+				if sameOwner(key.Owner, session.User) {
+					filtered = append(filtered, key)
+				}
+			}
+			keys = filtered
+		}
+		nodeSync := s.managedKeyStatuses()
+		for i := range keys {
+			keys[i].NodeSync = nodeSync
+		}
+		writeJSON(w, http.StatusOK, keys)
+		return
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || (parts[1] != "reveal" && parts[1] != "regenerate") {
+		writeJSONError(w, http.StatusNotFound, "not found")
+		return
+	}
+	username := parts[0]
+	if session.Role != RoleAdmin && !sameOwner(username, session.User) {
+		writeJSONError(w, http.StatusForbidden, "key access denied")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var key FixedUserKey
+	var err error
+	if parts[1] == "reveal" {
+		key, err = s.Users.RevealFixedKey(username)
+	} else {
+		key, err = s.Users.RegenerateFixedKey(username)
+		if err == nil {
+			s.requestManagedKeySync()
+		}
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, key)
 }
 
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
@@ -250,6 +325,7 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		s.requestManagedKeySync()
 		writeJSON(w, http.StatusCreated, user)
 	case http.MethodDelete:
 		session, _ := currentSession(r)
@@ -266,6 +342,7 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		s.requestManagedKeySync()
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -299,6 +376,10 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 			TLSSkipVerify: req.TLSSkipVerify,
 		}
 		if err := s.Client.Health(r.Context(), record, record.RootKey); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.syncManagedKeysToNode(r.Context(), record); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -349,6 +430,18 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		args.Name = session.User
+		if _, managedClient := s.Client.(ManagedKeyNodeAPI); managedClient {
+			key, keyErr := s.Users.FixedKeyForUser(session.User)
+			if keyErr != nil {
+				writeJSONError(w, http.StatusBadRequest, keyErr.Error())
+				return
+			}
+			if syncErr := s.syncManagedKeysToNode(r.Context(), record); syncErr != nil {
+				writeJSONError(w, http.StatusServiceUnavailable, syncErr.Error())
+				return
+			}
+			args.UserKeyID = key.ID
+		}
 		preparedSessionID := ""
 		if s.History != nil && args.StartsAt != nil && args.ExpiresAt != nil {
 			if client, ok := s.Client.(TelemetryNodeAPI); ok {
@@ -382,30 +475,15 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 				result.TokenID = reservationTokenID(result, status)
 			}
 		}
-		if preparedSessionID != "" && result.TokenID != "" {
-			_ = s.History.ConfirmSession(r.Context(), preparedSessionID, result.TokenID, result.ReservationIDs, result.GPUs)
+		if preparedSessionID != "" && result.GroupID != "" {
+			_ = s.History.ConfirmSession(r.Context(), preparedSessionID, result.GroupID, result.ReservationIDs, result.GPUs)
 		}
 		s.clearFleetCache()
 		result.Token = ""
+		result.TokenID = ""
 		writeJSON(w, http.StatusCreated, result)
 	case action == "claim-keys" && r.Method == http.MethodPost:
-		if session.Role != RoleAdmin {
-			writeJSONError(w, http.StatusForbidden, "admin access required for claim keys")
-			return
-		}
-		var args protocol.RegisterArgs
-		if err := decodeJSONBody(r, &args); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		args.Name = session.User
-		result, err := s.Client.CreateClaimKey(r.Context(), record, args)
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		s.clearFleetCache()
-		writeJSON(w, http.StatusCreated, result)
+		writeJSONError(w, http.StatusGone, "claim keys were replaced by the account fixed key")
 	case action == "show-key" && r.Method == http.MethodPost:
 		var req showKeyRequest
 		if err := decodeJSONBody(r, &req); err != nil {
@@ -443,9 +521,18 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 		}
 		args.ID = strings.TrimSpace(args.ID)
 		args.Mode = strings.TrimSpace(args.Mode)
-		if args.ID == "" {
-			writeJSONError(w, http.StatusBadRequest, "id is required")
-			return
+		if _, managedClient := s.Client.(ManagedKeyNodeAPI); managedClient {
+			key, keyErr := s.Users.FixedKeyForUser(session.User)
+			if keyErr != nil {
+				writeJSONError(w, http.StatusBadRequest, keyErr.Error())
+				return
+			}
+			if syncErr := s.syncManagedKeysToNode(r.Context(), record); syncErr != nil {
+				writeJSONError(w, http.StatusServiceUnavailable, syncErr.Error())
+				return
+			}
+			args.ID = key.ID
+			args.UserKeyID = key.ID
 		}
 		if session.Role != RoleAdmin && allowArgsHaveWildcard(args) {
 			writeJSONError(w, http.StatusForbidden, "wildcard authorization requires admin access")
@@ -759,6 +846,11 @@ func (s *Server) canRevoke(ctx context.Context, record ServerRecord, session ses
 	}
 	if reservation, ok := findReservation(status.Reservations, id); ok {
 		return sameOwner(reservation.Holder, session.User), nil
+	}
+	for _, reservation := range status.Reservations {
+		if reservation.GroupID == id {
+			return sameOwner(reservation.Holder, session.User), nil
+		}
 	}
 	if authorization, ok := findAuthorization(status.Authorizations, id); ok {
 		return sameOwner(authorization.Holder, session.User), nil

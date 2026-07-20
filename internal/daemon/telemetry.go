@@ -75,7 +75,7 @@ func (s *Server) bootstrapTelemetry() {
 		s.emitTelemetry(telemetry.EventReservationUpsert, payload, time.Now())
 	}
 	for _, authorization := range status.Authorizations {
-		s.emitAuthorizationView(authorization)
+		s.emitAuthorizationView(authorization, status.Reservations)
 	}
 }
 
@@ -87,7 +87,7 @@ func (s *Server) emitReservation(token model.Token, reservations []model.Reserva
 	payload := telemetry.ReservationUpsert{
 		ExternalSessionID: first.ExternalSessionID,
 		HistoryQuality:    "complete",
-		GroupID:           token.ID,
+		GroupID:           reservationTelemetryGroup(first, token.ID),
 		Holder:            first.Holder,
 		Purpose:           first.Purpose,
 		CreatedAt:         first.CreatedAt,
@@ -101,9 +101,16 @@ func (s *Server) emitReservation(token model.Token, reservations []model.Reserva
 }
 
 func (s *Server) emitAuthorization(tokenID string, authorization model.Authorization) {
-	s.emitTelemetry(telemetry.EventAuthorizationUpsert, telemetry.AuthorizationUpsert{
+	var groupIDs []string
+	if state, err := s.Store.EnforcementSnapshot(); err == nil {
+		groupIDs = reservationGroupsForToken(state.Reservations, authorization.TokenHash, -1, authorization.CreatedAt)
+	}
+	if len(groupIDs) == 0 && authorization.TokenMode == model.TokenModeReserved {
+		groupIDs = []string{tokenID}
+	}
+	payload := telemetry.AuthorizationUpsert{
 		AuthorizationID:  authorization.ID,
-		GroupID:          tokenID,
+		GroupIDs:         groupIDs,
 		Mode:             authorization.Mode,
 		Holder:           authorization.Holder,
 		Command:          boundedTelemetryCommand(authorization.Command),
@@ -113,13 +120,28 @@ func (s *Server) emitAuthorization(tokenID string, authorization model.Authoriza
 		Username:         authorization.Username,
 		CreatedAt:        authorization.CreatedAt,
 		ExpiresAt:        authorization.ExpiresAt,
-	}, authorization.CreatedAt)
+	}
+	if len(groupIDs) > 0 {
+		payload.GroupID = groupIDs[0]
+	}
+	s.emitTelemetry(telemetry.EventAuthorizationUpsert, payload, authorization.CreatedAt)
 }
 
-func (s *Server) emitAuthorizationView(authorization model.AuthorizationView) {
-	s.emitTelemetry(telemetry.EventAuthorizationUpsert, telemetry.AuthorizationUpsert{
+func (s *Server) emitAuthorizationView(authorization model.AuthorizationView, reservations []model.ReservationView) {
+	var groupIDs []string
+	for _, reservation := range reservations {
+		if reservation.GroupID == "" || !strings.EqualFold(strings.TrimSpace(reservation.Holder), strings.TrimSpace(authorization.Holder)) {
+			continue
+		}
+		if authorization.TokenMode == model.TokenModeReserved && reservation.GroupID != authorization.TokenID {
+			continue
+		}
+		addString(&groupIDs, reservation.GroupID)
+	}
+	sort.Strings(groupIDs)
+	payload := telemetry.AuthorizationUpsert{
 		AuthorizationID:  authorization.ID,
-		GroupID:          authorization.TokenID,
+		GroupIDs:         groupIDs,
 		Mode:             authorization.Mode,
 		Holder:           authorization.Holder,
 		Command:          boundedTelemetryCommand(authorization.Command),
@@ -129,7 +151,11 @@ func (s *Server) emitAuthorizationView(authorization model.AuthorizationView) {
 		Username:         authorization.Username,
 		CreatedAt:        authorization.CreatedAt,
 		ExpiresAt:        dereferenceTime(authorization.ExpiresAt),
-	}, authorization.CreatedAt)
+	}
+	if len(groupIDs) > 0 {
+		payload.GroupID = groupIDs[0]
+	}
+	s.emitTelemetry(telemetry.EventAuthorizationUpsert, payload, authorization.CreatedAt)
 }
 
 func (s *Server) emitAuthorizationEnded(id, reason string, at time.Time) {
@@ -190,19 +216,13 @@ func (s *Server) sampleTelemetryMetrics(ctx context.Context, start, end time.Tim
 	if statusErr != nil {
 		return
 	}
-	tokenIDs := make(map[string]string, len(state.Tokens))
-	for _, token := range state.Tokens {
-		tokenIDs[token.Hash] = token.ID
-	}
 	groupByGPU := make(map[int]string)
 	for _, reservation := range state.Reservations {
 		startsAt := model.ReservationStartsAt(reservation)
 		if reservation.Revoked || !startsAt.Before(end) || !reservation.ExpiresAt.After(start) {
 			continue
 		}
-		if groupID := tokenIDs[reservation.TokenHash]; groupID != "" {
-			groupByGPU[reservation.GPU] = groupID
-		}
+		groupByGPU[reservation.GPU] = reservationTelemetryGroup(reservation, "")
 	}
 	if len(groupByGPU) == 0 {
 		return
@@ -256,11 +276,18 @@ func (s *Server) trackObservedTelemetryJobs(state model.State, decisions []enfor
 			continue
 		}
 		authorization, ok := authorizations[decision.AuthID]
-		if !ok || authorization.Mode == model.ModeBare || authorization.TokenMode != model.TokenModeReserved {
+		if !ok || authorization.Mode == model.ModeBare || (authorization.TokenMode != model.TokenModeReserved && authorization.TokenMode != model.TokenModeManaged) {
 			continue
 		}
 		token, ok := tokens[authorization.TokenHash]
 		if !ok || token.ID == "" {
+			continue
+		}
+		groupIDs := reservationGroupsForToken(state.Reservations, authorization.TokenHash, decision.Process.GPU, now)
+		if len(groupIDs) == 0 && authorization.TokenMode == model.TokenModeReserved {
+			groupIDs = []string{token.ID}
+		}
+		if len(groupIDs) == 0 {
 			continue
 		}
 		key := fmt.Sprintf("%s/%d/%d", authorization.ID, decision.Process.PID, decision.Info.StartTime)
@@ -271,7 +298,8 @@ func (s *Server) trackObservedTelemetryJobs(state model.State, decisions []enfor
 			event := telemetry.JobEvent{
 				ExecutionID:     observedExecutionID(s.bootID, authorization.ID, decision.Process.PID, decision.Info.StartTime),
 				AuthorizationID: authorization.ID,
-				GroupID:         token.ID,
+				GroupID:         groupIDs[0],
+				GroupIDs:        append([]string(nil), groupIDs...),
 				Source:          "authorized_process",
 				Mode:            authorization.Mode,
 				Holder:          authorization.Holder,
@@ -288,7 +316,11 @@ func (s *Server) trackObservedTelemetryJobs(state model.State, decisions []enfor
 		} else {
 			job.lastSeen = now
 			job.missed = 0
-			if addGPU(&job.event.GPUs, decision.Process.GPU) {
+			groupsChanged := false
+			for _, groupID := range groupIDs {
+				groupsChanged = addString(&job.event.GroupIDs, groupID) || groupsChanged
+			}
+			if addGPU(&job.event.GPUs, decision.Process.GPU) || groupsChanged {
 				s.emitTelemetry(telemetry.EventJobUpdated, job.event, now)
 			}
 		}
@@ -312,10 +344,17 @@ func (s *Server) trackObservedTelemetryJobs(state model.State, decisions []enfor
 
 func (s *Server) rememberRunJob(token model.Token, authorization model.Authorization, pid int, command []string, at time.Time) telemetry.JobEvent {
 	started := at.UTC()
+	var groupIDs []string
+	if state, err := s.Store.EnforcementSnapshot(); err == nil {
+		groupIDs = reservationGroupsForToken(state.Reservations, token.Hash, -1, at)
+	}
+	if len(groupIDs) == 0 && token.Mode == model.TokenModeReserved {
+		groupIDs = []string{token.ID}
+	}
 	event := telemetry.JobEvent{
 		ExecutionID:     "exec_" + authorization.ID,
 		AuthorizationID: authorization.ID,
-		GroupID:         token.ID,
+		GroupIDs:        groupIDs,
 		Source:          "rocguard_run",
 		Mode:            authorization.Mode,
 		Holder:          authorization.Holder,
@@ -323,6 +362,9 @@ func (s *Server) rememberRunJob(token model.Token, authorization model.Authoriza
 		Command:         boundedTelemetryCommand(command),
 		StartedAt:       &started,
 		StartPrecision:  "exact",
+	}
+	if len(groupIDs) > 0 {
+		event.GroupID = groupIDs[0]
 	}
 	if s.Telemetry == nil {
 		return event
@@ -335,6 +377,37 @@ func (s *Server) rememberRunJob(token model.Token, authorization model.Authoriza
 	s.telemetryJobsMu.Unlock()
 	s.emitTelemetry(telemetry.EventJobStarted, event, at)
 	return event
+}
+
+func reservationTelemetryGroup(reservation model.Reservation, fallback string) string {
+	if reservation.GroupID != "" {
+		return reservation.GroupID
+	}
+	return fallback
+}
+
+func reservationGroupsForToken(reservations []model.Reservation, tokenHash string, gpu int, at time.Time) []string {
+	var groups []string
+	for _, reservation := range reservations {
+		if reservation.TokenHash != tokenHash || (gpu >= 0 && reservation.GPU != gpu) || !model.ReservationActiveAt(reservation, at) {
+			continue
+		}
+		if reservation.GroupID != "" {
+			addString(&groups, reservation.GroupID)
+		}
+	}
+	sort.Strings(groups)
+	return groups
+}
+
+func addString(values *[]string, value string) bool {
+	for _, existing := range *values {
+		if existing == value {
+			return false
+		}
+	}
+	*values = append(*values, value)
+	return true
 }
 
 func (s *Server) updateRunJobRootExit(authorizationID string, exitCode int, at time.Time) {

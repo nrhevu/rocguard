@@ -50,6 +50,11 @@ type UserRecord struct {
 	Username     string    `json:"username"`
 	Role         string    `json:"role"`
 	PasswordHash string    `json:"password_hash"`
+	KeyID        string    `json:"key_id,omitempty"`
+	KeyHash      string    `json:"key_hash,omitempty"`
+	KeyVersion   int64     `json:"key_version,omitempty"`
+	KeyCipher    string    `json:"key_cipher,omitempty"`
+	KeyCreatedAt time.Time `json:"key_created_at,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 	Disabled     bool      `json:"disabled,omitempty"`
@@ -69,6 +74,7 @@ type UserStore struct {
 	users         []UserRecord
 	passwordWork  chan struct{}
 	passwordQueue chan struct{}
+	keyCipher     *userKeyCipher
 }
 
 func NewUserStore(path string) *UserStore {
@@ -225,6 +231,11 @@ func (s *UserStore) Create(username, password, role string) (PublicUser, error) 
 	if err != nil {
 		return PublicUser{}, err
 	}
+	if s.keyCipher != nil {
+		if err := s.keyCipher.assign(&record, 1); err != nil {
+			return PublicUser{}, err
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -278,6 +289,7 @@ func (s *UserStore) Delete(username string) error {
 			}
 		}
 		users[i].PasswordHash = ""
+		users[i].KeyCipher = ""
 		users[i].Disabled = true
 		users[i].UpdatedAt = time.Now().UTC()
 		return s.saveLocked(users)

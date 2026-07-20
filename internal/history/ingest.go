@@ -235,8 +235,14 @@ func applyReservation(ctx context.Context, tx *sql.Tx, nodeID, serverID, serverN
 
 func applyAuthorization(ctx context.Context, tx *sql.Tx, nodeID string, payload telemetry.AuthorizationUpsert) error {
 	var sessionID string
-	if err := tx.QueryRowContext(ctx, "SELECT session_id FROM reservation_sessions WHERE node_id=? AND group_id=?", nodeID, payload.GroupID).Scan(&sessionID); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+	groups := telemetryGroups(payload.GroupID, payload.GroupIDs)
+	for _, groupID := range groups {
+		var candidate string
+		if err := tx.QueryRowContext(ctx, "SELECT session_id FROM reservation_sessions WHERE node_id=? AND group_id=?", nodeID, groupID).Scan(&candidate); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		} else if err == nil && sessionID == "" {
+			sessionID = candidate
+		}
 	}
 	command, _ := json.Marshal(payload.Command)
 	selector := firstNonempty(payload.ContainerID, payload.ContainerPattern, payload.Namespace, payload.Username)
@@ -244,18 +250,42 @@ func applyAuthorization(ctx context.Context, tx *sql.Tx, nodeID string, payload 
 		VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id,authorization_id) DO UPDATE SET session_id=excluded.session_id,mode=excluded.mode,
 		holder=excluded.holder,selector=excluded.selector,command_json=excluded.command_json,expires_at_ms=excluded.expires_at_ms`,
 		nodeID, payload.AuthorizationID, nullableString(sessionID), payload.Mode, payload.Holder, selector, string(command), millis(payload.CreatedAt), nullableTimeValue(payload.ExpiresAt))
-	return err
+	if err != nil {
+		return err
+	}
+	for _, groupID := range groups {
+		_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO authorization_sessions(node_id,authorization_id,session_id)
+			SELECT ?,?,session_id FROM reservation_sessions WHERE node_id=? AND group_id=?`, nodeID, payload.AuthorizationID, nodeID, groupID)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func applyJob(ctx context.Context, tx *sql.Tx, nodeID string, payload telemetry.JobEvent, occurredAt time.Time) error {
 	var session string
 	var expiresMS int64
 	var revoked sql.NullInt64
-	if err := tx.QueryRowContext(ctx, "SELECT session_id,expires_at_ms,revoked_at_ms FROM reservation_sessions WHERE node_id=? AND group_id=?", nodeID, payload.GroupID).Scan(&session, &expiresMS, &revoked); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+	groups := telemetryGroups(payload.GroupID, payload.GroupIDs)
+	var sessions []string
+	for _, groupID := range groups {
+		var candidate string
+		var candidateExpires int64
+		var candidateRevoked sql.NullInt64
+		if err := tx.QueryRowContext(ctx, "SELECT session_id,expires_at_ms,revoked_at_ms FROM reservation_sessions WHERE node_id=? AND group_id=?", nodeID, groupID).Scan(&candidate, &candidateExpires, &candidateRevoked); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return err
 		}
-		return err
+		sessions = append(sessions, candidate)
+		if session == "" {
+			session, expiresMS, revoked = candidate, candidateExpires, candidateRevoked
+		}
+	}
+	if session == "" {
+		return nil
 	}
 	effectiveEnd := timeFromMillis(expiresMS)
 	if revoked.Valid && timeFromMillis(revoked.Int64).Before(effectiveEnd) {
@@ -278,12 +308,34 @@ func applyJob(ctx context.Context, tx *sql.Tx, nodeID string, payload telemetry.
 	if err != nil {
 		return err
 	}
+	for _, linkedSession := range sessions {
+		if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO job_sessions(node_id,job_id,session_id) VALUES(?,?,?)", nodeID, payload.ExecutionID, linkedSession); err != nil {
+			return err
+		}
+		if payload.AuthorizationID != "" {
+			if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO authorization_sessions(node_id,authorization_id,session_id) VALUES(?,?,?)", nodeID, payload.AuthorizationID, linkedSession); err != nil {
+				return err
+			}
+		}
+	}
 	for _, gpu := range payload.GPUs {
 		if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO job_gpus(node_id,job_id,gpu) VALUES(?,?,?)", nodeID, payload.ExecutionID, gpu); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func telemetryGroups(primary string, additional []string) []string {
+	seen := make(map[string]bool)
+	var groups []string
+	for _, group := range append([]string{primary}, additional...) {
+		if group != "" && !seen[group] {
+			seen[group] = true
+			groups = append(groups, group)
+		}
+	}
+	return groups
 }
 
 func clampTime(value *time.Time, maximum time.Time) *time.Time {

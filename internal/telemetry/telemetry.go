@@ -110,6 +110,7 @@ type ReservationEnded struct {
 type AuthorizationUpsert struct {
 	AuthorizationID  string    `json:"authorization_id"`
 	GroupID          string    `json:"group_id"`
+	GroupIDs         []string  `json:"group_ids,omitempty"`
 	Mode             string    `json:"mode"`
 	Holder           string    `json:"holder"`
 	Command          []string  `json:"command,omitempty"`
@@ -131,6 +132,7 @@ type JobEvent struct {
 	ExecutionID     string     `json:"execution_id"`
 	AuthorizationID string     `json:"authorization_id"`
 	GroupID         string     `json:"group_id"`
+	GroupIDs        []string   `json:"group_ids,omitempty"`
 	Source          string     `json:"source"`
 	Mode            string     `json:"mode"`
 	Holder          string     `json:"holder"`
@@ -237,7 +239,7 @@ func (o *Outbox) Info() Info {
 	defer o.mu.Unlock()
 	return Info{
 		NodeID: o.nodeID, BootID: o.bootID, StreamID: o.streamID, TelemetrySchema: SchemaVersion,
-		Capabilities: []string{"telemetry_v1", "reservation_external_session_id", "job_tracking", "gpu_samples"},
+		Capabilities: []string{"telemetry_v1", "reservation_external_session_id", "job_tracking", "gpu_samples", "managed_user_keys_v1"},
 	}
 }
 

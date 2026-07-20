@@ -10,6 +10,7 @@ const (
 
 	TokenModeReserved = "reserved"
 	TokenModeClaimed  = "claimed"
+	TokenModeManaged  = "managed"
 
 	TokenKeyStatusStored    = "stored"
 	TokenKeyStatusNotStored = "not_stored"
@@ -51,6 +52,8 @@ type Token struct {
 	Secret    string    `json:"secret,omitempty"`
 	Name      string    `json:"name"`
 	Mode      string    `json:"mode"`
+	Version   int64     `json:"version,omitempty"`
+	Managed   bool      `json:"managed,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 	Revoked   bool      `json:"revoked,omitempty"`
@@ -58,6 +61,7 @@ type Token struct {
 
 type Reservation struct {
 	ID                string    `json:"id"`
+	GroupID           string    `json:"group_id,omitempty"`
 	ExternalSessionID string    `json:"external_session_id,omitempty"`
 	GPU               int       `json:"gpu"`
 	TokenHash         string    `json:"token_hash"`
@@ -96,6 +100,7 @@ type Authorization struct {
 	Mode             string    `json:"mode"`
 	TokenHash        string    `json:"token_hash"`
 	TokenMode        string    `json:"token_mode"`
+	TokenVersion     int64     `json:"token_version,omitempty"`
 	Holder           string    `json:"holder"`
 	UID              int       `json:"uid,omitempty"`
 	GID              int       `json:"gid,omitempty"`
@@ -167,6 +172,8 @@ type AuditEvent struct {
 }
 
 type State struct {
+	ManagedKeys    bool            `json:"managed_keys,omitempty"`
+	KeySnapshotID  string          `json:"key_snapshot_id,omitempty"`
 	Tokens         []Token         `json:"tokens"`
 	Reservations   []Reservation   `json:"reservations,omitempty"`
 	Authorizations []Authorization `json:"authorizations,omitempty"`
@@ -216,6 +223,8 @@ type TokenView struct {
 	KeyStatus string     `json:"key_status,omitempty"`
 	Name      string     `json:"name"`
 	Mode      string     `json:"mode"`
+	Version   int64      `json:"version,omitempty"`
+	Managed   bool       `json:"managed,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	Revoked   bool       `json:"revoked,omitempty"`
@@ -273,8 +282,9 @@ type KeyStatus struct {
 }
 
 type RegisterResult struct {
-	Token          string     `json:"token"`
+	Token          string     `json:"token,omitempty"`
 	TokenID        string     `json:"token_id,omitempty"`
+	GroupID        string     `json:"group_id,omitempty"`
 	Mode           string     `json:"mode"`
 	ReservationIDs []string   `json:"reservation_ids,omitempty"`
 	GPUs           []int      `json:"gpus,omitempty"`

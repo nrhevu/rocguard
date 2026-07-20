@@ -72,6 +72,19 @@ func (s *Store) Close() error {
 
 func (s *Store) DB() *sql.DB { return s.db }
 
+func (s *Store) RecordManagedKeySync(ctx context.Context, serverID, snapshotID, syncError string, syncedAt time.Time) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var syncedAtMS any
+	if !syncedAt.IsZero() {
+		syncedAtMS = syncedAt.UTC().UnixMilli()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO managed_key_sync_state(server_id,snapshot_id,synced_at_ms,sync_error)
+		VALUES(?,?,?,?) ON CONFLICT(server_id) DO UPDATE SET snapshot_id=excluded.snapshot_id,
+		synced_at_ms=excluded.synced_at_ms,sync_error=excluded.sync_error`, serverID, snapshotID, syncedAtMS, syncError)
+	return err
+}
+
 func (s *Store) configure(ctx context.Context) error {
 	for _, statement := range []string{
 		"PRAGMA journal_mode=WAL",
@@ -93,28 +106,31 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, migrationV1); err != nil {
-		return fmt.Errorf("apply history migration v1: %w", err)
-	}
-	checksumBytes := sha256.Sum256([]byte(migrationV1))
-	checksum := hex.EncodeToString(checksumBytes[:])
-	var existing string
-	err = tx.QueryRowContext(ctx, "SELECT checksum FROM schema_migrations WHERE version=1").Scan(&existing)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version,checksum,applied_at_ms) VALUES(1,?,?)", checksum, time.Now().UTC().UnixMilli()); err != nil {
-			return err
+	for index, migration := range []string{migrationV1, migrationV2} {
+		version := index + 1
+		if _, err := tx.ExecContext(ctx, migration); err != nil {
+			return fmt.Errorf("apply history migration v%d: %w", version, err)
 		}
-	case err != nil:
-		return err
-	case existing != checksum:
-		return errors.New("history migration v1 checksum mismatch")
+		checksumBytes := sha256.Sum256([]byte(migration))
+		checksum := hex.EncodeToString(checksumBytes[:])
+		var existing string
+		err = tx.QueryRowContext(ctx, "SELECT checksum FROM schema_migrations WHERE version=?", version).Scan(&existing)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version,checksum,applied_at_ms) VALUES(?,?,?)", version, checksum, time.Now().UTC().UnixMilli()); err != nil {
+				return err
+			}
+		case err != nil:
+			return err
+		case existing != checksum:
+			return fmt.Errorf("history migration v%d checksum mismatch", version)
+		}
 	}
 	var newest int
 	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM schema_migrations").Scan(&newest); err != nil {
 		return err
 	}
-	if newest > 1 {
+	if newest > 2 {
 		return fmt.Errorf("history database schema %d is newer than this binary", newest)
 	}
 	return tx.Commit()

@@ -353,7 +353,7 @@ func (a Authorizer) evictExpiredReservedProcesses(ctx context.Context, state mod
 			continue
 		}
 		mode := authorizationEvictionMode(authorization, tokensByHash)
-		if mode == model.TokenModeClaimed || tokenHasKnownReservation(staleReservations, authorization.TokenHash) || tokenHasKnownReservation(validReservations, authorization.TokenHash) {
+		if mode == model.TokenModeClaimed || mode == model.TokenModeManaged || tokenHasKnownReservation(staleReservations, authorization.TokenHash) || tokenHasKnownReservation(validReservations, authorization.TokenHash) {
 			assessment.Authorizations[authorization.ID] = true
 		}
 	}
@@ -522,6 +522,12 @@ func authorizationEvictionState(authorization model.Authorization, gpu int, toke
 		return false, validReservations[key] || staleReservations[key]
 	case model.TokenModeClaimed:
 		return globallyValid, !globallyValid
+	case model.TokenModeManaged:
+		key := gpuTokenKey{gpu: gpu, tokenHash: authorization.TokenHash}
+		if validReservations[key] {
+			return globallyValid, !globallyValid
+		}
+		return globallyValid, !globallyValid || staleReservations[key]
 	default:
 		return false, false
 	}
@@ -532,7 +538,7 @@ func authorizationGloballyValid(authorization model.Authorization, tokens map[st
 		return false
 	}
 	token, ok := tokens[authorization.TokenHash]
-	return ok && !token.Revoked && (!timeIsSet(token.ExpiresAt) || now.Before(token.ExpiresAt))
+	return ok && !token.Revoked && (!token.Managed || authorization.TokenVersion == token.Version) && (!timeIsSet(token.ExpiresAt) || now.Before(token.ExpiresAt))
 }
 
 func authorizationEvictionMode(authorization model.Authorization, tokens map[string]model.Token) string {
@@ -1027,8 +1033,11 @@ func (a Authorizer) matchAnyAuthorization(ctx context.Context, state model.State
 		if !ok || token.Revoked || (timeIsSet(token.ExpiresAt) && !now.Before(token.ExpiresAt)) {
 			continue
 		}
+		if token.Managed && authorization.TokenVersion != token.Version {
+			continue
+		}
 		mode := normalizeTokenMode(token.Mode)
-		if tokenMode != "" && mode != tokenMode {
+		if tokenMode != "" && mode != tokenMode && !(tokenMode == model.TokenModeClaimed && mode == model.TokenModeManaged) {
 			continue
 		}
 		authorization.TokenMode = mode
@@ -1253,7 +1262,8 @@ func activeSoftClaimsForGPU(state model.State, gpu int, now time.Time) []model.S
 		if claim.GPU != gpu {
 			continue
 		}
-		if token, ok := activeTokenByHash(state.Tokens, claim.TokenHash, now); ok && normalizeTokenMode(token.Mode) == model.TokenModeClaimed {
+		if token, ok := activeTokenByHash(state.Tokens, claim.TokenHash, now); ok &&
+			(normalizeTokenMode(token.Mode) == model.TokenModeClaimed || normalizeTokenMode(token.Mode) == model.TokenModeManaged) {
 			out = append(out, claim)
 		}
 	}

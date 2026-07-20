@@ -401,12 +401,72 @@ func TestNodeHTTPTelemetryInfoAndPage(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Fatalf("%s = %d %s", endpoint, response.Code, response.Body.String())
 		}
-		if endpoint == "/api/v1/info" && (!strings.Contains(response.Body.String(), `"node_id":"node_`) || !strings.Contains(response.Body.String(), `"telemetry_v1"`)) {
+		if endpoint == "/api/v1/info" && (!strings.Contains(response.Body.String(), `"node_id":"node_`) || !strings.Contains(response.Body.String(), `"telemetry_v1"`) || !strings.Contains(response.Body.String(), `"managed_user_keys_v1"`)) {
 			t.Fatalf("unexpected info response: %s", response.Body.String())
 		}
 		if strings.HasPrefix(endpoint, "/api/v1/telemetry") && !strings.Contains(response.Body.String(), `"daemon.started"`) {
 			t.Fatalf("unexpected telemetry response: %s", response.Body.String())
 		}
+	}
+}
+
+func TestNodeHTTPManagedKeySyncAndReservation(t *testing.T) {
+	server := testServer(t)
+	rootKey, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := "rg_" + strings.Repeat("a", 48)
+	snapshot := protocol.ManagedUserKeySnapshot{SnapshotID: "sha256:test", Keys: []protocol.ManagedUserKey{{ID: "uk_alice", Owner: "alice", Version: 1, Hash: store.HashToken(secret)}}}
+	body, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/user-keys/sync", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+rootKey)
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.nodeHTTPHandler().ServeHTTP(response, req)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"managed":true`) {
+		t.Fatalf("sync status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	now := time.Now().UTC()
+	startsAt, expiresAt := now.Add(time.Minute), now.Add(time.Hour)
+	reservationBody, err := json.Marshal(protocol.RegisterArgs{Name: "mallory", UserKeyID: "uk_alice", Purpose: "training", GPUs: []int{0, 1}, StartsAt: &startsAt, ExpiresAt: &expiresAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/reservations", strings.NewReader(string(reservationBody)))
+	req.Header.Set("Authorization", "Bearer "+rootKey)
+	req.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	server.nodeHTTPHandler().ServeHTTP(response, req)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("reservation status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result model.RegisterResult
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Token != "" || result.TokenID != "uk_alice" || result.GroupID == "" || len(result.ReservationIDs) != 2 {
+		t.Fatalf("unexpected managed reservation result: %+v", result)
+	}
+	status, err := server.Store.KeyStatus(rootKey, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Tokens) != 1 || status.Tokens[0].Key != "" || status.Tokens[0].Name != "alice" || !status.Tokens[0].Managed {
+		t.Fatalf("managed verifier leaked or owner changed: %+v", status.Tokens)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/claim-keys", strings.NewReader(`{"name":"alice"}`))
+	req.Header.Set("Authorization", "Bearer "+rootKey)
+	req.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	server.nodeHTTPHandler().ServeHTTP(response, req)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("legacy claim key remained enabled: %d %s", response.Code, response.Body.String())
 	}
 }
 

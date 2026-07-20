@@ -113,6 +113,39 @@ func TestApplyPageAggregatesAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestOneJobCanBelongToMultipleReservationSessionsWithoutInflatingSummary(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	start := time.Now().UTC().Add(-time.Minute)
+	jobStart := start.Add(time.Second)
+	page := telemetry.Page{NodeID: "node-a", StreamID: "stream-a", NextCursor: "cursor-3", Events: []telemetry.Event{
+		event(t, 1, telemetry.EventReservationUpsert, start, telemetry.ReservationUpsert{GroupID: "group-a", Holder: "alice", CreatedAt: start, StartsAt: start, ExpiresAt: start.Add(time.Hour), Members: []telemetry.ReservationMember{{ReservationID: "r0", GPU: 0}}}),
+		event(t, 2, telemetry.EventReservationUpsert, start, telemetry.ReservationUpsert{GroupID: "group-b", Holder: "alice", CreatedAt: start, StartsAt: start, ExpiresAt: start.Add(time.Hour), Members: []telemetry.ReservationMember{{ReservationID: "r1", GPU: 1}}}),
+		event(t, 3, telemetry.EventJobStarted, jobStart, telemetry.JobEvent{ExecutionID: "job-shared", AuthorizationID: "auth-shared", GroupID: "group-a", GroupIDs: []string{"group-a", "group-b"}, Source: "rocguard_run", Mode: "run", Holder: "alice", StartedAt: &jobStart}),
+	}}
+	if err := store.ApplyPage(ctx, "server-a", "GPU node", page); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := store.ListSessions(ctx, SessionFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 || sessions[0].JobCount != 1 || sessions[1].JobCount != 1 {
+		t.Fatalf("shared job was not attached to both sessions: %+v", sessions)
+	}
+	summary, _, _, err := store.Search(ctx, SearchExpression{}, SearchSort{}, 10, SearchCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Sessions != 2 || summary.Jobs != 1 {
+		t.Fatalf("shared job inflated search summary: %+v", summary)
+	}
+}
+
 func TestResultOwnershipAndOptimisticVersion(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "history.db"))
 	if err != nil {
@@ -236,7 +269,7 @@ func TestMigrationReopenWALAndRejectNewerSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	if _, err := store.DB().Exec("INSERT INTO schema_migrations(version,checksum,applied_at_ms) VALUES(2,'future',?)", time.Now().UnixMilli()); err != nil {
+	if _, err := store.DB().Exec("INSERT INTO schema_migrations(version,checksum,applied_at_ms) VALUES(3,'future',?)", time.Now().UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

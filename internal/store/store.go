@@ -18,6 +18,7 @@ import (
 
 	"rocguard/internal/config"
 	"rocguard/internal/model"
+	"rocguard/internal/protocol"
 )
 
 const (
@@ -73,6 +74,108 @@ func New(cfg config.Config) *Store {
 func HashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
+}
+
+func (s *Store) SyncManagedUserKeys(rootKey string, snapshot protocol.ManagedUserKeySnapshot, now time.Time) (protocol.ManagedUserKeySyncResult, error) {
+	if ok, err := s.ValidateRootKey(rootKey); err != nil {
+		return protocol.ManagedUserKeySyncResult{}, err
+	} else if !ok {
+		return protocol.ManagedUserKeySyncResult{}, ErrInvalidRootKey
+	}
+	snapshot.SnapshotID = strings.TrimSpace(snapshot.SnapshotID)
+	if snapshot.SnapshotID == "" {
+		return protocol.ManagedUserKeySyncResult{}, errors.New("snapshot_id is required")
+	}
+	if len(snapshot.Keys) > maxTotalTokens {
+		return protocol.ManagedUserKeySyncResult{}, fmt.Errorf("managed key limit exceeded: maximum %d", maxTotalTokens)
+	}
+	managed := make([]model.Token, 0, len(snapshot.Keys))
+	byOwner := make(map[string]model.Token, len(snapshot.Keys))
+	ids := make(map[string]bool, len(snapshot.Keys))
+	hashes := make(map[string]bool, len(snapshot.Keys))
+	for _, key := range snapshot.Keys {
+		key.ID = strings.TrimSpace(key.ID)
+		key.Owner = normalizeHolder(key.Owner)
+		key.Hash = strings.ToLower(strings.TrimSpace(key.Hash))
+		if key.ID == "" || key.Owner == "" || key.Version < 1 || len(key.Hash) != sha256.Size*2 {
+			return protocol.ManagedUserKeySyncResult{}, errors.New("managed key id, owner, positive version, and SHA-256 hash are required")
+		}
+		if _, err := hex.DecodeString(key.Hash); err != nil {
+			return protocol.ManagedUserKeySyncResult{}, errors.New("managed key hash must be hexadecimal SHA-256")
+		}
+		if ids[key.ID] || hashes[key.Hash] {
+			return protocol.ManagedUserKeySyncResult{}, errors.New("managed key ids and hashes must be unique")
+		}
+		if _, exists := byOwner[key.Owner]; exists {
+			return protocol.ManagedUserKeySyncResult{}, errors.New("each owner may have only one managed key")
+		}
+		ids[key.ID], hashes[key.Hash] = true, true
+		token := model.Token{ID: key.ID, Hash: key.Hash, Name: key.Owner, Mode: model.TokenModeManaged, Version: key.Version, Managed: true, CreatedAt: now.UTC()}
+		managed = append(managed, token)
+		byOwner[key.Owner] = token
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return protocol.ManagedUserKeySyncResult{}, err
+	}
+	if s.state.ManagedKeys && s.state.KeySnapshotID == snapshot.SnapshotID {
+		return protocol.ManagedUserKeySyncResult{SnapshotID: snapshot.SnapshotID, Applied: len(managed), Managed: true}, nil
+	}
+	oldTokenIDs := make(map[string]string, len(s.state.Tokens))
+	for _, token := range s.state.Tokens {
+		oldTokenIDs[token.Hash] = token.ID
+	}
+	for i := range s.state.Reservations {
+		reservation := &s.state.Reservations[i]
+		if reservation.GroupID == "" {
+			reservation.GroupID = oldTokenIDs[reservation.TokenHash]
+			if reservation.GroupID == "" {
+				reservation.GroupID = "grp_" + randomHex(8)
+			}
+		}
+		token, ok := byOwner[normalizeHolder(reservation.Holder)]
+		if !ok {
+			reservation.Revoked = true
+			reservation.Active = false
+			continue
+		}
+		reservation.TokenHash = token.Hash
+	}
+	// Managed key replacement is an immediate credential cutover. Existing
+	// authorizations keep their old hash/version so the eviction pass can close
+	// them instead of silently transferring attacker-created scopes.
+	s.state.Tokens = managed
+	s.state.ManagedKeys = true
+	s.state.KeySnapshotID = snapshot.SnapshotID
+	if err := s.saveLocked(); err != nil {
+		return protocol.ManagedUserKeySyncResult{}, err
+	}
+	return protocol.ManagedUserKeySyncResult{SnapshotID: snapshot.SnapshotID, Applied: len(managed), Managed: true}, nil
+}
+
+func (s *Store) ManagedKeysEnabled() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return false, err
+	}
+	return s.state.ManagedKeys, nil
+}
+
+func (s *Store) ManagedTokenByID(id string, now time.Time) (model.Token, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return model.Token{}, err
+	}
+	for _, token := range s.state.Tokens {
+		if token.ID == strings.TrimSpace(id) && token.Managed && !token.Revoked && !tokenExpired(token, now) {
+			return token, nil
+		}
+	}
+	return model.Token{}, ErrTokenNotFound
 }
 
 func ParseTTL(value string, def, max time.Duration) (time.Duration, error) {
@@ -326,6 +429,95 @@ func (s *Store) RegisterScheduledReservationsWithSession(rootKey, name, purpose,
 	return tokenSecret, token, reservations, nil
 }
 
+func (s *Store) RegisterManagedReservations(rootKey, userKeyID, purpose, externalSessionID string, gpus []int, startsAt, expiresAt, now time.Time) (model.Token, string, []model.Reservation, error) {
+	if ok, err := s.ValidateRootKey(rootKey); err != nil {
+		return model.Token{}, "", nil, err
+	} else if !ok {
+		return model.Token{}, "", nil, ErrInvalidRootKey
+	}
+	startsAt, expiresAt, now = startsAt.UTC(), expiresAt.UTC(), now.UTC()
+	if startsAt.IsZero() {
+		startsAt = now
+	}
+	if !expiresAt.After(startsAt) || !expiresAt.After(now) {
+		return model.Token{}, "", nil, errors.New("reservation end must be after start and in the future")
+	}
+	if expiresAt.Sub(startsAt) > MaxHardTTL {
+		return model.Token{}, "", nil, fmt.Errorf("reservation duration exceeds max %s", MaxHardTTL)
+	}
+	if len(gpus) == 0 {
+		return model.Token{}, "", nil, errors.New("at least one gpu is required")
+	}
+	seen := make(map[int]bool, len(gpus))
+	for _, gpu := range gpus {
+		if err := validateGPUIndex(gpu); err != nil {
+			return model.Token{}, "", nil, err
+		}
+		if seen[gpu] {
+			return model.Token{}, "", nil, fmt.Errorf("duplicate gpu %d", gpu)
+		}
+		seen[gpu] = true
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadLocked(); err != nil {
+		return model.Token{}, "", nil, err
+	}
+	if !s.state.ManagedKeys {
+		return model.Token{}, "", nil, errors.New("managed user keys are not configured")
+	}
+	var token model.Token
+	for _, candidate := range s.state.Tokens {
+		if candidate.ID == strings.TrimSpace(userKeyID) && candidate.Managed && !candidate.Revoked {
+			token = candidate
+			break
+		}
+	}
+	if token.ID == "" {
+		return model.Token{}, "", nil, ErrTokenNotFound
+	}
+	externalSessionID = strings.TrimSpace(externalSessionID)
+	if externalSessionID != "" {
+		var existing []model.Reservation
+		for _, reservation := range s.state.Reservations {
+			if reservation.ExternalSessionID == externalSessionID {
+				existing = append(existing, reservation)
+			}
+		}
+		if len(existing) > 0 {
+			if existing[0].TokenHash != token.Hash || !sameReservationRequest(existing, token.Name, purpose, gpus, startsAt, expiresAt) {
+				return model.Token{}, "", nil, errors.New("external session id was already used for a different reservation")
+			}
+			return token, existing[0].GroupID, existing, nil
+		}
+	}
+	if err := checkTotalCapacity("reservation", len(s.state.Reservations), len(gpus), maxTotalReservations); err != nil {
+		return model.Token{}, "", nil, err
+	}
+	for _, gpu := range gpus {
+		for _, existing := range s.state.Reservations {
+			if existing.GPU == gpu && model.ReservationOverlaps(existing, startsAt, expiresAt) {
+				return model.Token{}, "", nil, fmt.Errorf("gpu %d reservation overlaps %s", gpu, existing.ID)
+			}
+		}
+	}
+	groupID := "grp_" + randomHex(8)
+	reservations := make([]model.Reservation, 0, len(gpus))
+	for _, gpu := range gpus {
+		reservations = append(reservations, model.Reservation{
+			ID: NewReservationID(), GroupID: groupID, ExternalSessionID: externalSessionID,
+			GPU: gpu, TokenHash: token.Hash, Holder: token.Name, Purpose: strings.TrimSpace(purpose),
+			CreatedAt: now, StartsAt: startsAt, ExpiresAt: expiresAt, Active: true,
+		})
+	}
+	s.state.Reservations = append(s.state.Reservations, reservations...)
+	if err := s.saveLocked(); err != nil {
+		return model.Token{}, "", nil, err
+	}
+	return token, groupID, reservations, nil
+}
+
 func sameReservationRequest(existing []model.Reservation, name, purpose string, gpus []int, startsAt, expiresAt time.Time) bool {
 	if len(existing) != len(gpus) || len(existing) == 0 {
 		return false
@@ -402,6 +594,8 @@ func (s *Store) TokenView(secret string, now time.Time) (model.TokenView, error)
 		ID:        token.ID,
 		Name:      token.Name,
 		Mode:      NormalizeTokenMode(token.Mode),
+		Version:   token.Version,
+		Managed:   token.Managed,
 		CreatedAt: token.CreatedAt,
 		ExpiresAt: timePtrIfSet(token.ExpiresAt),
 		Revoked:   token.Revoked,
@@ -625,6 +819,41 @@ func (s *Store) Revoke(idOrToken string) error {
 	if err := s.loadLocked(); err != nil {
 		return err
 	}
+	managedHashes := make(map[string]bool)
+	for _, token := range s.state.Tokens {
+		if token.Managed {
+			managedHashes[token.Hash] = true
+		}
+	}
+	managedGroupID := ""
+	for _, reservation := range s.state.Reservations {
+		groupID := reservation.GroupID
+		if groupID == "" {
+			groupID = reservation.ID
+		}
+		if managedHashes[reservation.TokenHash] && (reservation.ID == idOrToken || groupID == idOrToken) {
+			managedGroupID = groupID
+			break
+		}
+	}
+	if managedGroupID != "" {
+		changed := false
+		for i := range s.state.Reservations {
+			reservation := &s.state.Reservations[i]
+			groupID := reservation.GroupID
+			if groupID == "" {
+				groupID = reservation.ID
+			}
+			if groupID == managedGroupID && !reservation.Revoked {
+				reservation.Revoked = true
+				changed = true
+			}
+		}
+		if !changed {
+			return nil
+		}
+		return s.saveLocked()
+	}
 	tokenHash := ""
 	if strings.HasPrefix(idOrToken, "rg_") {
 		tokenHash = HashToken(idOrToken)
@@ -762,6 +991,8 @@ func (s *Store) status(now time.Time, allowedTokenHash string, all bool) (model.
 			ID:        token.ID,
 			Name:      token.Name,
 			Mode:      NormalizeTokenMode(token.Mode),
+			Version:   token.Version,
+			Managed:   token.Managed,
 			CreatedAt: token.CreatedAt,
 			ExpiresAt: timePtrIfSet(token.ExpiresAt),
 			Revoked:   token.Revoked,
@@ -774,7 +1005,7 @@ func (s *Store) status(now time.Time, allowedTokenHash string, all bool) (model.
 		if reservation.Active && !reservation.Revoked && now.Before(reservation.ExpiresAt) {
 			status.Reservations = append(status.Reservations, model.ReservationView{
 				ID:                reservation.ID,
-				GroupID:           tokenIDsByHash[reservation.TokenHash],
+				GroupID:           reservationGroupID(reservation, tokenIDsByHash),
 				ExternalSessionID: reservation.ExternalSessionID,
 				GPU:               reservation.GPU,
 				Holder:            reservation.Holder,
@@ -855,6 +1086,8 @@ func (s *Store) KeyStatus(rootKey string, now time.Time) (model.KeyStatus, error
 			ID:        token.ID,
 			Name:      token.Name,
 			Mode:      NormalizeTokenMode(token.Mode),
+			Version:   token.Version,
+			Managed:   token.Managed,
 			CreatedAt: token.CreatedAt,
 			ExpiresAt: timePtrIfSet(token.ExpiresAt),
 			Revoked:   token.Revoked,
@@ -871,7 +1104,7 @@ func (s *Store) KeyStatus(rootKey string, now time.Time) (model.KeyStatus, error
 		if reservation.Active && !reservation.Revoked && now.Before(reservation.ExpiresAt) {
 			status.Reservations = append(status.Reservations, model.ReservationView{
 				ID:                reservation.ID,
-				GroupID:           tokenIDsByHash[reservation.TokenHash],
+				GroupID:           reservationGroupID(reservation, tokenIDsByHash),
 				ExternalSessionID: reservation.ExternalSessionID,
 				GPU:               reservation.GPU,
 				Holder:            reservation.Holder,
@@ -1441,7 +1674,7 @@ func liveReservationTokenHashes(reservations []model.Reservation, now time.Time)
 }
 
 func cloneState(state model.State) model.State {
-	out := model.State{}
+	out := model.State{ManagedKeys: state.ManagedKeys, KeySnapshotID: state.KeySnapshotID}
 	out.Tokens = append(out.Tokens, state.Tokens...)
 	out.Reservations = append(out.Reservations, state.Reservations...)
 	out.Authorizations = append(out.Authorizations, state.Authorizations...)
@@ -1459,7 +1692,7 @@ func cloneState(state model.State) model.State {
 }
 
 func cloneEnforcementState(state model.State) model.State {
-	var out model.State
+	out := model.State{ManagedKeys: state.ManagedKeys, KeySnapshotID: state.KeySnapshotID}
 	out.Tokens = append(out.Tokens, state.Tokens...)
 	for i := range out.Tokens {
 		out.Tokens[i].Secret = ""
@@ -1530,6 +1763,13 @@ func authorizationView(authorization model.Authorization, tokenID string) model.
 	}
 }
 
+func reservationGroupID(reservation model.Reservation, tokenIDsByHash map[string]string) string {
+	if reservation.GroupID != "" {
+		return reservation.GroupID
+	}
+	return tokenIDsByHash[reservation.TokenHash]
+}
+
 func boundedViewCommand(command []string) []string {
 	out := make([]string, 0, min(len(command), maxViewCommandArgs))
 	remaining := maxViewCommandBytes
@@ -1554,6 +1794,9 @@ func checkTotalCapacity(kind string, current, adding, maximum int) error {
 }
 
 func validateStateBounds(state model.State) error {
+	if err := validatePersistedValues("state", state.KeySnapshotID); err != nil {
+		return err
+	}
 	counts := []struct {
 		kind    string
 		current int
@@ -1581,7 +1824,7 @@ func validateStateBounds(state model.State) error {
 		if err := validateGPUIndex(reservation.GPU); err != nil {
 			return fmt.Errorf("reservation %q: %w", reservation.ID, err)
 		}
-		if err := validatePersistedValues("reservation", reservation.ID, reservation.ExternalSessionID, reservation.TokenHash, reservation.Holder, reservation.Purpose); err != nil {
+		if err := validatePersistedValues("reservation", reservation.ID, reservation.GroupID, reservation.ExternalSessionID, reservation.TokenHash, reservation.Holder, reservation.Purpose); err != nil {
 			return err
 		}
 	}

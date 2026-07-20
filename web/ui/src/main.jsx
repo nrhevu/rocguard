@@ -23,13 +23,13 @@ function App() {
   const [servers, setServers] = useState([]);
   const [fleet, setFleet] = useState([]);
   const [users, setUsers] = useState([]);
+  const [fixedKeys, setFixedKeys] = useState([]);
   const [selectedServerId, setSelectedServerId] = useState("");
   const [selectedGPUs, setSelectedGPUs] = useState(new Set());
   const [activeGPU, setActiveGPU] = useState(null);
   const [view, setView] = useState("gpu");
   const [search, setSearch] = useState("");
   const [addOpen, setAddOpen] = useState(false);
-  const [claimOpen, setClaimOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [userOpen, setUserOpen] = useState(false);
@@ -237,6 +237,7 @@ function App() {
       setServers([]);
       setFleet([]);
       setUsers([]);
+      setFixedKeys([]);
       setSelectedServerId("");
       setSelectedGPUs(new Set());
       setActiveGPU(null);
@@ -339,7 +340,10 @@ function App() {
 
   async function refresh({ signal, isCurrent } = {}) {
     try {
-      const snapshot = await api("/api/fleet/snapshot", { signal });
+      const [snapshot, keys] = await Promise.all([
+        api("/api/fleet/snapshot", { signal }),
+        api("/api/keys", { signal }),
+      ]);
       if (signal?.aborted || (isCurrent && !isCurrent())) {
         return;
       }
@@ -347,6 +351,7 @@ function App() {
       const serverList = nextFleet.map((item) => item.server).filter(Boolean);
       setServers(serverList);
       setFleet(nextFleet);
+      setFixedKeys(keys || []);
       setSelectedServerId((currentId) => {
         if (currentId && serverList.some((server) => server.id === currentId)) {
           return currentId;
@@ -375,9 +380,8 @@ function App() {
   const reservations = current?.snapshot?.reservations || [];
   const authorizations = current?.snapshot?.authorizations || [];
   const isAdmin = auth.role === "admin";
-  const scheduleToken = scheduleTarget
-    ? tokens.find((token) => token.id === scheduleTarget.id && token.mode === "reserved")
-    : null;
+  const fixedKey = fixedKeys.find((key) => sameText(key.owner, auth.user)) || null;
+  const scheduleToken = scheduleTarget && sameText(scheduleTarget.holder, auth.user) ? fixedKey : null;
   const selectedGPUList = Array.from(selectedGPUs).sort((a, b) => a - b);
   const allGPUIds = gpus.map((gpu) => gpu.id);
   const availableGPUIds = gpus
@@ -481,12 +485,8 @@ function App() {
         }),
       });
       setReservationSuccess({
-        id: result.token_id,
-        token: {
-          id: result.token_id,
-          name: auth.user,
-          mode: result.mode || "reserved",
-        },
+        id: result.group_id,
+        token: fixedKey,
         label: values.purpose || "Reservation",
         holder: auth.user,
         purpose: values.purpose,
@@ -504,28 +504,24 @@ function App() {
     }
   }
 
-  async function createClaimKey() {
-    const result = await api(`/api/servers/${currentServerId}/claim-keys`, {
-      method: "POST",
-      body: JSON.stringify({ name: auth.user }),
-    });
-    setClaimOpen(false);
-    setSuccessKey(result.token || "");
-    await refresh();
-  }
-
-  async function showKey(tokenId) {
+  async function showKey(owner = auth.user) {
     try {
-      const status = await api(`/api/servers/${currentServerId}/show-key`, {
-        method: "POST",
-        body: JSON.stringify({ id: tokenId }),
-      });
-      const token = (status.tokens || []).find((item) => item.id === tokenId);
-      setSuccessKey(token?.key || "");
-      return Boolean(token?.key);
+      const key = await api(`/api/keys/${encodeURIComponent(owner)}/reveal`, { method: "POST" });
+      setSuccessKey(key.key || "");
+      return Boolean(key.key);
     } catch (err) {
       setError(err.message);
       return false;
+    }
+  }
+
+  async function regenerateKey(owner = auth.user) {
+    try {
+      const key = await api(`/api/keys/${encodeURIComponent(owner)}/regenerate`, { method: "POST" });
+      setSuccessKey(key.key || "");
+      await refresh();
+    } catch (err) {
+      setError(err.message);
     }
   }
 
@@ -760,13 +756,10 @@ function App() {
           </div>
         ) : view === "keys" ? (
           <KeysView
-            tokens={tokens}
-            reservations={reservations}
-            canCreate={isAdmin}
-            onCreate={() => setClaimOpen(true)}
+            keys={fixedKey ? [fixedKey] : []}
             onAllow={setAllowTarget}
             onShow={showKey}
-            onRevoke={(token) => setRevokeTarget({ ...token, kind: "key" })}
+            onRegenerate={regenerateKey}
           />
         ) : view === "history" ? (
           <HistoryDashboard
@@ -794,7 +787,6 @@ function App() {
       </main>
 
       {isAdmin && addOpen && <AddServerModal onClose={() => setAddOpen(false)} onSubmit={addServer} />}
-      {isAdmin && claimOpen && <ClaimKeyModal owner={auth.user} onClose={() => setClaimOpen(false)} onSubmit={createClaimKey} />}
       {allowTarget && (
         <AllowKeyModal
           token={allowTarget}
@@ -840,11 +832,11 @@ function App() {
           title="Reservation created"
           target={reservationSuccess}
           canAuthorize={Boolean(reservationSuccess.id)}
-          canShowKey={Boolean(reservationSuccess.id)}
+		  canShowKey={Boolean(fixedKey)}
           canRevoke={Boolean(reservationSuccess.id)}
           onClose={() => setReservationSuccess(null)}
           onAuthorize={() => setAllowTarget(reservationSuccess.token)}
-          onShowKey={() => showKey(reservationSuccess.id)}
+		  onShowKey={() => showKey(auth.user)}
           onRevoke={() => setRevokeTarget(reservationSuccess)}
         />
       )}
@@ -1755,56 +1747,38 @@ function ReserveForm({ owner, selected, gpus, reservations, onMissingSelection, 
   );
 }
 
-function KeysView({ tokens, reservations, canCreate, onCreate, onAllow, onShow, onRevoke }) {
-  const reservationsByToken = new Map(
-    groupScheduleReservations(reservations).map((reservation) => [reservation.id, reservation]),
-  );
+function KeysView({ keys, onAllow, onShow, onRegenerate }) {
   return (
     <section className="keys-panel">
       <div className="section-heading">
         <div>
-          <h2>Keys</h2>
-          <p className="muted">Claim keys and reserved keys are listed without secrets.</p>
+          <h2>My fixed key</h2>
+          <p className="muted">This key works for every reservation on every synchronized node, and can claim an unreserved GPU.</p>
         </div>
-        {canCreate && <button className="primary-button" onClick={onCreate}>Create claim key</button>}
       </div>
       <div className="key-list">
-        {tokens.map((token) => {
-          const reservation = token.mode === "reserved" ? reservationsByToken.get(token.id) : null;
-          return (
-            <div className="key-row" key={token.id}>
-              <div className="key-summary">
-                <strong>{token.name || "Key ..."}</strong>
-                <span className="key-subtitle">{token.mode} · {new Date(token.created_at).toLocaleDateString()}</span>
-                {token.mode === "reserved" && (
-                  <div className="reserved-key-details">
-                    <KeyDetail label="Purpose" value={reservation?.purpose || "--"} />
-                    <KeyDetail label="Start" value={reservation ? dateTimeLabel(reservation.starts_at) : "--"} />
-                    <KeyDetail label="End" value={reservation ? dateTimeLabel(reservation.expires_at) : "--"} />
-                    <KeyDetail label="GPUs" value={reservation?.gpus?.length ? reservation.gpus.join(", ") : "--"} />
-                  </div>
-                )}
-              </div>
-              <div className="key-actions">
-                <button className="primary-button" onClick={() => onAllow(token)}>Authorize</button>
-                <button className="key-button" onClick={() => onShow(token.id)}>Show key</button>
-                <button type="button" className="danger-button" onClick={() => onRevoke(token)}>Revoke</button>
-              </div>
+        {keys.map((key) => (
+          <div className="key-row" key={key.id}>
+            <div className="key-summary">
+              <strong>{key.owner}</strong>
+              <span className="key-subtitle">Fixed · version {key.version} · created {new Date(key.created_at).toLocaleDateString()}</span>
+              <span className="key-subtitle">{key.id}</span>
+              {(key.node_sync || []).map((node) => (
+                <span className={`key-sync key-sync-${node.status}`} key={node.node_id} title={node.error || ""}>
+                  {node.node}: {node.status}
+                </span>
+              ))}
             </div>
-          );
-        })}
-        {tokens.length === 0 && <div className="empty">No keys yet.</div>}
+            <div className="key-actions">
+              <button className="primary-button" onClick={() => onAllow(key)}>Authorize</button>
+              <button className="key-button" onClick={() => onShow(key.owner)}>Show key</button>
+              <button type="button" className="danger-button" onClick={() => onRegenerate(key.owner)}>Regenerate</button>
+            </div>
+          </div>
+        ))}
+        {keys.length === 0 && <div className="empty">Your fixed key is being initialized.</div>}
       </div>
     </section>
-  );
-}
-
-function KeyDetail({ label, value }) {
-  return (
-    <div className="reserved-key-detail">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
   );
 }
 
@@ -2219,43 +2193,6 @@ function DeleteUserModal({ user, onClose, onSubmit }) {
   );
 }
 
-function ClaimKeyModal({ owner, onClose, onSubmit }) {
-  const [error, setError] = useState("");
-  const [pending, setPending] = useState(false);
-  return (
-    <Modal title="Create claim key" onClose={onClose} hideClose>
-      <form
-        className="modal-form"
-        onSubmit={async (event) => {
-          event.preventDefault();
-          if (pending) {
-            return;
-          }
-          setPending(true);
-          setError("");
-          try {
-            await onSubmit();
-          } catch (err) {
-            setError(err.message);
-          } finally {
-            setPending(false);
-          }
-        }}
-      >
-        <div className="owner-row modal-owner">
-          <span>User</span>
-          <strong>{owner}</strong>
-        </div>
-        {error && <div className="modal-error">{error}</div>}
-        <div className="modal-actions">
-          <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
-          <button className="primary-button" disabled={pending}>{pending ? "Creating" : "Create"}</button>
-        </div>
-      </form>
-    </Modal>
-  );
-}
-
 function ScheduleDetailModal({
   title = "Reservation details",
   target,
@@ -2302,14 +2239,13 @@ function ScheduleDetailModal({
 }
 
 function RevokeModal({ target, onClose, onSubmit }) {
-  const isKey = target.kind === "key";
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
-  const targetLabel = !isKey && target.gpus?.length
+  const targetLabel = target.gpus?.length
     ? `${target.label} · GPU ${target.gpus.join(", ")}`
     : target.label;
   return (
-    <Modal title={isKey ? "Revoke key" : "Revoke reservation"} onClose={onClose} hideClose>
+    <Modal title="Revoke reservation" onClose={onClose} hideClose>
       <form
         className="modal-form"
         onSubmit={async (event) => {
@@ -2327,20 +2263,12 @@ function RevokeModal({ target, onClose, onSubmit }) {
             setPending(false);
           }
         }}
-      >
+        >
         <div className="revoke-summary">
-          <strong>{isKey ? target.name || "Key ..." : targetLabel}</strong>
-          <span>
-            {isKey
-              ? `${target.mode} · ${new Date(target.created_at).toLocaleDateString()}`
-              : `${timeLabel(target.start)} - ${timeLabel(target.end)}`}
-          </span>
+          <strong>{targetLabel}</strong>
+          <span>{timeLabel(target.start)} - {timeLabel(target.end)}</span>
         </div>
-        <p className="muted">
-          {isKey
-            ? "This will revoke the key and remove any related reservations or claims."
-            : "This will remove this job from every GPU in the reservation."}
-        </p>
+        <p className="muted">This ends the reservation on every selected GPU. Your fixed key remains active.</p>
         {error && <div className="modal-error">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
@@ -2386,10 +2314,10 @@ function SuccessKey({ token, onClose }) {
   return (
     <div className="modal-backdrop">
       <section className="success-panel">
-        <h2>Reserve Success</h2>
-        <p>Your key</p>
+        <h2>Your fixed key</h2>
+        <p>This same key is used for every reservation and synchronized node.</p>
         <div className="copy-row">
-          <input className="key-output" readOnly spellCheck="false" value={token || "rg ..."} aria-label="Reserved API key" />
+          <input className="key-output" readOnly spellCheck="false" value={token || "rg ..."} aria-label="Fixed API key" />
           <button
             type="button"
             className={`small-button copy-button ${copied ? "copied" : ""}`}

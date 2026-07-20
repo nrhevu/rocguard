@@ -157,6 +157,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "unable to create account")
 		return
 	}
+	s.requestManagedKeySync()
 	expires := time.Now().Add(sessionTTL)
 	http.SetCookie(w, s.sessionCookie(r, s.signSession(user.Username, user.Role, expires), expires))
 	writeJSON(w, http.StatusCreated, map[string]any{

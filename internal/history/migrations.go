@@ -146,3 +146,31 @@ CREATE TABLE IF NOT EXISTS session_artifacts (
   PRIMARY KEY(session_id, position)
 );
 `
+
+const migrationV2 = `
+CREATE TABLE IF NOT EXISTS authorization_sessions (
+  node_id TEXT NOT NULL,
+  authorization_id TEXT NOT NULL,
+  session_id TEXT NOT NULL REFERENCES reservation_sessions(session_id) ON DELETE CASCADE,
+  PRIMARY KEY(node_id, authorization_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS authorization_sessions_session_idx ON authorization_sessions(session_id, authorization_id);
+INSERT OR IGNORE INTO authorization_sessions(node_id,authorization_id,session_id)
+  SELECT node_id,authorization_id,session_id FROM authorization_scopes WHERE session_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS job_sessions (
+  node_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  session_id TEXT NOT NULL REFERENCES reservation_sessions(session_id) ON DELETE CASCADE,
+  PRIMARY KEY(node_id, job_id, session_id),
+  FOREIGN KEY(node_id,job_id) REFERENCES jobs(node_id,job_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS job_sessions_session_idx ON job_sessions(session_id, job_id);
+INSERT OR IGNORE INTO job_sessions(node_id,job_id,session_id)
+  SELECT node_id,job_id,session_id FROM jobs;
+CREATE TABLE IF NOT EXISTS managed_key_sync_state (
+  server_id TEXT PRIMARY KEY,
+  snapshot_id TEXT NOT NULL DEFAULT '',
+  synced_at_ms INTEGER,
+  sync_error TEXT NOT NULL DEFAULT ''
+);
+`

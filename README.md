@@ -293,6 +293,7 @@ Back up these files as secrets:
 
 ```text
 /var/lib/rocguard-web/session.key
+/var/lib/rocguard-web/user-key.key
 /var/lib/rocguard-web/servers.json
 /var/lib/rocguard-web/users.json
 ```
@@ -306,9 +307,10 @@ only while the gateway is stopped, then preserve ownership UID/GID `65532` and
 mode `0600`. Keep this directory on a local filesystem; NFS is not supported.
 
 They must remain owned by UID/GID `65532` with mode `0600`. Losing
-`session.key` signs out all browser sessions. Never place these files, node
-root keys, certificate private keys, or `/etc/rocguard/web.env` in source
-control.
+`session.key` signs out all browser sessions. Losing `user-key.key` makes the
+encrypted fixed keys in `users.json` unrecoverable, so those two files must be
+backed up and restored together. Never place these files, node root keys,
+certificate private keys, or `/etc/rocguard/web.env` in source control.
 
 ## Using RocGuard
 
@@ -328,10 +330,14 @@ the `Users` tab.
 3. Select one or more available GPUs.
 4. Choose the start and end time.
 5. Enter a purpose and submit.
-6. Open the reservation, select `Show key`, and copy the key.
+6. Open `Key` and copy your fixed key if you have not saved it already.
 
-A reserved key works only for its selected GPUs and reservation window. Keep
-the key private and revoke reservations that are no longer needed.
+Each account has one fixed key shared by every synchronized node and every
+reservation. The key uses the account's reservation entitlement on reserved
+GPUs and can claim a currently unreserved GPU. Reserving another window does
+not create or change the key. Keep it private; use `Regenerate` only when the
+credential must be replaced, because the previous version stops working after
+the managed-key snapshot reaches each node.
 
 ### Run a workload
 
@@ -372,9 +378,12 @@ KEY=rg_xxx rocguard token info
 
 In the web `Key` tab:
 
-- `Show key` reveals a key you own; administrators can reveal stored keys.
-- `Revoke` removes a key or reservation you own; administrators can revoke any
-  item.
+- `Show key` reveals your fixed key; administrators can reveal a user's key.
+- `Regenerate` replaces the fixed key and invalidates its previous version.
+- Node badges show whether the current key snapshot has synchronized.
+
+Revoking a reservation ends only that reservation. It does not change the
+account's fixed key.
 
 Regular users never need a node root key.
 

@@ -60,6 +60,10 @@ type TelemetryNodeAPI interface {
 	Telemetry(ctx context.Context, server ServerRecord, cursor string, limit int) (telemetry.Page, error)
 }
 
+type ManagedKeyNodeAPI interface {
+	SyncManagedUserKeys(ctx context.Context, server ServerRecord, snapshot protocol.ManagedUserKeySnapshot) (protocol.ManagedUserKeySyncResult, error)
+}
+
 type TelemetryGapError struct {
 	Gap telemetry.CursorGap
 }
@@ -345,6 +349,12 @@ func (v *snapshotJSONValidator) leaveContainer() {
 func (c NodeClient) CreateReservation(ctx context.Context, server ServerRecord, args protocol.RegisterArgs) (model.RegisterResult, error) {
 	var result model.RegisterResult
 	err := c.call(ctx, server, server.RootKey, http.MethodPost, "/api/v1/reservations", args, &result)
+	return result, err
+}
+
+func (c NodeClient) SyncManagedUserKeys(ctx context.Context, server ServerRecord, snapshot protocol.ManagedUserKeySnapshot) (protocol.ManagedUserKeySyncResult, error) {
+	var result protocol.ManagedUserKeySyncResult
+	err := c.call(ctx, server, server.RootKey, http.MethodPut, "/api/v1/user-keys/sync", snapshot, &result)
 	return result, err
 }
 

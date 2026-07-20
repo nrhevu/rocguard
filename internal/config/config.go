@@ -29,6 +29,7 @@ type Config struct {
 	WebSecureCookies      bool
 	WebTrustProxy         bool
 	WebSessionKey         string
+	WebUserKey            string
 	WebRegistry           string
 	WebUsers              string
 	WebUIDir              string
@@ -62,6 +63,7 @@ func Default() Config {
 		WebSecureCookies:      envBool("ROCGUARD_WEB_SECURE_COOKIES"),
 		WebTrustProxy:         envBool("ROCGUARD_WEB_TRUST_PROXY"),
 		WebSessionKey:         env("ROCGUARD_WEB_SESSION_KEY", "/var/lib/rocguard/web-session.key"),
+		WebUserKey:            env("ROCGUARD_WEB_USER_KEY", "/var/lib/rocguard-web/user-key.key"),
 		WebRegistry:           env("ROCGUARD_WEB_REGISTRY", "/var/lib/rocguard/web-servers.json"),
 		WebUsers:              env("ROCGUARD_WEB_USERS", "/var/lib/rocguard/web-users.json"),
 		WebUIDir:              env("ROCGUARD_WEB_UI_DIR", "web/ui/dist"),

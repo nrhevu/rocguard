@@ -29,6 +29,10 @@ func decodeRegisterArgs(raw json.RawMessage) (protocol.RegisterArgs, error) {
 			return decoder.Decode(&args.Name)
 		case "purpose":
 			return decoder.Decode(&args.Purpose)
+		case "external_session_id":
+			return decoder.Decode(&args.ExternalSessionID)
+		case "user_key_id":
+			return decoder.Decode(&args.UserKeyID)
 		case "gpus":
 			return decodeBoundedIntArray(decoder, &args.GPUs, maxGPUsPerRequest, "gpus")
 		case "ttl":

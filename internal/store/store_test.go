@@ -15,6 +15,7 @@ import (
 
 	"rocguard/internal/config"
 	"rocguard/internal/model"
+	"rocguard/internal/protocol"
 )
 
 func testStore(t *testing.T) *Store {
@@ -633,6 +634,55 @@ func TestRevokeFutureReservationDeletesRelatedToken(t *testing.T) {
 	}
 	if len(status.Reservations) != 0 {
 		t.Fatalf("revoke by future reservation id should delete related reservations: %+v", status.Reservations)
+	}
+}
+
+func TestManagedKeyReservationsHaveIndependentGroupsAndRevokeKeepsKey(t *testing.T) {
+	st := testStore(t)
+	rootKey, err := st.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
+	secret := "rg_" + strings.Repeat("a", 48)
+	snapshot := protocol.ManagedUserKeySnapshot{
+		SnapshotID: "sha256:test",
+		Keys:       []protocol.ManagedUserKey{{ID: "uk_alice", Owner: "alice", Version: 1, Hash: HashToken(secret)}},
+	}
+	if _, err := st.SyncManagedUserKeys(rootKey, snapshot, now); err != nil {
+		t.Fatal(err)
+	}
+	_, firstGroup, first, err := st.RegisterManagedReservations(rootKey, "uk_alice", "first", "sess_first", []int{0}, now, now.Add(time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondGroup, _, err := st.RegisterManagedReservations(rootKey, "uk_alice", "second", "sess_second", []int{1}, now, now.Add(time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstGroup == secondGroup {
+		t.Fatal("reservations using one fixed key must have independent groups")
+	}
+	if err := st.Revoke(firstGroup); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ValidateToken(secret, now.Add(time.Minute)); err != nil {
+		t.Fatalf("revoking a reservation must keep the fixed key valid: %v", err)
+	}
+	status, err := st.KeyStatus(rootKey, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Tokens) != 1 || status.Tokens[0].Revoked {
+		t.Fatalf("fixed key was revoked: %+v", status.Tokens)
+	}
+	for _, reservation := range status.Reservations {
+		if reservation.ID == first[0].ID {
+			t.Fatal("revoked reservation remained visible")
+		}
+		if reservation.GroupID != secondGroup {
+			t.Fatalf("unexpected surviving reservation: %+v", reservation)
+		}
 	}
 }
 
