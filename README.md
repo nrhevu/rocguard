@@ -369,6 +369,27 @@ In the web `Key` tab:
 
 Regular users never need a node root key.
 
+### Codex skill
+
+This repository includes a Codex skill for low-friction RocGuard session
+protection and handoff workflows. Install it into Codex with:
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R codex/skills/rocguard "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+Restart or reload Codex so the skill list refreshes, then use:
+
+```text
+$rocguard protect
+use ROCGUARD_KEY
+```
+
+By default, the skill authorizes the current Linux user. Add `docker: ...` or
+`k8s namespace: ...` only when a narrower exact scope is known. See
+`codex/skills/rocguard/USER_GUIDE.md` for copy-paste prompts.
+
 ## Administration
 
 ### Root key

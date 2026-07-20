@@ -1,0 +1,4 @@
+interface:
+  display_name: "RocGuard"
+  short_description: "Protect or yield shared GPU sessions"
+  default_prompt: "Use $rocguard to protect or yield my GPU session with a RocGuard key."
