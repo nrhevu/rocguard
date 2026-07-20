@@ -24,7 +24,7 @@ const (
 	DefaultTokenTTL   = 2 * time.Hour
 	MaxTokenTTL       = 24 * time.Hour
 	DefaultHardTTL    = 2 * time.Hour
-	MaxHardTTL        = 8 * time.Hour
+	MaxHardTTL        = 24 * time.Hour
 	maxAuditEvents    = 1000
 	maxAuditLogBytes  = 10 << 20
 	maxStateFileBytes = 64 << 20

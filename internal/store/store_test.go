@@ -227,13 +227,13 @@ func TestHardRegisterTTLMax(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)
-	if _, token, reservations, err := st.RegisterHardReservations(key, "alice", []int{0}, "8h", now); err != nil {
-		t.Fatalf("8h reserved reservation should be accepted: %v", err)
+	if _, token, reservations, err := st.RegisterHardReservations(key, "alice", []int{0}, "24h", now); err != nil {
+		t.Fatalf("24h reserved reservation should be accepted: %v", err)
 	} else if token.Mode != model.TokenModeReserved || len(reservations) != 1 || reservations[0].GPU != 0 {
 		t.Fatalf("unexpected reserved token/reservations: token=%+v reservations=%+v", token, reservations)
 	}
-	if _, _, _, err := st.RegisterHardReservations(key, "bob", []int{1}, "8h1s", now); err == nil {
-		t.Fatal("expected reserved ttl above 8h to fail")
+	if _, _, _, err := st.RegisterHardReservations(key, "bob", []int{1}, "24h1s", now); err == nil {
+		t.Fatal("expected reserved ttl above 24h to fail")
 	}
 }
 
