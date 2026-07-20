@@ -19,10 +19,11 @@ const (
 )
 
 type GPUProcess struct {
-	GPU      int    `json:"gpu"`
-	PID      int    `json:"pid"`
-	Name     string `json:"name,omitempty"`
-	MemBytes uint64 `json:"mem_bytes,omitempty"`
+	GPU             int    `json:"gpu"`
+	PID             int    `json:"pid"`
+	Name            string `json:"name,omitempty"`
+	MemBytes        uint64 `json:"mem_bytes,omitempty"`
+	MemBytesUnknown bool   `json:"mem_bytes_unknown,omitempty"`
 }
 
 type GPUMetric struct {
@@ -34,6 +35,7 @@ type GPUMetric struct {
 
 type ProcInfo struct {
 	PID         int
+	StartTime   uint64
 	UID         int
 	Username    string
 	Cmdline     []string
@@ -143,6 +145,8 @@ type BypassRule struct {
 	ID        string    `json:"id"`
 	Type      string    `json:"type"`
 	PID       int       `json:"pid,omitempty"`
+	StartTime uint64    `json:"start_time,omitempty"`
+	BootID    string    `json:"boot_id,omitempty"`
 	Command   string    `json:"command,omitempty"`
 	UID       int       `json:"uid,omitempty"`
 	Reason    string    `json:"reason"`

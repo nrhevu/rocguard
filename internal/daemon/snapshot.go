@@ -15,15 +15,13 @@ func (s *Server) Snapshot(ctx context.Context, now time.Time) (model.NodeSnapsho
 	if err != nil {
 		return model.NodeSnapshot{}, err
 	}
-	rows, _ := s.ps(ctx, now)
-	processes, _ := s.AMD.Processes(ctx)
+	processes, _ := s.processesForRead(ctx)
+	rows, _ := s.psWithProcesses(ctx, now, processes)
 	metricsByGPU := map[int]model.GPUMetric{}
-	if metricsProvider, ok := s.AMD.(amdsmi.MetricsProvider); ok {
-		if metrics, err := metricsProvider.Metrics(ctx); err == nil {
-			for _, metric := range metrics {
-				idsMetric := metric
-				metricsByGPU[idsMetric.GPU] = idsMetric
-			}
+	if metrics, err := s.metricsForRead(ctx); err == nil {
+		for _, metric := range metrics {
+			idsMetric := metric
+			metricsByGPU[idsMetric.GPU] = idsMetric
 		}
 	}
 	hostname, _ := os.Hostname()
@@ -96,6 +94,23 @@ func (s *Server) Snapshot(ctx context.Context, now time.Time) (model.NodeSnapsho
 		Bypasses:       status.Bypasses,
 		PS:             rows,
 	}, nil
+}
+
+func (s *Server) metricsForRead(ctx context.Context) ([]model.GPUMetric, error) {
+	provider, ok := s.AMD.(amdsmi.MetricsProvider)
+	if !ok {
+		return nil, nil
+	}
+	s.metricsReadMu.Lock()
+	defer s.metricsReadMu.Unlock()
+	if time.Since(s.metricsReadAt) < time.Second {
+		return append([]model.GPUMetric(nil), s.metricsReadRows...), s.metricsReadErr
+	}
+	rows, err := provider.Metrics(ctx)
+	s.metricsReadAt = time.Now()
+	s.metricsReadRows = append(s.metricsReadRows[:0], rows...)
+	s.metricsReadErr = err
+	return append([]model.GPUMetric(nil), rows...), err
 }
 
 func reservationViewActiveAt(reservation model.ReservationView, now time.Time) bool {

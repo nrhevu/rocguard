@@ -2,9 +2,15 @@ package web
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +19,7 @@ import (
 
 	"rocguard/internal/config"
 	"rocguard/internal/model"
+	"rocguard/internal/netlimit"
 	"rocguard/internal/protocol"
 )
 
@@ -22,12 +29,21 @@ type Server struct {
 	Users    *UserStore
 	Client   NodeAPI
 
-	fleetCacheMu  sync.Mutex
-	fleetCache    fleetSnapshot
-	fleetCacheAt  time.Time
-	fleetCacheOK  bool
-	fleetCacheTTL time.Duration
-	now           func() time.Time
+	fleetCacheMu   sync.Mutex
+	fleetCache     fleetSnapshot
+	fleetCacheAt   time.Time
+	fleetCacheOK   bool
+	fleetCacheTTL  time.Duration
+	fleetRefresh   *fleetRefreshCall
+	now            func() time.Time
+	sessionKey     []byte
+	sessionKeyErr  error
+	loginMu        sync.Mutex
+	loginAttempts  map[string]loginAttempt
+	requestMu      sync.Mutex
+	activeUsers    map[string]int
+	activeTotal    int
+	activeNonAdmin int
 }
 
 type addServerRequest struct {
@@ -56,6 +72,35 @@ type fleetSnapshot struct {
 	Servers []serverSnapshot `json:"servers"`
 }
 
+type fleetRefreshCall struct {
+	done   chan struct{}
+	result fleetSnapshot
+	err    error
+}
+
+const (
+	fleetRefreshTimeout          = 20 * time.Second
+	fleetNodeTimeout             = 4 * time.Second
+	maxFleetWorkers              = 16
+	maxNodeSnapshotRecords       = 4096
+	maxNodeSnapshotProcesses     = 2048
+	maxFleetSnapshotRecords      = 32768
+	maxFleetSnapshotProcesses    = 8192
+	maxFleetSnapshotRetainedSize = 32 << 20
+	maxFleetErrorBytes           = 1024
+	maxWebHTTPConnections        = 256
+	maxAuthenticatedRequests     = 64
+	maxAuthenticatedRequestsUser = 8
+	reservedAdminRequests        = 8
+)
+
+type fleetSnapshotBudget struct {
+	mu        sync.Mutex
+	records   int
+	processes int
+	bytes     int64
+}
+
 type serverSnapshot struct {
 	Server   PublicServerRecord  `json:"server"`
 	Online   bool                `json:"online"`
@@ -64,19 +109,41 @@ type serverSnapshot struct {
 }
 
 func New(cfg config.Config) *Server {
+	sessionKey, sessionKeyErr := loadOrCreateSessionKey(cfg.WebSessionKey)
 	return &Server{
 		Cfg:           cfg,
-		Registry:      NewRegistry(cfg.WebRegistry),
+		Registry:      NewRegistry(cfg.WebRegistry, cfg.WebAllowInsecureNodes),
 		Users:         NewUserStore(cfg.WebUsers),
-		Client:        NodeClient{Timeout: 4 * time.Second},
+		Client:        NodeClient{Timeout: 4 * time.Second, AllowInsecureNodes: cfg.WebAllowInsecureNodes},
 		fleetCacheTTL: time.Second,
 		now:           time.Now,
+		sessionKey:    sessionKey,
+		sessionKeyErr: sessionKeyErr,
+		loginAttempts: make(map[string]loginAttempt),
+		activeUsers:   make(map[string]int),
 	}
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	if strings.TrimSpace(s.Cfg.WebPassword) == "" {
-		return errors.New("ROCGUARD_WEB_PASSWORD is required")
+	if s.sessionKeyErr != nil {
+		return fmt.Errorf("initialize web session key: %w", s.sessionKeyErr)
+	}
+	if len(s.sessionKey) != sessionKeyBytes {
+		return errors.New("web session key is unavailable")
+	}
+	if (s.Cfg.WebTLSCert == "") != (s.Cfg.WebTLSKey == "") {
+		return errors.New("both ROCGUARD_WEB_TLS_CERT and ROCGUARD_WEB_TLS_KEY are required for TLS")
+	}
+	if s.Cfg.WebTLSCert == "" && !s.Cfg.WebAllowInsecure {
+		return errors.New("refusing web HTTP listener without TLS; configure TLS or explicitly set ROCGUARD_WEB_ALLOW_INSECURE=1")
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if s.Cfg.WebTLSCert != "" {
+		certificate, err := tls.LoadX509KeyPair(s.Cfg.WebTLSCert, s.Cfg.WebTLSKey)
+		if err != nil {
+			return fmt.Errorf("load web TLS certificate: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{certificate}
 	}
 	if err := s.Users.BootstrapAdmin(s.Cfg.WebUser, s.Cfg.WebPassword); err != nil {
 		return err
@@ -85,24 +152,48 @@ func (s *Server) Run(ctx context.Context) error {
 		Addr:              s.Cfg.WebAddr,
 		Handler:           s.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+		TLSConfig:         tlsConfig,
 	}
+	listener, err := net.Listen("tcp", s.Cfg.WebAddr)
+	if err != nil {
+		return err
+	}
+	listener = netlimit.NewListener(listener, maxWebHTTPConnections)
+	defer listener.Close()
+	serveDone := make(chan struct{})
+	defer close(serveDone)
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-serveDone:
+			return
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
 	}()
-	err := httpServer.ListenAndServe()
-	if errors.Is(err, http.ErrServerClosed) {
+	var serveErr error
+	if s.Cfg.WebTLSCert != "" {
+		serveErr = httpServer.ServeTLS(listener, "", "")
+	} else {
+		serveErr = httpServer.Serve(listener)
+	}
+	if errors.Is(serveErr, http.ErrServerClosed) {
 		return nil
 	}
-	return err
+	return serveErr
 }
 
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/login", s.handleLogin)
-	mux.HandleFunc("/api/register", s.handleRegister)
+	if s.Cfg.WebAllowRegistration {
+		mux.HandleFunc("/api/register", s.handleRegister)
+	}
 	mux.HandleFunc("/api/session", s.handleSession)
 	mux.HandleFunc("/api/logout", s.requireSession(s.handleLogout))
 	mux.HandleFunc("/api/password", s.requireSession(s.handleChangePassword))
@@ -111,7 +202,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/servers/", s.requireSession(s.handleServerAction))
 	mux.HandleFunc("/api/fleet/snapshot", s.requireSession(s.handleFleetSnapshot))
 	mux.HandleFunc("/", s.handleStatic)
-	return mux
+	return s.securityMiddleware(mux)
 }
 
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
@@ -125,12 +216,17 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, users)
 	case http.MethodPost:
 		var req createUserRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(r, &req); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		user, err := s.Users.Create(req.Username, req.Password, req.Role)
 		if err != nil {
+			if errors.Is(err, errPasswordWorkBusy) {
+				w.Header().Set("Retry-After", "1")
+				writeJSONError(w, http.StatusTooManyRequests, "password service is temporarily busy; try again")
+				return
+			}
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -138,7 +234,7 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		session, _ := currentSession(r)
 		var req deleteUserRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(r, &req); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -172,7 +268,7 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req addServerRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(r, &req); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -228,7 +324,7 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 	case action == "reservations" && r.Method == http.MethodPost:
 		var args protocol.RegisterArgs
-		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+		if err := decodeJSONBody(r, &args); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -247,8 +343,15 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 		result.Token = ""
 		writeJSON(w, http.StatusCreated, result)
 	case action == "claim-keys" && r.Method == http.MethodPost:
+		if session.Role != RoleAdmin {
+			writeJSONError(w, http.StatusForbidden, "admin access required for claim keys")
+			return
+		}
 		var args protocol.RegisterArgs
-		_ = json.NewDecoder(r.Body).Decode(&args)
+		if err := decodeJSONBody(r, &args); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		args.Name = session.User
 		result, err := s.Client.CreateClaimKey(r.Context(), record, args)
 		if err != nil {
@@ -259,7 +362,7 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, result)
 	case action == "show-key" && r.Method == http.MethodPost:
 		var req showKeyRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(r, &req); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -288,7 +391,7 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 		})
 	case action == "allow" && r.Method == http.MethodPost:
 		var args protocol.AllowArgs
-		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+		if err := decodeJSONBody(r, &args); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -296,6 +399,10 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 		args.Mode = strings.TrimSpace(args.Mode)
 		if args.ID == "" {
 			writeJSONError(w, http.StatusBadRequest, "id is required")
+			return
+		}
+		if session.Role != RoleAdmin && allowArgsHaveWildcard(args) {
+			writeJSONError(w, http.StatusForbidden, "wildcard authorization requires admin access")
 			return
 		}
 		allowed, err := s.canUseKey(r.Context(), record, session, args.ID)
@@ -316,7 +423,7 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, result)
 	case action == "revoke" && r.Method == http.MethodPost:
 		var args protocol.RevokeArgs
-		if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+		if err := decodeJSONBody(r, &args); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -362,20 +469,50 @@ func (s *Server) handleFleetSnapshot(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) cachedFleetSnapshot(ctx context.Context) (fleetSnapshot, error) {
 	s.fleetCacheMu.Lock()
-	defer s.fleetCacheMu.Unlock()
-
 	now := s.nowTime()
 	if s.fleetCacheOK && now.Sub(s.fleetCacheAt) < s.fleetSnapshotCacheTTL() {
-		return s.fleetCache, nil
+		out := s.fleetCache
+		s.fleetCacheMu.Unlock()
+		return out, nil
 	}
-	out, err := s.fetchFleetSnapshot(ctx)
-	if err != nil {
-		return fleetSnapshot{}, err
+	if call := s.fleetRefresh; call != nil {
+		s.fleetCacheMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return fleetSnapshot{}, ctx.Err()
+		case <-call.done:
+			return call.result, call.err
+		}
 	}
-	s.fleetCache = out
-	s.fleetCacheAt = now
-	s.fleetCacheOK = true
-	return out, nil
+	call := &fleetRefreshCall{done: make(chan struct{})}
+	s.fleetRefresh = call
+	s.fleetCacheMu.Unlock()
+
+	go s.refreshFleetSnapshot(call)
+	select {
+	case <-ctx.Done():
+		return fleetSnapshot{}, ctx.Err()
+	case <-call.done:
+		return call.result, call.err
+	}
+}
+
+func (s *Server) refreshFleetSnapshot(call *fleetRefreshCall) {
+	refreshCtx, cancel := context.WithTimeout(context.Background(), fleetRefreshTimeout)
+	defer cancel()
+	out, err := s.fetchFleetSnapshot(refreshCtx)
+
+	s.fleetCacheMu.Lock()
+	call.result = out
+	call.err = err
+	if err == nil {
+		s.fleetCache = out
+		s.fleetCacheAt = s.nowTime()
+		s.fleetCacheOK = true
+	}
+	s.fleetRefresh = nil
+	close(call.done)
+	s.fleetCacheMu.Unlock()
 }
 
 func (s *Server) fetchFleetSnapshot(ctx context.Context) (fleetSnapshot, error) {
@@ -384,26 +521,154 @@ func (s *Server) fetchFleetSnapshot(ctx context.Context) (fleetSnapshot, error) 
 		return fleetSnapshot{}, err
 	}
 	out := fleetSnapshot{Servers: make([]serverSnapshot, len(records))}
-	var wg sync.WaitGroup
-	for i, record := range records {
-		wg.Add(1)
-		go func(i int, record ServerRecord) {
-			defer wg.Done()
-			nodeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			defer cancel()
-			snapshot, err := s.Client.Snapshot(nodeCtx, record)
-			item := serverSnapshot{Server: publicServerRecord(record)}
-			if err != nil {
-				item.Error = err.Error()
-			} else {
-				item.Online = true
-				item.Snapshot = &snapshot
-			}
-			out.Servers[i] = item
-		}(i, record)
+	if len(records) == 0 {
+		return out, nil
 	}
+	type snapshotJob struct {
+		index  int
+		record ServerRecord
+	}
+	jobs := make(chan snapshotJob)
+	var wg sync.WaitGroup
+	budget := &fleetSnapshotBudget{}
+	workers := min(maxFleetWorkers, len(records))
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				nodeCtx, cancel := context.WithTimeout(ctx, fleetNodeTimeout)
+				snapshot, err := s.Client.Snapshot(nodeCtx, job.record)
+				cancel()
+				item := serverSnapshot{Server: publicServerRecord(job.record)}
+				if err != nil {
+					item.Error = boundedFleetError(err)
+				} else if err := budget.accept(snapshot); err != nil {
+					item.Error = err.Error()
+				} else {
+					item.Online = true
+					item.Snapshot = &snapshot
+				}
+				out.Servers[job.index] = item
+			}
+		}()
+	}
+	dispatching := true
+	for i, record := range records {
+		select {
+		case jobs <- snapshotJob{index: i, record: record}:
+		case <-ctx.Done():
+			dispatching = false
+		}
+		if !dispatching {
+			break
+		}
+	}
+	close(jobs)
 	wg.Wait()
+	for i, record := range records {
+		if out.Servers[i].Server.ID != "" {
+			continue
+		}
+		message := "snapshot unavailable"
+		if err := ctx.Err(); err != nil {
+			message = err.Error()
+		}
+		out.Servers[i] = serverSnapshot{Server: publicServerRecord(record), Error: message}
+	}
 	return out, nil
+}
+
+func boundedFleetError(err error) string {
+	message := err.Error()
+	if len(message) > maxFleetErrorBytes {
+		return message[:maxFleetErrorBytes]
+	}
+	return message
+}
+
+func (b *fleetSnapshotBudget) accept(snapshot model.NodeSnapshot) error {
+	records, processes, bytes, err := nodeSnapshotCost(snapshot)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.records+records > maxFleetSnapshotRecords ||
+		b.processes+processes > maxFleetSnapshotProcesses ||
+		b.bytes+bytes > maxFleetSnapshotRetainedSize {
+		return errors.New("fleet snapshot budget exceeded")
+	}
+	b.records += records
+	b.processes += processes
+	b.bytes += bytes
+	return nil
+}
+
+func nodeSnapshotCost(snapshot model.NodeSnapshot) (records, processes int, bytes int64, err error) {
+	records = len(snapshot.GPUs) + len(snapshot.Tokens) + len(snapshot.Reservations) +
+		len(snapshot.Authorizations) + len(snapshot.SoftClaims) + len(snapshot.Leases) +
+		len(snapshot.Bypasses) + len(snapshot.PS)
+	for _, gpu := range snapshot.GPUs {
+		processes += len(gpu.Processes)
+	}
+	for _, authorization := range snapshot.Authorizations {
+		records += len(authorization.Command)
+	}
+	for _, lease := range snapshot.Leases {
+		records += len(lease.Command)
+	}
+	records += processes
+	if records > maxNodeSnapshotRecords {
+		return 0, 0, 0, fmt.Errorf("node snapshot exceeds %d records", maxNodeSnapshotRecords)
+	}
+	if processes > maxNodeSnapshotProcesses {
+		return 0, 0, 0, fmt.Errorf("node snapshot exceeds %d processes", maxNodeSnapshotProcesses)
+	}
+
+	bytes = 1024 + int64(records)*512
+	add := func(values ...string) {
+		for _, value := range values {
+			bytes += int64(len(value))
+		}
+	}
+	add(snapshot.Hostname)
+	for _, gpu := range snapshot.GPUs {
+		add(gpu.State)
+		for _, process := range gpu.Processes {
+			add(process.Name)
+		}
+	}
+	for _, token := range snapshot.Tokens {
+		add(token.ID, token.Key, token.KeyStatus, token.Name, token.Mode)
+	}
+	for _, reservation := range snapshot.Reservations {
+		add(reservation.ID, reservation.GroupID, reservation.Holder, reservation.Purpose)
+	}
+	for _, authorization := range snapshot.Authorizations {
+		add(authorization.ID, authorization.TokenID, authorization.Mode, authorization.TokenMode,
+			authorization.Holder, authorization.Username, authorization.ContainerID,
+			authorization.ContainerPattern, authorization.Namespace)
+		add(authorization.Command...)
+	}
+	for _, claim := range snapshot.SoftClaims {
+		add(claim.ID, claim.AuthorizationID, claim.Holder)
+	}
+	for _, lease := range snapshot.Leases {
+		add(lease.ID, lease.Mode, lease.TokenHash, lease.Holder, lease.CgroupPath,
+			lease.CgroupRel, lease.ContainerID, lease.Namespace)
+		add(lease.Command...)
+	}
+	for _, bypass := range snapshot.Bypasses {
+		add(bypass.ID, bypass.Type, bypass.Command, bypass.Reason)
+	}
+	for _, row := range snapshot.PS {
+		add(row.ID, row.GPU, row.User, row.Command)
+	}
+	if bytes > maxFleetSnapshotRetainedSize {
+		return 0, 0, 0, errors.New("node snapshot retained size is too large")
+	}
+	return records, processes, bytes, nil
 }
 
 func (s *Server) nowTime() time.Time {
@@ -467,20 +732,29 @@ func filterFleetSnapshot(in fleetSnapshot, session sessionInfo) fleetSnapshot {
 		filtered := item
 		if item.Snapshot != nil {
 			snapshot := *item.Snapshot
+			snapshot.GPUs = cloneFilteredGPUSnapshots(snapshot.GPUs)
 			snapshot.Tokens = filterTokens(snapshot.Tokens, session.User)
 			snapshot.Reservations = scrubReservations(snapshot.Reservations, session.User)
 			snapshot.Authorizations = filterAuthorizations(snapshot.Authorizations, session.User)
 			snapshot.SoftClaims = filterSoftClaims(snapshot.SoftClaims, session.User)
 			snapshot.Leases = filterLeases(snapshot.Leases, session.User)
 			snapshot.Bypasses = nil
+			snapshot.PS = nil
 			for i := range snapshot.GPUs {
-				if snapshot.GPUs[i].Reservation != nil && !sameOwner(snapshot.GPUs[i].Reservation.Holder, session.User) {
+				if snapshot.GPUs[i].Reservation != nil {
 					reservation := *snapshot.GPUs[i].Reservation
-					reservation.GroupID = ""
+					if !sameOwner(reservation.Holder, session.User) {
+						reservation.GroupID = ""
+					}
 					snapshot.GPUs[i].Reservation = &reservation
 				}
-				if snapshot.GPUs[i].Claim != nil && !sameOwner(snapshot.GPUs[i].Claim.Holder, session.User) {
-					snapshot.GPUs[i].Claim = nil
+				if snapshot.GPUs[i].Claim != nil {
+					if !sameOwner(snapshot.GPUs[i].Claim.Holder, session.User) {
+						snapshot.GPUs[i].Claim = nil
+					} else {
+						claim := *snapshot.GPUs[i].Claim
+						snapshot.GPUs[i].Claim = &claim
+					}
 				}
 			}
 			filtered.Snapshot = &snapshot
@@ -490,8 +764,16 @@ func filterFleetSnapshot(in fleetSnapshot, session sessionInfo) fleetSnapshot {
 	return out
 }
 
+func cloneFilteredGPUSnapshots(gpus []model.GPUSnapshot) []model.GPUSnapshot {
+	out := append([]model.GPUSnapshot(nil), gpus...)
+	for i := range out {
+		out[i].Processes = nil
+	}
+	return out
+}
+
 func filterTokens(tokens []model.TokenView, user string) []model.TokenView {
-	out := make([]model.TokenView, 0, len(tokens))
+	out := make([]model.TokenView, 0)
 	for _, token := range tokens {
 		if sameOwner(token.Name, user) {
 			out = append(out, token)
@@ -512,7 +794,7 @@ func scrubReservations(reservations []model.ReservationView, user string) []mode
 }
 
 func filterAuthorizations(authorizations []model.AuthorizationView, user string) []model.AuthorizationView {
-	out := make([]model.AuthorizationView, 0, len(authorizations))
+	out := make([]model.AuthorizationView, 0)
 	for _, authorization := range authorizations {
 		if sameOwner(authorization.Holder, user) {
 			out = append(out, authorization)
@@ -522,7 +804,7 @@ func filterAuthorizations(authorizations []model.AuthorizationView, user string)
 }
 
 func filterSoftClaims(claims []model.SoftClaimView, user string) []model.SoftClaimView {
-	out := make([]model.SoftClaimView, 0, len(claims))
+	out := make([]model.SoftClaimView, 0)
 	for _, claim := range claims {
 		if sameOwner(claim.Holder, user) {
 			out = append(out, claim)
@@ -532,7 +814,7 @@ func filterSoftClaims(claims []model.SoftClaimView, user string) []model.SoftCla
 }
 
 func filterLeases(leases []model.Lease, user string) []model.Lease {
-	out := make([]model.Lease, 0, len(leases))
+	out := make([]model.Lease, 0)
 	for _, lease := range leases {
 		if sameOwner(lease.Holder, user) {
 			out = append(out, lease)
@@ -594,6 +876,10 @@ func sameOwner(left, right string) bool {
 	return leftErr == nil && rightErr == nil && leftName == rightName
 }
 
+func allowArgsHaveWildcard(args protocol.AllowArgs) bool {
+	return strings.Contains(args.Container, "*") || strings.Contains(args.Namespace, "*") || strings.Contains(args.User, "*")
+}
+
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/api/") {
 		writeJSONError(w, http.StatusNotFound, "not found")
@@ -629,6 +915,84 @@ func splitServerAction(rawPath string) (string, string, bool) {
 		return parts[0], parts[1], true
 	}
 	return "", "", false
+}
+
+const maxAPIRequestBytes = 64 << 10
+
+func (s *Server) securityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Vary", "Cookie")
+			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, maxAPIRequestBytes)
+			}
+			if requestChangesState(r.Method) && !sameOriginRequest(r) {
+				writeJSONError(w, http.StatusForbidden, "cross-origin request denied")
+				return
+			}
+			if requestChangesState(r.Method) && requestHasBody(r) && !requestHasJSONContentType(r) {
+				writeJSONError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requestChangesState(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+func requestHasBody(r *http.Request) bool {
+	return r.Body != nil && (r.ContentLength != 0 || len(r.TransferEncoding) > 0)
+}
+
+func requestHasJSONContentType(r *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && strings.EqualFold(mediaType, "application/json")
+}
+
+func sameOriginRequest(r *http.Request) bool {
+	if site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); site == "cross-site" {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
+
+func decodeJSONBody(r *http.Request, dst any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain one JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

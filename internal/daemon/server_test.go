@@ -29,6 +29,23 @@ func (f fakeAMD) Processes(context.Context) ([]model.GPUProcess, error) {
 	return f.processes, nil
 }
 
+type failingAMD struct {
+	err error
+}
+
+func (f failingAMD) Processes(context.Context) ([]model.GPUProcess, error) {
+	return nil, f.err
+}
+
+type countingAMD struct {
+	calls int
+}
+
+func (f *countingAMD) Processes(context.Context) ([]model.GPUProcess, error) {
+	f.calls++
+	return nil, nil
+}
+
 type daemonFakeProc struct {
 	infos map[int]model.ProcInfo
 }
@@ -67,6 +84,18 @@ func (daemonFakeRuntime) DockerContainerName(context.Context, string) (string, e
 
 func (daemonFakeRuntime) NamespaceForContainer(context.Context, string) (string, error) {
 	return "training", nil
+}
+
+func TestNodeHTTPRejectsPlaintextWithoutExplicitOptIn(t *testing.T) {
+	server := testServer(t)
+	server.Cfg.NodeAddr = "127.0.0.1:0"
+	closeServer, err := server.startNodeHTTP(context.Background())
+	if closeServer != nil {
+		closeServer()
+	}
+	if err == nil || !strings.Contains(err.Error(), "ROCGUARD_NODE_ALLOW_INSECURE") {
+		t.Fatalf("startNodeHTTP error = %v, want explicit plaintext opt-in error", err)
+	}
 }
 
 type daemonMissingDockerRuntime struct{}
@@ -111,6 +140,64 @@ func TestRegisterRPC(t *testing.T) {
 	}
 	if result.Token == "" {
 		t.Fatal("empty token")
+	}
+}
+
+func TestReservationValidationUsesConfiguredInventoryAndOneSample(t *testing.T) {
+	server := testServer(t)
+	server.Cfg.GPUCount = 2
+	provider := &countingAMD{}
+	server.AMD = provider
+	now := time.Now()
+	if err := server.ensureGPUsCanReserveWindow(context.Background(), []int{0, 1}, now, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if provider.calls != 1 {
+		t.Fatalf("amd process samples = %d, want 1", provider.calls)
+	}
+	if err := server.ensureGPUsCanReserveWindow(context.Background(), []int{2}, now, now.Add(time.Hour)); err == nil {
+		t.Fatal("out-of-inventory GPU unexpectedly accepted")
+	}
+}
+
+func TestNonRootStatusRequiresTokenAndFiltersOtherKeys(t *testing.T) {
+	server := testServer(t)
+	rootKey, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceSecret, aliceToken, err := server.Store.RegisterSoftToken(rootKey, "alice", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, bobToken, err := server.Store.RegisterSoftToken(rootKey, "bob", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []model.Token{aliceToken, bobToken} {
+		if err := server.Store.AddAuthorization(model.Authorization{
+			ID: store.NewAuthorizationID(), Mode: model.ModeUser, TokenHash: token.Hash,
+			TokenMode: token.Mode, Holder: token.Name, UID: 1000, CreatedAt: time.Now(), Active: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := server.dispatch(context.Background(), peer{UID: 1000, GID: 1000}, protocol.Request{Method: "status"}); err == nil {
+		t.Fatal("non-root tokenless status unexpectedly succeeded")
+	}
+	result, err := server.dispatch(context.Background(), peer{UID: 1000, GID: 1000}, protocol.Request{Method: "status", Token: aliceSecret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := result.(model.Status)
+	if len(status.Tokens) != 1 || status.Tokens[0].ID != aliceToken.ID {
+		t.Fatalf("status exposed other tokens: %+v", status.Tokens)
+	}
+	if len(status.Authorizations) != 1 || status.Authorizations[0].TokenID != aliceToken.ID {
+		t.Fatalf("status exposed other authorizations: %+v", status.Authorizations)
+	}
+	if len(status.Bypasses) != 0 || len(status.Leases) != 0 {
+		t.Fatalf("status exposed administrative rows: %+v", status)
 	}
 }
 
@@ -169,10 +256,12 @@ func TestHardRegisterBusyGPUFailsWithoutReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.AMD = fakeAMD{processes: []model.GPUProcess{{GPU: 2, PID: 10, MemBytes: 1}}}
-	server.Proc = daemonFakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000, Cmdline: []string{"python"}}}}
+	server.Proc = daemonFakeProc{infos: map[int]model.ProcInfo{10: {PID: 10, UID: 1000, Cmdline: []string{"python", "--password", "do-not-leak", "\x1b[31m"}}}}
 	args, _ := json.Marshal(protocol.RegisterArgs{RootKey: key, Mode: model.TokenModeReserved, Name: "alice", GPUs: []int{1, 2}, TTL: "1h"})
 	if _, err := server.dispatch(context.Background(), peer{}, protocol.Request{ID: "1", Method: "register", Args: args}); err == nil {
 		t.Fatal("expected busy gpu error")
+	} else if err.Error() != "gpu 2 is busy" {
+		t.Fatalf("busy error exposed process details: %q", err)
 	}
 	status, err := server.Store.Status(time.Now())
 	if err != nil {
@@ -228,7 +317,7 @@ func TestSoftRegisterCreatesTokenOnly(t *testing.T) {
 	}
 }
 
-func TestReservedTokenCanAuthorizeBeforeStart(t *testing.T) {
+func TestReservedTokenOnlyAuthorizesDuringWindow(t *testing.T) {
 	server := testServer(t)
 	key, err := server.Store.ReadOrCreateRootKey()
 	if err != nil {
@@ -244,8 +333,8 @@ func TestReservedTokenCanAuthorizeBeforeStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := server.ensureTokenCanAuthorize(tokenHash, token, now); err != nil {
-		t.Fatalf("reserved token should authorize before starts_at: %v", err)
+	if err := server.ensureTokenCanAuthorize(tokenHash, token, now); err == nil {
+		t.Fatal("reserved token should not authorize before starts_at")
 	}
 	if err := server.ensureTokenCanAuthorize(tokenHash, token, start.Add(time.Minute)); err != nil {
 		t.Fatalf("reserved token should authorize during window: %v", err)
@@ -308,6 +397,7 @@ func TestNodeHTTPReservationPreservesOwner(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/reservations", strings.NewReader(string(body)))
 	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	server.nodeHTTPHandler().ServeHTTP(response, req)
 	if response.Code != http.StatusCreated {
@@ -331,10 +421,32 @@ func TestNodeHTTPReservationPreservesOwner(t *testing.T) {
 	}
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/reservations", strings.NewReader(string(missingOwner)))
 	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
 	response = httptest.NewRecorder()
 	server.nodeHTTPHandler().ServeHTTP(response, req)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("missing owner status = %d, body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestScheduledReservationRejectsOverlappingLegacyLease(t *testing.T) {
+	server := testServer(t)
+	now := time.Now().UTC()
+	lease := model.Lease{
+		ID:        "lease_existing",
+		GPU:       0,
+		Mode:      model.ModeBare,
+		Holder:    "alice",
+		CreatedAt: now.Add(-time.Minute),
+		ExpiresAt: now.Add(2 * time.Hour),
+		Active:    true,
+	}
+	if err := server.Store.AddLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	err := server.ensureGPUCanReserveWindow(context.Background(), 0, now.Add(time.Hour), now.Add(3*time.Hour))
+	if err == nil || !strings.Contains(err.Error(), lease.ID) {
+		t.Fatalf("overlapping scheduled reservation error = %v", err)
 	}
 }
 
@@ -358,6 +470,7 @@ func TestNodeHTTPAllowCreatesAuthorization(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/allow", strings.NewReader(string(body)))
 	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	server.nodeHTTPHandler().ServeHTTP(response, req)
 	if response.Code != http.StatusCreated {
@@ -429,6 +542,180 @@ func TestClaimedMonitorRejectsRunGPUWhenBusy(t *testing.T) {
 	}
 }
 
+func TestMonitorEvictsRevokedReservationBeforePruningEvidence(t *testing.T) {
+	server := testServer(t)
+	rootKey, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	secret, token, _, err := server.Store.RegisterHardReservations(rootKey, "alice", []int{0}, "1h", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := model.Authorization{
+		ID:        "auth_revoked",
+		Mode:      model.ModeUser,
+		TokenHash: token.Hash,
+		TokenMode: token.Mode,
+		Holder:    token.Name,
+		UID:       1000,
+		CreatedAt: now.UTC(),
+		ExpiresAt: token.ExpiresAt,
+		Active:    true,
+	}
+	if err := server.Store.AddAuthorization(authorization); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Store.Revoke(secret); err != nil {
+		t.Fatal(err)
+	}
+
+	killer := &daemonFakeKiller{}
+	server.Killer = killer
+	server.AMD = fakeAMD{processes: []model.GPUProcess{{GPU: 0, PID: 123, MemBytes: 1}}}
+	server.Proc = daemonFakeProc{infos: map[int]model.ProcInfo{123: {PID: 123, UID: 1000}}}
+	server.monitorOnce(context.Background())
+
+	if len(killer.killed) != 1 || killer.killed[0] != 123 {
+		t.Fatalf("revoked process kills = %v, want [123]", killer.killed)
+	}
+	state, err := server.Store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tokens) == 0 || len(state.Reservations) == 0 || len(state.Authorizations) == 0 {
+		t.Fatalf("revoked evidence was pruned before quiescence was confirmed: %+v", state)
+	}
+	server.AMD = fakeAMD{}
+	server.Proc = daemonFakeProc{infos: map[int]model.ProcInfo{}}
+	for i := 1; i <= evictionCleanSamples; i++ {
+		server.monitorOnce(context.Background())
+		state, err = server.Store.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < evictionCleanSamples && len(state.Authorizations) == 0 {
+			t.Fatalf("revoked evidence pruned after only %d clean samples", i)
+		}
+	}
+	if len(state.Tokens) != 0 || len(state.Reservations) != 0 || len(state.Authorizations) != 0 {
+		t.Fatalf("revoked evidence was not pruned after confirmed quiescence: %+v", state)
+	}
+}
+
+func TestRevokeSerializesWithEnforcement(t *testing.T) {
+	server := testServer(t)
+	server.enforceMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- server.revoke("missing") }()
+	select {
+	case <-done:
+		server.enforceMu.Unlock()
+		t.Fatal("revoke did not wait for the enforcement transaction")
+	case <-time.After(25 * time.Millisecond):
+	}
+	server.enforceMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("revoke remained blocked after enforcement completed")
+	}
+}
+
+func TestConnectionAdmissionReservesRootCapacity(t *testing.T) {
+	server := testServer(t)
+	for i := 0; i < maxRPCConnections-reservedRootRPCConnections; i++ {
+		uid := 1000 + i/maxRPCConnectionsUID
+		if !server.acquireConnection(uid) {
+			t.Fatalf("non-root connection %d rejected before reserved boundary", i)
+		}
+	}
+	if server.acquireConnection(2000) {
+		t.Fatal("non-root connection consumed root-reserved capacity")
+	}
+	for i := 0; i < reservedRootRPCConnections; i++ {
+		if !server.acquireConnection(0) {
+			t.Fatalf("root-reserved connection %d was rejected", i)
+		}
+	}
+	if server.acquireConnection(0) {
+		t.Fatal("connection admission exceeded the absolute cap")
+	}
+}
+
+func TestDockerResolveAdmissionIsBounded(t *testing.T) {
+	server := testServer(t)
+	releases := make([]func(), 0, maxConcurrentDockerResolves)
+	for range maxConcurrentDockerResolves {
+		release, err := server.acquireDockerResolve(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		releases = append(releases, release)
+	}
+	if _, err := server.acquireDockerResolve(context.Background()); err == nil {
+		t.Fatal("docker resolver admission exceeded its cap")
+	}
+	for _, release := range releases {
+		release()
+	}
+}
+
+func TestNodeHTTPAdmissionIsBounded(t *testing.T) {
+	server := testServer(t)
+	releases := make([]func(), 0, maxConcurrentNodeHTTP)
+	for range maxConcurrentNodeHTTP {
+		release, ok := server.acquireNodeHTTPRequest()
+		if !ok {
+			t.Fatal("node HTTP admission rejected before its cap")
+		}
+		releases = append(releases, release)
+	}
+	if _, ok := server.acquireNodeHTTPRequest(); ok {
+		t.Fatal("node HTTP admission exceeded its cap")
+	}
+	for _, release := range releases {
+		release()
+	}
+}
+
+func TestBypassAddSerializesWithEnforcement(t *testing.T) {
+	server := testServer(t)
+	server.Proc = daemonFakeProc{infos: map[int]model.ProcInfo{123: {PID: 123, StartTime: 42}}}
+	server.enforceMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := server.addBypass(protocol.BypassAddArgs{Type: model.BypassPID, PID: 123, TTL: "1h", Reason: "maintenance"}, time.Now())
+		done <- err
+	}()
+	select {
+	case <-done:
+		server.enforceMu.Unlock()
+		t.Fatal("bypass add did not wait for the enforcement transaction")
+	case <-time.After(25 * time.Millisecond):
+	}
+	server.enforceMu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bypass add remained blocked after enforcement completed")
+	}
+}
+
+func TestCommandBypassRequiresRootUID(t *testing.T) {
+	server := testServer(t)
+	_, err := server.addBypass(protocol.BypassAddArgs{
+		Type: model.BypassCommand, Command: "/usr/bin/gpuagent", UID: 1000, TTL: "1h", Reason: "maintenance",
+	}, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "uid 0") {
+		t.Fatalf("non-root command bypass error = %v, want uid 0 restriction", err)
+	}
+}
+
 func TestAdminMethodsRequireRootKey(t *testing.T) {
 	server := testServer(t)
 	if _, err := server.dispatch(context.Background(), peer{}, protocol.Request{ID: "1", Method: "show_keys", Args: []byte(`{"root_key":"bad"}`)}); !errors.Is(err, store.ErrInvalidRootKey) {
@@ -485,7 +772,7 @@ func TestPSIncludesHardReservationRow(t *testing.T) {
 	if _, _, _, err := server.Store.RegisterHardReservations(key, "alice", []int{3}, "1h", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := server.ps(context.Background(), time.Now())
+	rows, err := server.ps(context.Background(), time.Now(), "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +817,7 @@ func TestPSAggregatesMultiGPUProcessRows(t *testing.T) {
 		123: {PID: 123, Username: "alice", Cmdline: []string{"python", "train.py"}},
 	}}
 
-	rows, err := server.ps(context.Background(), now)
+	rows, err := server.ps(context.Background(), now, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +882,7 @@ func TestDockerAllowWildcardStoresPattern(t *testing.T) {
 	}
 }
 
-func TestDockerAllowStoresNameWhenContainerDoesNotExist(t *testing.T) {
+func TestDockerAllowRejectsContainerWhenResolutionFails(t *testing.T) {
 	server := testServer(t)
 	server.Runtime = daemonMissingDockerRuntime{}
 	key, err := server.Store.ReadOrCreateRootKey()
@@ -607,13 +894,15 @@ func TestDockerAllowStoresNameWhenContainerDoesNotExist(t *testing.T) {
 		t.Fatal(err)
 	}
 	args, _ := json.Marshal(protocol.DockerAllowArgs{Container: "future-container"})
-	result, err := server.dispatch(context.Background(), peer{}, protocol.Request{ID: "1", Method: "allow_docker", Token: secret, Args: args})
+	if _, err := server.dispatch(context.Background(), peer{}, protocol.Request{ID: "1", Method: "allow_docker", Token: secret, Args: args}); err == nil {
+		t.Fatal("unresolved exact container created a deferred authorization")
+	}
+	status, err := server.Store.Status(time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	allow := result.(model.AllowResult)
-	if allow.AuthorizationID == "" || allow.ContainerPattern != "future-container" || allow.ContainerID != "" {
-		t.Fatalf("unexpected allow result: %+v", allow)
+	if len(status.Authorizations) != 0 {
+		t.Fatalf("failed container resolution persisted authorization: %+v", status.Authorizations)
 	}
 }
 
@@ -646,7 +935,7 @@ func TestUserAllowWildcardDoesNotLookupUser(t *testing.T) {
 }
 
 func TestCommandEnvDoesNotInjectGPUVisibility(t *testing.T) {
-	env := commandEnv([]string{"PATH=/bin", "KEY=rg_secret"})
+	env := commandEnv([]string{"PATH=/bin", "KEY=rg_secret", "ROOT_KEY=rk_secret", "ROCGUARD_WEB_PASSWORD=secret"})
 	for _, item := range env {
 		if strings.HasPrefix(item, "HIP_VISIBLE_DEVICES=") ||
 			strings.HasPrefix(item, "ROCR_VISIBLE_DEVICES=") ||
@@ -657,6 +946,85 @@ func TestCommandEnvDoesNotInjectGPUVisibility(t *testing.T) {
 	}
 	if len(env) != 1 || env[0] != "PATH=/bin" {
 		t.Fatalf("unexpected env: %v", env)
+	}
+	if env := commandEnv(nil); env == nil || len(env) != 0 {
+		t.Fatalf("missing client env must not inherit daemon env: %#v", env)
+	}
+}
+
+func TestPrepareUnixSocketRefusesLiveListener(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "live.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := prepareUnixSocket(path); err == nil {
+		t.Fatal("live unix socket was replaced")
+	}
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("live listener was damaged: %v", err)
+	}
+	_ = conn.Close()
+}
+
+func TestPrepareUnixSocketRemovesOnlyStaleSocket(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stale.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareUnixSocket(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale socket remains: %v", err)
+	}
+}
+
+func TestRemoveOwnedUnixSocketPreservesReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "owned.sock")
+	first, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.SetUnlinkOnClose(false)
+	defer first.Close()
+	expected, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	if err := removeOwnedUnixSocket(path, expected); err == nil {
+		t.Fatal("replacement socket was treated as owned")
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("replacement socket was removed: %v", err)
+	}
+}
+
+func TestAcquireUnixSocketLockRejectsSecondOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.lock")
+	first, err := acquireUnixSocketLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if second, err := acquireUnixSocketLock(path); err == nil {
+		second.Close()
+		t.Fatal("second socket lock owner unexpectedly succeeded")
 	}
 }
 
@@ -677,7 +1045,7 @@ func TestRunCommandAllowsNoGPU(t *testing.T) {
 	client, srv := net.Pipe()
 	defer client.Close()
 	defer srv.Close()
-	result, err := server.runCommand(context.Background(), srv, "1", token, tokenHash, peer{UID: os.Getuid(), GID: os.Getgid()}, protocol.RunArgs{
+	result, err := server.runCommand(context.Background(), srv, "1", secret, token, tokenHash, peer{UID: os.Getuid(), GID: os.Getgid()}, protocol.RunArgs{
 		Command: []string{"/bin/true"},
 		Workdir: t.TempDir(),
 	})
@@ -735,17 +1103,8 @@ func TestRunConnectionCloseKillsProcessGroup(t *testing.T) {
 	}
 }
 
-func TestPeerGroupsIncludesSupplementaryGroups(t *testing.T) {
-	dir := t.TempDir()
-	statusDir := filepath.Join(dir, "1234")
-	if err := os.MkdirAll(statusDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	status := "Name:\trocguard\nGroups:\t1001 44 109 1001\n"
-	if err := os.WriteFile(filepath.Join(statusDir, "status"), []byte(status), 0644); err != nil {
-		t.Fatal(err)
-	}
-	groups := peerGroups(dir, 1234, 1001)
+func TestNormalizePeerGroupsIncludesSupplementaryGroups(t *testing.T) {
+	groups := normalizePeerGroups(1001, []string{"1001", "44", "109", "1001", "invalid"})
 	want := []uint32{1001, 44, 109}
 	if len(groups) != len(want) {
 		t.Fatalf("groups=%v want=%v", groups, want)
@@ -754,6 +1113,55 @@ func TestPeerGroupsIncludesSupplementaryGroups(t *testing.T) {
 		if groups[i] != want[i] {
 			t.Fatalf("groups=%v want=%v", groups, want)
 		}
+	}
+}
+
+func TestPeerProcessGroupsUsesConnectedProcessStatus(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, "123")
+	if err := os.MkdirAll(base, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "status"), []byte("Uid:\t1000\t1000\t1000\t1000\nGroups:\t44 109\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	groups, err := peerProcessGroups(root, 123, 1000, 1001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []uint32{1001, 44, 109}
+	if len(groups) != len(want) {
+		t.Fatalf("groups=%v want=%v", groups, want)
+	}
+	for i := range want {
+		if groups[i] != want[i] {
+			t.Fatalf("groups=%v want=%v", groups, want)
+		}
+	}
+	if _, err := peerProcessGroups(root, 123, 2000, 1001); err == nil {
+		t.Fatal("peer UID mismatch was accepted")
+	}
+}
+
+func TestReadBootIDValidatesKernelValue(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "sys", "kernel", "random")
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	bootIDPath := filepath.Join(path, "boot_id")
+	const bootID = "11111111-2222-3333-4444-555555555555"
+	if err := os.WriteFile(bootIDPath, []byte(bootID+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readBootID(root); err != nil || got != bootID {
+		t.Fatalf("readBootID = %q, %v", got, err)
+	}
+	if err := os.WriteFile(bootIDPath, []byte("not-a-boot-id\n"), 0444); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readBootID(root); err == nil {
+		t.Fatal("invalid boot id was accepted")
 	}
 }
 
@@ -824,6 +1232,84 @@ func TestCleanupFinishedBareLeaseReleasesDeadProcess(t *testing.T) {
 	}
 }
 
+func TestMonitorCleansExpiredManagedCgroupWhenAMDTelemetryFails(t *testing.T) {
+	server := testServer(t)
+	server.AMD = failingAMD{err: errors.New("telemetry unavailable")}
+	rootKey, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalNow := time.Now().Add(-2 * time.Hour)
+	if _, _, _, err := server.Store.RegisterScheduledReservations(rootKey, "old", "", []int{1}, historicalNow, historicalNow.Add(time.Hour), historicalNow); err != nil {
+		t.Fatal(err)
+	}
+	cgroupPath := filepath.Join(server.Cfg.CgroupRoot, "auth_expired")
+	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	authorization := model.Authorization{
+		ID:         "auth_expired",
+		Mode:       model.ModeBare,
+		CgroupPath: cgroupPath,
+		CreatedAt:  time.Now().Add(-2 * time.Hour),
+		ExpiresAt:  time.Now().Add(-time.Hour),
+		Active:     true,
+	}
+	if err := server.Store.AddAuthorization(authorization); err != nil {
+		t.Fatal(err)
+	}
+
+	server.monitorOnce(context.Background())
+
+	if _, err := os.Stat(cgroupPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired managed cgroup still exists after telemetry failure: %v", err)
+	}
+	state, err := server.Store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Authorizations) != 0 {
+		t.Fatalf("expired managed authorization was not narrowly pruned: %+v", state.Authorizations)
+	}
+	if len(state.Tokens) != 0 || len(state.Reservations) != 0 {
+		t.Fatalf("unreferenced expired entitlements accumulated during telemetry outage: tokens=%+v reservations=%+v", state.Tokens, state.Reservations)
+	}
+}
+
+func TestDryRunKeepsNonemptyExpiredManagedAuthorization(t *testing.T) {
+	server := testServer(t)
+	server.Cfg.DryRun = true
+	cgroupPath := filepath.Join(server.Cfg.CgroupRoot, "auth_running")
+	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte("123\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	authorization := model.Authorization{
+		ID:         "auth_running",
+		Mode:       model.ModeBare,
+		CgroupPath: cgroupPath,
+		CreatedAt:  time.Now().Add(-2 * time.Hour),
+		ExpiresAt:  time.Now().Add(-time.Hour),
+		Active:     true,
+	}
+	if err := server.Store.AddAuthorization(authorization); err != nil {
+		t.Fatal(err)
+	}
+	server.cleanupExpiredAuthorizations()
+	state, err := server.Store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Authorizations) != 1 || !state.Authorizations[0].Active {
+		t.Fatalf("dry-run discarded live cgroup evidence: %+v", state.Authorizations)
+	}
+}
+
 func TestCleanupFinishedBareLeaseKeepsNonEmptyCgroup(t *testing.T) {
 	server := testServer(t)
 	cgroupPath := filepath.Join(server.Cfg.CgroupRoot, "lease_child")
@@ -873,11 +1359,16 @@ func testServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	return &Server{
-		Cfg:      cfg,
-		Store:    st,
-		AMD:      fakeAMD{},
-		Proc:     daemonFakeProc{infos: map[int]model.ProcInfo{}},
-		Runtime:  daemonFakeRuntime{},
-		Interval: time.Hour,
+		Cfg:                       cfg,
+		Store:                     st,
+		AMD:                       fakeAMD{},
+		Proc:                      daemonFakeProc{infos: map[int]model.ProcInfo{}},
+		Runtime:                   daemonFakeRuntime{},
+		Interval:                  time.Hour,
+		bootID:                    "11111111-2222-3333-4444-555555555555",
+		allowUnsafeCgroupFallback: true,
+		resolvePeer: func(net.Conn, string) (peer, error) {
+			return peer{PID: os.Getpid(), UID: os.Getuid(), GID: os.Getgid(), Groups: []uint32{uint32(os.Getgid())}}, nil
+		},
 	}
 }

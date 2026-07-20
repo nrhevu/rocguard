@@ -37,8 +37,10 @@ def parse_args():
         raise SystemExit("--matrix must be positive")
     if args.sleep < 0:
         raise SystemExit("--sleep must be >= 0")
-    if args.children < 0:
-        raise SystemExit("--children must be >= 0")
+    if args.duration < 0:
+        raise SystemExit("--duration must be >= 0")
+    if args.children < 0 or args.children > 64:
+        raise SystemExit("--children must be between 0 and 64")
     return args
 
 
@@ -100,16 +102,18 @@ def main():
 
     chunk_mb = min(64, args.mem_mb)
     element_size = torch.empty((), dtype=torch.float32, device="cuda:0").element_size()
-    elems_per_chunk = chunk_mb * 1024 * 1024 // element_size
-    chunks = max(1, (args.mem_mb + chunk_mb - 1) // chunk_mb)
 
     holders = []
     try:
         for local_idx, host_gpu in enumerate(args.gpus):
             device = torch.device(f"cuda:{local_idx}")
             tensors = []
-            for _ in range(chunks):
-                tensors.append(torch.empty(elems_per_chunk, dtype=torch.float32, device=device))
+            remaining_mb = args.mem_mb
+            while remaining_mb > 0:
+                allocation_mb = min(chunk_mb, remaining_mb)
+                elements = allocation_mb * 1024 * 1024 // element_size
+                tensors.append(torch.empty(elements, dtype=torch.float32, device=device))
+                remaining_mb -= allocation_mb
             torch.cuda.synchronize(device)
             holders.append(
                 {
@@ -120,7 +124,7 @@ def main():
                     "b": torch.randn((args.matrix, args.matrix), device=device),
                 }
             )
-            print(f"holding host gpu={host_gpu} as torch device={device}; allocated ~{chunks * chunk_mb} MiB")
+            print(f"holding host gpu={host_gpu} as torch device={device}; allocated ~{args.mem_mb} MiB")
     except RuntimeError as err:
         print(f"allocation failed: {err}", file=sys.stderr)
         return 1
@@ -128,16 +132,17 @@ def main():
     deadline = None if args.duration <= 0 else time.monotonic() + args.duration
 
     iterations = 0
-    while deadline is None or time.monotonic() < deadline:
-        for holder in holders:
-            holder["a"] = (holder["a"] @ holder["b"]).relu()
-        iterations += 1
-        if args.sleep:
-            time.sleep(args.sleep)
-        if iterations % 10 == 0:
+    with torch.inference_mode():
+        while deadline is None or time.monotonic() < deadline:
             for holder in holders:
-                torch.cuda.synchronize(holder["device"])
-            print(f"still holding gpus {visible_gpus}; iterations={iterations}", flush=True)
+                holder["a"] = (holder["a"] @ holder["b"]).relu()
+            iterations += 1
+            if args.sleep:
+                time.sleep(args.sleep)
+            if iterations % 10 == 0:
+                for holder in holders:
+                    torch.cuda.synchronize(holder["device"])
+                print(f"still holding gpus {visible_gpus}; iterations={iterations}", flush=True)
 
     for holder in holders:
         torch.cuda.synchronize(holder["device"])

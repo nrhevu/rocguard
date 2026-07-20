@@ -1,4 +1,6 @@
-ARG BASE_IMAGE=rocm/pytorch:latest
+# Supply an immutable, trusted ROCm/PyTorch image reference (preferably a digest)
+# with: docker build -f Dockerfile.hold-gpu --build-arg BASE_IMAGE=repo/image@sha256:... .
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 WORKDIR /work

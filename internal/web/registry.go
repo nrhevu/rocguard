@@ -5,11 +5,19 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	maxRegistryFileBytes = 2 << 20
+	maxServerRecords     = 256
+	maxServerNameBytes   = 128
+	maxServerEndpoint    = 2048
+	maxServerRootKey     = 256
 )
 
 type ServerRecord struct {
@@ -32,12 +40,15 @@ type PublicServerRecord struct {
 }
 
 type Registry struct {
-	mu   sync.Mutex
-	path string
+	mu                 sync.Mutex
+	path               string
+	allowInsecureNodes bool
+	loaded             bool
+	records            []ServerRecord
 }
 
-func NewRegistry(path string) *Registry {
-	return &Registry{path: path}
+func NewRegistry(path string, allowInsecureNodes bool) *Registry {
+	return &Registry{path: path, allowInsecureNodes: allowInsecureNodes}
 }
 
 func (r *Registry) List() ([]ServerRecord, error) {
@@ -93,6 +104,12 @@ func (r *Registry) Upsert(record ServerRecord) (ServerRecord, error) {
 	if strings.TrimSpace(record.RootKey) == "" {
 		return ServerRecord{}, errors.New("root key is required")
 	}
+	if err := validateServerRecord(record); err != nil {
+		return ServerRecord{}, err
+	}
+	if _, err := joinURL(record.Endpoint, "/healthz", r.allowInsecureNodes); err != nil {
+		return ServerRecord{}, err
+	}
 	found := false
 	for i := range records {
 		if records[i].ID == record.ID {
@@ -103,6 +120,9 @@ func (r *Registry) Upsert(record ServerRecord) (ServerRecord, error) {
 		}
 	}
 	if !found {
+		if len(records) >= maxServerRecords {
+			return ServerRecord{}, fmt.Errorf("server limit reached: maximum %d", maxServerRecords)
+		}
 		records = append(records, record)
 	}
 	if err := r.saveLocked(records); err != nil {
@@ -134,39 +154,70 @@ func (r *Registry) Delete(id string) error {
 }
 
 func (r *Registry) loadLocked() ([]ServerRecord, error) {
-	data, err := os.ReadFile(r.path)
+	if r.loaded {
+		return append([]ServerRecord(nil), r.records...), nil
+	}
+	data, err := readPrivateFile(r.path, "registry file", maxRegistryFileBytes)
 	if errors.Is(err, os.ErrNotExist) {
+		r.loaded = true
+		r.records = nil
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	if len(strings.TrimSpace(string(data))) == 0 {
+		r.loaded = true
+		r.records = nil
 		return nil, nil
 	}
 	var records []ServerRecord
 	if err := json.Unmarshal(data, &records); err != nil {
 		return nil, err
 	}
-	return records, nil
+	if len(records) > maxServerRecords {
+		return nil, fmt.Errorf("registry contains %d records; maximum is %d", len(records), maxServerRecords)
+	}
+	for _, record := range records {
+		if err := validateServerRecord(record); err != nil {
+			return nil, err
+		}
+	}
+	r.records = append([]ServerRecord(nil), records...)
+	r.loaded = true
+	return append([]ServerRecord(nil), records...), nil
+}
+
+func validateServerRecord(record ServerRecord) error {
+	if len(record.Name) > maxServerNameBytes {
+		return fmt.Errorf("server name must be at most %d bytes", maxServerNameBytes)
+	}
+	if len(record.Endpoint) > maxServerEndpoint {
+		return fmt.Errorf("server endpoint must be at most %d bytes", maxServerEndpoint)
+	}
+	if len(record.RootKey) > maxServerRootKey {
+		return fmt.Errorf("root key must be at most %d bytes", maxServerRootKey)
+	}
+	// Keep plaintext records readable so an administrator can remove them or
+	// enable the explicit gateway opt-in. NodeClient enforces the configured
+	// transport policy before constructing a request that carries a root key.
+	if _, err := parseNodeEndpoint(record.Endpoint); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) saveLocked(records []ServerRecord) error {
-	if err := os.MkdirAll(filepath.Dir(r.path), 0700); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(records, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := r.path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0600); err != nil {
-		return err
+	committed, err := writePrivateFile(r.path, append(data, '\n'))
+	if committed {
+		r.records = append([]ServerRecord(nil), records...)
+		r.loaded = true
 	}
-	if err := os.Rename(tmp, r.path); err != nil {
-		return err
-	}
-	return os.Chmod(r.path, 0600)
+	return err
 }
 
 func publicServerRecord(record ServerRecord) PublicServerRecord {

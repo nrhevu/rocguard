@@ -1,0 +1,7 @@
+# The hold-GPU image needs only this one runtime script. Keep repository
+# metadata, local state, and untracked secrets out of local or remote builders.
+*
+!Dockerfile.hold-gpu
+!scripts/
+scripts/*
+!scripts/hold_gpu.py

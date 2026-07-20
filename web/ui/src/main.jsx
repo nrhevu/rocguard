@@ -8,7 +8,6 @@ const statusLabels = {
   claimed: "Claimed",
 };
 
-const showDevWarnings = import.meta.env.DEV;
 const calendarHourHeight = 28;
 const minCalendarHours = 10;
 const scheduleLaneGap = 2;
@@ -17,6 +16,7 @@ const dayMs = 24 * hourMs;
 
 function App() {
   const [auth, setAuth] = useState({ checking: true, authenticated: false, user: "", role: "" });
+  const [registrationEnabled, setRegistrationEnabled] = useState(false);
   const [servers, setServers] = useState([]);
   const [fleet, setFleet] = useState([]);
   const [users, setUsers] = useState([]);
@@ -49,9 +49,64 @@ function App() {
     if (!auth.authenticated) {
       return undefined;
     }
-    refresh();
-    const timer = window.setInterval(refresh, 5000);
-    return () => window.clearInterval(timer);
+
+    let stopped = false;
+    let running = false;
+    let timer;
+    let controller;
+
+    function clearTimer() {
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+    }
+
+    function schedule() {
+      clearTimer();
+      if (stopped || document.hidden) {
+        return;
+      }
+      timer = window.setTimeout(() => {
+        timer = undefined;
+        void poll();
+      }, 5000);
+    }
+
+    async function poll() {
+      if (stopped || running || document.hidden) {
+        return;
+      }
+      running = true;
+      controller = new AbortController();
+      try {
+        await refresh({ signal: controller.signal, isCurrent: () => !stopped });
+      } finally {
+        running = false;
+        controller = undefined;
+        schedule();
+      }
+    }
+
+    function handleVisibilityChange() {
+      if (document.hidden) {
+        clearTimer();
+        return;
+      }
+      if (!running) {
+        clearTimer();
+        void poll();
+      }
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    void poll();
+    return () => {
+      stopped = true;
+      clearTimer();
+      controller?.abort();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, [auth.authenticated]);
 
   useEffect(() => {
@@ -97,8 +152,10 @@ function App() {
         user: session.user || "",
         role: session.role || "",
       });
+      setRegistrationEnabled(Boolean(session.registration_enabled));
     } catch {
       setAuth({ checking: false, authenticated: false, user: "", role: "" });
+      setRegistrationEnabled(false);
     }
   }
 
@@ -106,7 +163,7 @@ function App() {
     try {
       const session = await api("/api/login", {
         method: "POST",
-        body: JSON.stringify(values),
+        body: JSON.stringify({ username: values.username, password: values.password }),
       });
       setLoginError("");
       setError("");
@@ -176,13 +233,14 @@ function App() {
     }
   }
 
-  async function refresh() {
+  async function refresh({ signal, isCurrent } = {}) {
     try {
-      const [serverList, snapshot] = await Promise.all([
-        api("/api/servers"),
-        api("/api/fleet/snapshot"),
-      ]);
+      const snapshot = await api("/api/fleet/snapshot", { signal });
+      if (signal?.aborted || (isCurrent && !isCurrent())) {
+        return;
+      }
       const nextFleet = snapshot.servers || [];
+      const serverList = nextFleet.map((item) => item.server).filter(Boolean);
       setServers(serverList);
       setFleet(nextFleet);
       setSelectedServerId((currentId) => {
@@ -192,6 +250,9 @@ function App() {
         return serverList[0]?.id || nextFleet[0]?.server?.id || "";
       });
     } catch (err) {
+      if (signal?.aborted || err.name === "AbortError" || (isCurrent && !isCurrent())) {
+        return;
+      }
       if (err.status === 401) {
         setAuth({ checking: false, authenticated: false, user: "", role: "" });
         return;
@@ -422,6 +483,7 @@ function App() {
       await refresh();
     } catch (err) {
       setError(err.message);
+      throw err;
     }
   }
 
@@ -438,6 +500,7 @@ function App() {
     return (
       <LoginScreen
         error={loginError}
+        registrationEnabled={registrationEnabled}
         onLogin={login}
         onRegister={register}
         onResetError={() => setLoginError("")}
@@ -532,7 +595,8 @@ function App() {
           </div>
         </header>
 
-        {showDevWarnings && current?.error && <div className="banner">{current.error}</div>}
+        {error && <div className="banner" role="alert">{error}</div>}
+        {current?.error && <div className="banner" role="alert">{current.error}</div>}
 
         {view === "gpu" ? (
           <div className="dashboard-grid">
@@ -591,6 +655,7 @@ function App() {
           <KeysView
             tokens={tokens}
             reservations={reservations}
+            canCreate={isAdmin}
             onCreate={() => setClaimOpen(true)}
             onAllow={setAllowTarget}
             onShow={showKey}
@@ -607,7 +672,7 @@ function App() {
       </main>
 
       {isAdmin && addOpen && <AddServerModal onClose={() => setAddOpen(false)} onSubmit={addServer} />}
-      {claimOpen && <ClaimKeyModal owner={auth.user} onClose={() => setClaimOpen(false)} onSubmit={createClaimKey} />}
+      {isAdmin && claimOpen && <ClaimKeyModal owner={auth.user} onClose={() => setClaimOpen(false)} onSubmit={createClaimKey} />}
       {allowTarget && (
         <AllowKeyModal
           token={allowTarget}
@@ -683,12 +748,16 @@ function LoadingScreen() {
   );
 }
 
-function LoginScreen({ error, onLogin, onRegister, onResetError }) {
+function LoginScreen({ error, registrationEnabled, onLogin, onRegister, onResetError }) {
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ username: "", password: "", confirmPassword: "" });
   const [localError, setLocalError] = useState("");
+  const [pending, setPending] = useState(false);
 
   function switchMode() {
+    if (pending) {
+      return;
+    }
     setCreating((value) => !value);
     setForm((value) => ({ ...value, password: "", confirmPassword: "" }));
     setLocalError("");
@@ -699,17 +768,25 @@ function LoginScreen({ error, onLogin, onRegister, onResetError }) {
     <div className="login-shell">
       <form
         className="login-panel"
-        onSubmit={(event) => {
+        onSubmit={async (event) => {
           event.preventDefault();
+          if (pending) {
+            return;
+          }
           setLocalError("");
           if (creating && form.password !== form.confirmPassword) {
             setLocalError("Passwords do not match");
             return;
           }
-          if (creating) {
-            onRegister(form);
-          } else {
-            onLogin(form);
+          setPending(true);
+          try {
+            if (creating) {
+              await onRegister(form);
+            } else {
+              await onLogin(form);
+            }
+          } finally {
+            setPending(false);
           }
         }}
       >
@@ -752,13 +829,17 @@ function LoginScreen({ error, onLogin, onRegister, onResetError }) {
           </label>
         )}
         {(localError || error) && <div className="login-error">{localError || error}</div>}
-        <button className="primary-button">{creating ? "Create account" : "Sign in"}</button>
-        <div className="login-switch-row">
-          <span>{creating ? "Already have an account?" : "New to RocGuard?"}</span>
-          <button type="button" className="login-switch-button" onClick={switchMode}>
-            {creating ? "Sign in" : "Create account"}
-          </button>
-        </div>
+        <button className="primary-button" disabled={pending}>
+          {pending ? (creating ? "Creating account" : "Signing in") : (creating ? "Create account" : "Sign in")}
+        </button>
+        {registrationEnabled && (
+          <div className="login-switch-row">
+            <span>{creating ? "Already have an account?" : "New to RocGuard?"}</span>
+            <button type="button" className="login-switch-button" onClick={switchMode} disabled={pending}>
+              {creating ? "Sign in" : "Create account"}
+            </button>
+          </div>
+        )}
       </form>
     </div>
   );
@@ -960,6 +1041,7 @@ function ReserveForm({ owner, selected, gpus, reservations, onMissingSelection, 
     start: defaults.start,
     end: defaults.end,
   });
+  const [pending, setPending] = useState(false);
   const targetLabel = selected.length ? ` ${selected.join(", ")}` : "";
   const hasDetails = reservationDetailsComplete(form);
   const conflict = hasDetails ? reservationConflict(selected, reservations, form) : null;
@@ -985,13 +1067,21 @@ function ReserveForm({ owner, selected, gpus, reservations, onMissingSelection, 
   return (
     <form
       className="reserve-form"
-      onSubmit={(event) => {
+      onSubmit={async (event) => {
         event.preventDefault();
+        if (pending) {
+          return;
+        }
         if (!canSubmit) {
           explainBlockedSubmit();
           return;
         }
-        onSubmit(form);
+        setPending(true);
+        try {
+          await onSubmit(form);
+        } finally {
+          setPending(false);
+        }
       }}
     >
       <h3>Reserve GPU{targetLabel}</h3>
@@ -1013,20 +1103,20 @@ function ReserveForm({ owner, selected, gpus, reservations, onMissingSelection, 
         </div>
       )}
       <div
-        className={`submit-guard ${canSubmit ? "" : "disabled"}`}
+        className={`submit-guard ${canSubmit && !pending ? "" : "disabled"}`}
         onClick={() => {
-          if (!canSubmit) {
+          if (!pending && !canSubmit) {
             explainBlockedSubmit();
           }
         }}
       >
-        <button className="primary-button" disabled={!canSubmit}>Submit</button>
+        <button className="primary-button" disabled={!canSubmit || pending}>{pending ? "Submitting" : "Submit"}</button>
       </div>
     </form>
   );
 }
 
-function KeysView({ tokens, reservations, onCreate, onAllow, onShow, onRevoke }) {
+function KeysView({ tokens, reservations, canCreate, onCreate, onAllow, onShow, onRevoke }) {
   const reservationsByToken = new Map(
     groupScheduleReservations(reservations).map((reservation) => [reservation.id, reservation]),
   );
@@ -1037,7 +1127,7 @@ function KeysView({ tokens, reservations, onCreate, onAllow, onShow, onRevoke })
           <h2>Keys</h2>
           <p className="muted">Claim keys and reserved keys are listed without secrets.</p>
         </div>
-        <button className="primary-button" onClick={onCreate}>Create claim key</button>
+        {canCreate && <button className="primary-button" onClick={onCreate}>Create claim key</button>}
       </div>
       <div className="key-list">
         {tokens.map((token) => {
@@ -1197,6 +1287,9 @@ function AddRuleModal({ onClose, onSubmit }) {
 
   async function submit(event) {
     event.preventDefault();
+    if (pending) {
+      return;
+    }
     const value = form.value.trim();
     if (!value) {
       setError("Value is required");
@@ -1328,22 +1421,41 @@ function UsersView({ users, currentUser, onCreate, onDelete }) {
 
 function AddServerModal({ onClose, onSubmit }) {
   const [form, setForm] = useState({ name: "", endpoint: "", root_key: "", tls_skip_verify: false });
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
+  const plaintextHTTP = form.endpoint.trim().toLowerCase().startsWith("http://");
   return (
     <Modal title="Add server" onClose={onClose} hideClose>
       <form
         className="modal-form"
-        onSubmit={(event) => {
+        onSubmit={async (event) => {
           event.preventDefault();
-          onSubmit(form);
+          if (pending) {
+            return;
+          }
+          setPending(true);
+          setError("");
+          try {
+            await onSubmit(form);
+          } catch (err) {
+            setError(err.message);
+          } finally {
+            setPending(false);
+          }
         }}
       >
         <label>Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="prod-cluster-01" /></label>
-        <label>Endpoint API<input value={form.endpoint} onChange={(event) => setForm({ ...form, endpoint: event.target.value })} placeholder="https://server:8443" required /></label>
+        <label>Endpoint API<input value={form.endpoint} onChange={(event) => {
+          const endpoint = event.target.value;
+          setForm({ ...form, endpoint, tls_skip_verify: endpoint.trim().toLowerCase().startsWith("http://") ? false : form.tls_skip_verify });
+        }} placeholder="https://server:8192" required /></label>
         <label>Root key<input type="password" value={form.root_key} onChange={(event) => setForm({ ...form, root_key: event.target.value })} required /></label>
-        <label className="checkbox-line"><input type="checkbox" checked={form.tls_skip_verify} onChange={(event) => setForm({ ...form, tls_skip_verify: event.target.checked })} />Skip TLS verify</label>
+        <label className="checkbox-line"><input type="checkbox" checked={form.tls_skip_verify} disabled={plaintextHTTP} onChange={(event) => setForm({ ...form, tls_skip_verify: event.target.checked })} />Skip TLS verify</label>
+        {plaintextHTTP && <div className="form-warning">Plaintext HTTP sends the node root key and control traffic unencrypted. The gateway process must explicitly enable ROCGUARD_WEB_ALLOW_INSECURE_NODES.</div>}
+        {error && <div className="modal-error">{error}</div>}
         <div className="modal-actions">
-          <button type="button" className="small-button" onClick={onClose}>Cancel</button>
-          <button className="primary-button">Add</button>
+          <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
+          <button className="primary-button" disabled={pending}>{pending ? "Adding" : "Add"}</button>
         </div>
       </form>
     </Modal>
@@ -1360,6 +1472,9 @@ function ChangePasswordModal({ onClose, onSubmit }) {
         className="modal-form"
         onSubmit={async (event) => {
           event.preventDefault();
+          if (pending) {
+            return;
+          }
           setPending(true);
           setError("");
           try {
@@ -1376,7 +1491,7 @@ function ChangePasswordModal({ onClose, onSubmit }) {
         <label>New password<input type="password" autoComplete="new-password" value={form.new_password} onChange={(event) => setForm({ ...form, new_password: event.target.value })} required /></label>
         {error && <div className="modal-error">{error}</div>}
         <div className="modal-actions">
-          <button type="button" className="small-button" onClick={onClose}>Cancel</button>
+          <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
           <button className="primary-button" disabled={pending}>{pending ? "Saving" : "Save"}</button>
         </div>
       </form>
@@ -1394,6 +1509,9 @@ function CreateUserModal({ onClose, onSubmit }) {
         className="modal-form"
         onSubmit={async (event) => {
           event.preventDefault();
+          if (pending) {
+            return;
+          }
           setPending(true);
           setError("");
           try {
@@ -1415,7 +1533,7 @@ function CreateUserModal({ onClose, onSubmit }) {
         </label>
         {error && <div className="modal-error">{error}</div>}
         <div className="modal-actions">
-          <button type="button" className="small-button" onClick={onClose}>Cancel</button>
+          <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
           <button className="primary-button" disabled={pending}>{pending ? "Creating" : "Create"}</button>
         </div>
       </form>
@@ -1432,6 +1550,9 @@ function DeleteUserModal({ user, onClose, onSubmit }) {
         className="modal-form"
         onSubmit={async (event) => {
           event.preventDefault();
+          if (pending) {
+            return;
+          }
           setPending(true);
           setError("");
           try {
@@ -1451,7 +1572,7 @@ function DeleteUserModal({ user, onClose, onSubmit }) {
         <p className="muted">This removes web access for this user. Existing keys and reservations remain.</p>
         {error && <div className="modal-error">{error}</div>}
         <div className="modal-actions">
-          <button type="button" className="small-button" onClick={onClose}>Cancel</button>
+          <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
           <button className="danger-button" disabled={pending}>{pending ? "Deleting" : "Delete"}</button>
         </div>
       </form>
@@ -1460,22 +1581,36 @@ function DeleteUserModal({ user, onClose, onSubmit }) {
 }
 
 function ClaimKeyModal({ owner, onClose, onSubmit }) {
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
   return (
     <Modal title="Create claim key" onClose={onClose} hideClose>
       <form
         className="modal-form"
-        onSubmit={(event) => {
+        onSubmit={async (event) => {
           event.preventDefault();
-          onSubmit();
+          if (pending) {
+            return;
+          }
+          setPending(true);
+          setError("");
+          try {
+            await onSubmit();
+          } catch (err) {
+            setError(err.message);
+          } finally {
+            setPending(false);
+          }
         }}
       >
         <div className="owner-row modal-owner">
           <span>User</span>
           <strong>{owner}</strong>
         </div>
+        {error && <div className="modal-error">{error}</div>}
         <div className="modal-actions">
-          <button type="button" className="small-button" onClick={onClose}>Cancel</button>
-          <button className="primary-button">Create</button>
+          <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
+          <button className="primary-button" disabled={pending}>{pending ? "Creating" : "Create"}</button>
         </div>
       </form>
     </Modal>
@@ -1529,6 +1664,8 @@ function ScheduleDetailModal({
 
 function RevokeModal({ target, onClose, onSubmit }) {
   const isKey = target.kind === "key";
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
   const targetLabel = !isKey && target.gpus?.length
     ? `${target.label} · GPU ${target.gpus.join(", ")}`
     : target.label;
@@ -1536,9 +1673,20 @@ function RevokeModal({ target, onClose, onSubmit }) {
     <Modal title={isKey ? "Revoke key" : "Revoke reservation"} onClose={onClose} hideClose>
       <form
         className="modal-form"
-        onSubmit={(event) => {
+        onSubmit={async (event) => {
           event.preventDefault();
-          onSubmit();
+          if (pending) {
+            return;
+          }
+          setPending(true);
+          setError("");
+          try {
+            await onSubmit();
+          } catch (err) {
+            setError(err.message);
+          } finally {
+            setPending(false);
+          }
         }}
       >
         <div className="revoke-summary">
@@ -1554,9 +1702,10 @@ function RevokeModal({ target, onClose, onSubmit }) {
             ? "This will revoke the key and remove any related reservations or claims."
             : "This will remove this job from every GPU in the reservation."}
         </p>
+        {error && <div className="modal-error">{error}</div>}
         <div className="modal-actions">
-          <button type="button" className="small-button" onClick={onClose}>Cancel</button>
-          <button className="danger-button">Revoke</button>
+          <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
+          <button className="danger-button" disabled={pending}>{pending ? "Revoking" : "Revoke"}</button>
         </div>
       </form>
     </Modal>

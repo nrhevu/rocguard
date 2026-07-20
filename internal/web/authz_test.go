@@ -80,7 +80,7 @@ func TestGatewayRoleAuthorization(t *testing.T) {
 	userCookie := testSessionCookie(t, server, "alice", RoleUser)
 	adminCookie := testSessionCookie(t, server, "admin", RoleAdmin)
 
-	userAdd := requestJSON(handler, http.MethodPost, "/api/servers", `{"name":"n","endpoint":"http://node","root_key":"rk"}`, userCookie)
+	userAdd := requestJSON(handler, http.MethodPost, "/api/servers", `{"name":"n","endpoint":"https://node","root_key":"rk"}`, userCookie)
 	if userAdd.Code != http.StatusForbidden {
 		t.Fatalf("user add server status = %d, body=%s", userAdd.Code, userAdd.Body.String())
 	}
@@ -90,7 +90,7 @@ func TestGatewayRoleAuthorization(t *testing.T) {
 		t.Fatalf("user create user status = %d, body=%s", userCreate.Code, userCreate.Body.String())
 	}
 
-	adminCreate := requestJSON(handler, http.MethodPost, "/api/users", `{"username":"bob","password":"secret"}`, adminCookie)
+	adminCreate := requestJSON(handler, http.MethodPost, "/api/users", `{"username":"bob","password":"test-password-strong"}`, adminCookie)
 	if adminCreate.Code != http.StatusCreated {
 		t.Fatalf("admin create user status = %d, body=%s", adminCreate.Code, adminCreate.Body.String())
 	}
@@ -226,14 +226,14 @@ func newAuthzServer(t *testing.T) (*Server, *authzNodeClient, string) {
 	tmp := t.TempDir()
 	server := New(config.Config{
 		WebUser:     "admin",
-		WebPassword: "secret",
+		WebPassword: "test-password-strong",
 		WebRegistry: filepath.Join(tmp, "servers.json"),
 		WebUsers:    filepath.Join(tmp, "users.json"),
 	})
-	if err := server.Users.BootstrapAdmin("admin", "secret"); err != nil {
+	if err := server.Users.BootstrapAdmin("admin", "test-password-strong"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.Users.Create("alice", "secret", RoleUser); err != nil {
+	if _, err := server.Users.Create("alice", "test-password-strong", RoleUser); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Unix(1000, 0).UTC()
@@ -268,7 +268,7 @@ func newAuthzServer(t *testing.T) (*Server, *authzNodeClient, string) {
 	server.Client = client
 	stored, err := server.Registry.Upsert(ServerRecord{
 		Name:     "node-a",
-		Endpoint: "http://node-a:8443",
+		Endpoint: "https://node-a:8443",
 		RootKey:  "rk_test",
 	})
 	if err != nil {

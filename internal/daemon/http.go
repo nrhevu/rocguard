@@ -2,47 +2,79 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"rocguard/internal/model"
+	"rocguard/internal/netlimit"
 	"rocguard/internal/protocol"
 	"rocguard/internal/store"
 )
+
+const maxNodeHTTPConnections = 128
 
 func (s *Server) startNodeHTTP(ctx context.Context) (func(), error) {
 	if (s.Cfg.NodeTLSCert == "") != (s.Cfg.NodeTLSKey == "") {
 		return nil, errors.New("both ROCGUARD_NODE_TLS_CERT and ROCGUARD_NODE_TLS_KEY are required for TLS")
 	}
+	if s.Cfg.NodeTLSCert == "" && !s.Cfg.NodeAllowInsecure {
+		return nil, errors.New("refusing node HTTP listener without TLS; configure TLS or explicitly set ROCGUARD_NODE_ALLOW_INSECURE=1")
+	}
+	var tlsConfig *tls.Config
+	if s.Cfg.NodeTLSCert != "" {
+		certificate, err := tls.LoadX509KeyPair(s.Cfg.NodeTLSCert, s.Cfg.NodeTLSKey)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	}
 	listener, err := net.Listen("tcp", s.Cfg.NodeAddr)
 	if err != nil {
 		return nil, err
 	}
+	listener = netlimit.NewListener(listener, maxNodeHTTPConnections)
 	server := &http.Server{
 		Handler:           s.nodeHTTPHandler(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+		TLSConfig:         tlsConfig,
 	}
+	closed := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-closed:
+			return
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
 	go func() {
-		if s.Cfg.NodeTLSCert != "" || s.Cfg.NodeTLSKey != "" {
-			_ = server.ServeTLS(listener, s.Cfg.NodeTLSCert, s.Cfg.NodeTLSKey)
+		if tlsConfig != nil {
+			_ = server.ServeTLS(listener, "", "")
 			return
 		}
 		_ = server.Serve(listener)
 	}()
+	var closeOnce sync.Once
 	return func() {
-		_ = server.Close()
-		_ = listener.Close()
+		closeOnce.Do(func() {
+			close(closed)
+			_ = server.Close()
+			_ = listener.Close()
+		})
 	}, nil
 }
 
@@ -55,7 +87,47 @@ func (s *Server) nodeHTTPHandler() http.Handler {
 	mux.HandleFunc("/api/v1/show-keys", s.nodeAuth(s.handleNodeShowKeys))
 	mux.HandleFunc("/api/v1/allow", s.nodeAuth(s.handleNodeAllow))
 	mux.HandleFunc("/api/v1/revoke", s.nodeAuth(s.handleNodeRevoke))
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		release, ok := s.acquireNodeHTTPRequest()
+		if !ok {
+			w.Header().Set("Retry-After", "1")
+			writeHTTPError(w, http.StatusServiceUnavailable, "too many concurrent node requests; retry shortly")
+			return
+		}
+		defer release()
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		}
+		if nodeRequestHasBody(r) && !nodeRequestHasJSONContentType(r) {
+			writeHTTPError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) acquireNodeHTTPRequest() (func(), bool) {
+	s.nodeHTTPOnce.Do(func() {
+		s.nodeHTTPSlots = make(chan struct{}, maxConcurrentNodeHTTP)
+	})
+	select {
+	case s.nodeHTTPSlots <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-s.nodeHTTPSlots }) }, true
+	default:
+		return nil, false
+	}
+}
+
+func nodeRequestHasBody(r *http.Request) bool {
+	return r.Body != nil && (r.ContentLength != 0 || len(r.TransferEncoding) > 0)
+}
+
+func nodeRequestHasJSONContentType(r *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && strings.EqualFold(mediaType, "application/json")
 }
 
 type nodeHTTPFunc func(http.ResponseWriter, *http.Request, string)
@@ -107,7 +179,7 @@ func (s *Server) handleNodeReservations(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	var args protocol.RegisterArgs
-	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+	if err := decodeNodeJSON(r, &args); err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -132,7 +204,7 @@ func (s *Server) handleNodeClaimKeys(w http.ResponseWriter, r *http.Request, roo
 		return
 	}
 	var args protocol.RegisterArgs
-	if err := json.NewDecoder(r.Body).Decode(&args); err != nil && !errors.Is(err, io.EOF) {
+	if err := decodeNodeJSON(r, &args); err != nil && !errors.Is(err, io.EOF) {
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -170,7 +242,7 @@ func (s *Server) handleNodeAllow(w http.ResponseWriter, r *http.Request, rootKey
 		return
 	}
 	var args protocol.AllowArgs
-	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+	if err := decodeNodeJSON(r, &args); err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -220,7 +292,7 @@ func (s *Server) handleNodeRevoke(w http.ResponseWriter, r *http.Request, rootKe
 		return
 	}
 	var args protocol.RevokeArgs
-	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+	if err := decodeNodeJSON(r, &args); err != nil {
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -250,6 +322,21 @@ func bearerToken(r *http.Request) (string, bool) {
 	}
 	token := strings.TrimSpace(strings.TrimPrefix(header, prefix))
 	return token, token != ""
+}
+
+func decodeNodeJSON(r *http.Request, dst any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain one JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func writeDispatchError(w http.ResponseWriter, err error) {

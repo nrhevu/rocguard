@@ -10,7 +10,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -231,6 +233,14 @@ func runCommand(cfg config.Config, args []string) error {
 	if len(command) == 0 {
 		return errors.New("usage: KEY=... rocguard run -- <command>")
 	}
+	if !strings.ContainsRune(command[0], filepath.Separator) {
+		resolved, err := exec.LookPath(command[0])
+		if err != nil {
+			return fmt.Errorf("resolve command %q using caller PATH: %w", command[0], err)
+		}
+		command = append([]string(nil), command...)
+		command[0] = resolved
+	}
 	workdir, _ := os.Getwd()
 	raw, err := callRPC(cfg, "run", requiredToken(), protocol.RunArgs{
 		Command: command,
@@ -299,14 +309,33 @@ func bypassCommand(cfg config.Config, args []string) error {
 	fs.SetOutput(io.Discard)
 	pid := fs.Int("pid", 0, "pid")
 	command := fs.String("command", "", "absolute command path")
-	uid := fs.Int("uid", 0, "uid")
+	uid := fs.Int("uid", -1, "uid")
 	ttl := fs.String("ttl", "2h", "ttl")
 	reason := fs.String("reason", "", "reason")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return errors.New("unexpected positional arguments")
+	}
+	hasPID := *pid > 0
+	hasCommand := strings.TrimSpace(*command) != ""
+	if hasPID == hasCommand {
+		return errors.New("exactly one of --pid or --command is required")
+	}
+	if strings.TrimSpace(*reason) == "" {
+		return errors.New("--reason is required")
+	}
+	if hasCommand {
+		if !filepath.IsAbs(*command) {
+			return errors.New("--command must be an absolute path")
+		}
+		if *uid != 0 {
+			return errors.New("--command bypass is restricted to --uid 0; use --pid for non-root processes")
+		}
+	}
 	kind := model.BypassPID
-	if *command != "" {
+	if hasCommand {
 		kind = model.BypassCommand
 	}
 	rootKey, err := rootKeyFromEnvOrPrompt()
@@ -340,9 +369,18 @@ func writePSRows(out io.Writer, rows []model.PSRow) error {
 	writer := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(writer, "id\tgpu\tuser\tcommand")
 	for _, row := range rows {
-		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", row.ID, row.GPU, row.User, row.Command)
+		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", terminalSafeCell(row.ID), terminalSafeCell(row.GPU), terminalSafeCell(row.User), terminalSafeCell(row.Command))
 	}
 	return writer.Flush()
+}
+
+func terminalSafeCell(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return '?'
+		}
+		return r
+	}, value)
 }
 
 func printRPC(cfg config.Config, method, token string, args any) error {
@@ -468,11 +506,18 @@ func rootKeyFromEnvOrPrompt() (string, error) {
 }
 
 func callRPC(cfg config.Config, method, token string, args any, stream bool) (json.RawMessage, error) {
-	conn, err := net.Dial("unix", cfg.SocketPath)
+	conn, err := net.DialTimeout("unix", cfg.SocketPath, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connect %s: %w", cfg.SocketPath, err)
 	}
 	defer conn.Close()
+	if !stream {
+		if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			return nil, err
+		}
+	} else if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return nil, err
+	}
 	var rawArgs json.RawMessage
 	if args != nil {
 		rawArgs, err = json.Marshal(args)
@@ -487,8 +532,13 @@ func callRPC(cfg config.Config, method, token string, args any, stream bool) (js
 		Args:   rawArgs,
 	}
 	data, _ := json.Marshal(req)
-	if _, err := conn.Write(append(data, '\n')); err != nil {
+	if err := writeAll(conn, append(data, '\n')); err != nil {
 		return nil, err
+	}
+	if stream {
+		if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+			return nil, err
+		}
 	}
 	decoder := json.NewDecoder(conn)
 	for {
@@ -517,6 +567,20 @@ func callRPC(cfg config.Config, method, token string, args any, stream bool) (js
 	}
 }
 
+func writeAll(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := writer.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
 func prompt(reader *bufio.Reader, label string) (string, error) {
 	fmt.Print(label)
 	value, err := reader.ReadString('\n')
@@ -542,8 +606,15 @@ func promptSecret(reader *bufio.Reader, label string) (string, error) {
 	if err := setTermios(fd, &noEcho); err != nil {
 		return "", err
 	}
+	restored := false
+	defer func() {
+		if !restored {
+			_ = setTermios(fd, state)
+		}
+	}()
 	value, readErr := readPromptValue(reader)
 	restoreErr := setTermios(fd, state)
+	restored = restoreErr == nil
 	fmt.Println()
 	if readErr != nil {
 		return "", readErr
@@ -609,8 +680,8 @@ func usageText() string {
   KEY=... rocguard allow docker --container <name-or-id>
   KEY=... rocguard allow k8s --namespace <name>
   KEY=... rocguard allow user --name <name>
-  rocguard status
-  rocguard ps
+  KEY=... rocguard status  (root may omit KEY)
+  KEY=... rocguard ps      (root may omit KEY)
   KEY=... rocguard token info
   ROOT_KEY=... rocguard show-keys
   ROOT_KEY=... rocguard bypass add (--pid <pid> | --command <path> --uid <uid>) --ttl <duration> --reason <text>

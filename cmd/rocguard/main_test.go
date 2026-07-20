@@ -29,6 +29,37 @@ func TestWritePSRowsFormatsTable(t *testing.T) {
 	}
 }
 
+func TestWritePSRowsEscapesTerminalControls(t *testing.T) {
+	var buf bytes.Buffer
+	err := writePSRows(&buf, []model.PSRow{{
+		ID:      "id\x1b]52;c;payload\a",
+		GPU:     "0\nspoof",
+		User:    "alice\tadmin",
+		Command: "python\x1b[2J",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if strings.ContainsAny(out, "\x1b\a") || strings.Contains(out, "\nspoof") || strings.Contains(out, "alice\tadmin") {
+		t.Fatalf("terminal control reached output: %q", out)
+	}
+}
+
+func TestBypassCommandValidatesSelectorsBeforeReadingRootKey(t *testing.T) {
+	for _, args := range [][]string{
+		{"add", "--reason", "test"},
+		{"add", "--pid", "1", "--command", "/bin/true", "--uid", "0", "--reason", "test"},
+		{"add", "--command", "/bin/true", "--reason", "test"},
+		{"add", "--command", "/bin/true", "--uid", "1000", "--reason", "test"},
+		{"add", "--pid", "1"},
+	} {
+		if err := bypassCommand(config.Config{}, args); err == nil {
+			t.Fatalf("bypassCommand(%v) unexpectedly succeeded", args)
+		}
+	}
+}
+
 func TestRunCommandRejectsLeadingFlag(t *testing.T) {
 	err := runCommand(config.Config{}, []string{"-x", "--", "echo", "ok"})
 	if err == nil {

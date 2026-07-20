@@ -17,8 +17,14 @@ root, sudo, or root-equivalent Docker access can bypass it.
 
 - Linux with cgroup v2
 - AMD ROCm tooling with `amd-smi`
-- Go 1.22+
-- Node.js and npm for building the web UI
+- The latest patch release of a currently supported Go line. As of July 2026,
+  use Go 1.26.5 (recommended) or Go 1.25.12. Check the
+  [official release history](https://go.dev/doc/devel/release) for newer
+  security patches. The `go 1.22` directive in `go.mod` is the source-language
+  version, not a recommendation to build production binaries with an
+  unsupported Go toolchain.
+- The latest patch release of a currently supported Node.js LTS line, with npm,
+  for building the web UI
 - Root access for the daemon
 - Optional: Docker, `crictl`, or `kubectl` for container scopes
 
@@ -107,179 +113,133 @@ If `ROCGUARD_ROOT_KEY` is set, use that file path instead.
 
 ## Installation
 
-The node daemon runs as root. One web gateway can manage one or more nodes, and
-browsers connect only to the gateway.
+Choose the guide that matches the complete transport topology:
 
-### 1. Build
+- [Install with TLS](INSTALL-TLS.md) — recommended for production. The node API
+  and browser-facing gateway use HTTPS.
+- [Install without TLS](INSTALL-NO-TLS.md) — plaintext HTTP for isolated,
+  trusted development networks only.
 
-From the repository root:
+Both guides include the build, binary and UI installation, node daemon, web
+gateway, systemd hardening, first-admin setup, node registration, firewall
+boundaries, and secret-file handling. Do not mix TLS and plaintext snippets:
+RocGuard's three insecure-transport switches are independent and fail closed by
+default.
 
-```bash
-npm --prefix web/ui ci
-npm --prefix web/ui run build
-go build -buildvcs=false -o rocguard ./cmd/rocguard
-```
-
-### 2. Install the binary and UI
-
-```bash
-sudo install -o root -g root -m 0755 rocguard /usr/local/bin/rocguard
-sudo install -d -o root -g root -m 0755 /etc/rocguard
-sudo install -d -o root -g root -m 0700 /var/lib/rocguard
-sudo install -d -o root -g root -m 0755 /var/log/rocguard
-sudo install -d -o root -g root -m 0755 /usr/local/share/rocguard/ui
-sudo cp -a web/ui/dist/. /usr/local/share/rocguard/ui/
-```
-
-### 3. Create the node root key
-
-Create this once on every GPU node. Do not share it with regular users.
-
-```bash
-sudo sh -c 'umask 077; test -f /var/lib/rocguard/root.key || printf "rk_%s\n" "$(openssl rand -hex 32)" > /var/lib/rocguard/root.key'
-sudo chmod 600 /var/lib/rocguard/root.key
-```
-
-Read it later with:
-
-```bash
-sudo cat /var/lib/rocguard/root.key
-```
-
-### 4. Install the node daemon
-
-Create `/etc/systemd/system/rocguard.service`:
-
-```ini
-[Unit]
-Description=RocGuard daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-Group=root
-Environment=ROCGUARD_SOCKET=/run/rocguard.sock
-Environment=ROCGUARD_STATE=/var/lib/rocguard/state.json
-Environment=ROCGUARD_ROOT_KEY=/var/lib/rocguard/root.key
-Environment=ROCGUARD_AUDIT_LOG=/var/log/rocguard/audit.log
-Environment=ROCGUARD_NODE_ADDR=0.0.0.0:8192
-ExecStart=/usr/local/bin/rocguard daemon
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and verify it:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now rocguard
-sudo systemctl status rocguard --no-pager
-rocguard status
-```
-
-The Unix socket `/run/rocguard.sock` is available to local users. The node API
-on port `8192` requires the root key as a bearer token. Allow this port only
-from the gateway host.
-
-For a node API outside a trusted private network, add both TLS variables to the
-service and use an `https://` endpoint in the gateway:
-
-```ini
-Environment=ROCGUARD_NODE_TLS_CERT=/etc/rocguard/tls.crt
-Environment=ROCGUARD_NODE_TLS_KEY=/etc/rocguard/tls.key
-```
-
-### 5. Install the web gateway
-
-Skip this step on nodes that will be managed by a gateway elsewhere. Create the
-gateway credentials file:
-
-```bash
-sudo install -o root -g root -m 0600 /dev/null /etc/rocguard/web.env
-sudoedit /etc/rocguard/web.env
-```
-
-Add the initial admin account:
-
-```text
-ROCGUARD_WEB_USER=admin
-ROCGUARD_WEB_PASSWORD=change-me
-```
-
-Quote passwords that contain spaces, for example
-`ROCGUARD_WEB_PASSWORD="nexus titan"`.
-
-Create `/etc/systemd/system/rocguard-web.service`:
-
-```ini
-[Unit]
-Description=RocGuard web gateway
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-Group=root
-EnvironmentFile=/etc/rocguard/web.env
-Environment=ROCGUARD_WEB_ADDR=0.0.0.0:8080
-Environment=ROCGUARD_WEB_USERS=/var/lib/rocguard/web-users.json
-Environment=ROCGUARD_WEB_REGISTRY=/var/lib/rocguard/web-servers.json
-Environment=ROCGUARD_WEB_UI_DIR=/usr/local/share/rocguard/ui
-ExecStart=/usr/local/bin/rocguard web
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable it:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now rocguard-web
-sudo systemctl status rocguard-web --no-pager
-```
-
-Open `http://<gateway-host>:8080`. If a host firewall is enabled, allow TCP
-port `8080` from the networks that should access the UI. Do not expose node port
-`8192` to all users.
-
-The first admin is created from `ROCGUARD_WEB_USER` and
-`ROCGUARD_WEB_PASSWORD` only when the users file is empty. Admin can add nodes
-and manage users. Regular users can manage only their own keys and
-reservations. Add each node with:
-
-```text
-Name: a display name
-Endpoint API: http://<node-host>:8192
-Root key: contents of /var/lib/rocguard/root.key on that node
-```
-
-The gateway registry and users files use mode `0600` because they contain node
-root keys and password hashes.
+For an existing deployment, follow the upgrade procedure below and then compare
+its service configuration with the selected installation guide.
 
 ## Upgrade
 
-Build the new version, replace the installed files, then restart both services:
+Back up `/etc/rocguard`, `/var/lib/rocguard`, and `/var/lib/rocguard-web`, then
+stop both services. Build the new version and replace the binary and UI. The UI
+is staged on the destination filesystem, normalized to root ownership, and
+swapped as a directory so removed asset bundles cannot linger:
 
 ```bash
+sudo systemctl stop rocguard-web rocguard
 npm --prefix web/ui ci
 npm --prefix web/ui run build
 go build -buildvcs=false -o rocguard ./cmd/rocguard
 sudo install -o root -g root -m 0755 rocguard /usr/local/bin/rocguard
-sudo cp -a web/ui/dist/. /usr/local/share/rocguard/ui/
-sudo systemctl restart rocguard rocguard-web
+sudo install -d -o root -g root -m 0755 /usr/local/share/rocguard
+UI_STAGE="$(sudo mktemp -d /usr/local/share/rocguard/.ui.XXXXXX)"
+sudo cp -R web/ui/dist/. "$UI_STAGE/"
+sudo chown -R root:root "$UI_STAGE"
+sudo find "$UI_STAGE" -type d -exec chmod 0755 {} +
+sudo find "$UI_STAGE" -type f -exec chmod 0644 {} +
+sudo rm -rf /usr/local/share/rocguard/ui.previous
+if sudo test -d /usr/local/share/rocguard/ui; then
+  sudo mv /usr/local/share/rocguard/ui /usr/local/share/rocguard/ui.previous
+fi
+sudo mv "$UI_STAGE" /usr/local/share/rocguard/ui
+sudo rm -rf /usr/local/share/rocguard/ui.previous
 ```
 
-Existing state, root keys, users, and registered servers remain in
-`/var/lib/rocguard`.
+Older installations stored gateway state beside daemon state. Create the
+dedicated account and migrate each legacy file only when its new destination
+does not already exist:
+
+```bash
+if ! id rocguard-web >/dev/null 2>&1; then
+  sudo useradd --system --user-group --home-dir /var/lib/rocguard-web --create-home --shell /usr/sbin/nologin rocguard-web
+elif ! getent group rocguard-web >/dev/null 2>&1; then
+  sudo groupadd --system rocguard-web
+fi
+sudo install -d -o rocguard-web -g rocguard-web -m 0700 /var/lib/rocguard-web
+if sudo test -f /var/lib/rocguard/web-users.json && ! sudo test -e /var/lib/rocguard-web/users.json; then
+  sudo install -o rocguard-web -g rocguard-web -m 0600 /var/lib/rocguard/web-users.json /var/lib/rocguard-web/users.json
+fi
+if sudo test -f /var/lib/rocguard/web-servers.json && ! sudo test -e /var/lib/rocguard-web/servers.json; then
+  sudo install -o rocguard-web -g rocguard-web -m 0600 /var/lib/rocguard/web-servers.json /var/lib/rocguard-web/servers.json
+fi
+if sudo test -f /var/lib/rocguard/web-session.key && ! sudo test -e /var/lib/rocguard-web/session.key; then
+  sudo install -o rocguard-web -g rocguard-web -m 0600 /var/lib/rocguard/web-session.key /var/lib/rocguard-web/session.key
+fi
+sudo find /var/lib/rocguard-web -maxdepth 1 -type f \( -name users.json -o -name servers.json -o -name session.key \) -exec chown rocguard-web:rocguard-web {} + -exec chmod 0600 {} +
+```
+
+Set `ROCGUARD_WEB_USERS`, `ROCGUARD_WEB_REGISTRY`, and
+`ROCGUARD_WEB_SESSION_KEY` to those three new paths as shown in the gateway
+service unit in [INSTALL-TLS.md](INSTALL-TLS.md) or
+[INSTALL-NO-TLS.md](INSTALL-NO-TLS.md). If no legacy session key exists, the
+gateway creates one on first start; that safely invalidates old browser
+sessions. Do not copy either web state file over an existing destination.
+
+Before starting the services, update their units for fail-closed transport
+security:
+
+- By default, a node API used by the built-in gateway must have
+  `ROCGUARD_NODE_TLS_CERT` and `ROCGUARD_NODE_TLS_KEY`, even on loopback. A
+  deliberate plaintext deployment instead requires both
+  `ROCGUARD_NODE_ALLOW_INSECURE=1` on the node and
+  `ROCGUARD_WEB_ALLOW_INSECURE_NODES=1` on the gateway. Leave
+  `ROCGUARD_NODE_ADDR` empty when the API is not needed.
+- A web gateway should have `ROCGUARD_WEB_TLS_CERT` and
+  `ROCGUARD_WEB_TLS_KEY`. A deliberately plaintext reverse-proxy backend must
+  bind to loopback and set both `ROCGUARD_WEB_ALLOW_INSECURE=1` and
+  `ROCGUARD_WEB_SECURE_COOKIES=1`.
+- A direct plaintext deployment must use all three independent opt-ins shown in
+  [INSTALL-NO-TLS.md](INSTALL-NO-TLS.md):
+  `ROCGUARD_NODE_ALLOW_INSECURE=1`,
+  `ROCGUARD_WEB_ALLOW_INSECURE_NODES=1`, and
+  `ROCGUARD_WEB_ALLOW_INSECURE=1`. Remove both certificate/key pairs together.
+- User self-registration remains disabled unless the gateway explicitly sets
+  `ROCGUARD_WEB_ALLOW_REGISTRATION=1`. Self-registered accounts always receive
+  the regular user role.
+- Remove `UMask=0077` from the daemon unit so it is not inherited by launched
+  user workloads. The web gateway may keep its restrictive umask.
+
+Then reload and start both services:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start rocguard rocguard-web
+sudo systemctl status rocguard rocguard-web --no-pager
+```
+
+After the gateway is reachable, make every registered node match the selected
+installation guide. For TLS, replace each `http://` record with
+`https://<node-host>:8192` and install the issuing CA instead of enabling
+`Skip TLS verify`. For a deliberately plaintext deployment, set
+`ROCGUARD_WEB_ALLOW_INSECURE_NODES=1` before restart and understand that every
+stored HTTP record becomes active immediately.
+
+Finally, sign in with each migrated administrator account, immediately change
+any legacy/default password (including `change-me`), and review the `Users` tab
+for accounts that should be removed. Delete `ROCGUARD_WEB_PASSWORD` from
+`/etc/rocguard/web.env` and from any unit override after the first successful
+sign-in, then restart the gateway to remove the bootstrap secret from its live
+environment:
+
+```bash
+sudo sed -i '/^ROCGUARD_WEB_PASSWORD=/d' /etc/rocguard/web.env
+sudo systemctl daemon-reload
+sudo systemctl restart rocguard-web
+```
+
+Daemon state and root keys remain in `/var/lib/rocguard`; migrated gateway
+state remains in `/var/lib/rocguard-web`.
 
 ## Uninstall
 
@@ -301,10 +261,13 @@ RocGuard can be installed again later. To remove all RocGuard data permanently:
 ```bash
 sudo rm -rf /etc/rocguard
 sudo rm -rf /var/lib/rocguard
+sudo rm -rf /var/lib/rocguard-web
 sudo rm -rf /var/log/rocguard
+sudo userdel rocguard-web
 ```
 
-Also remove any firewall rules created for ports `8080` or `8192`.
+Also remove any firewall rules created for ports `8443`, `8080`, or `8192` (or
+other ports chosen for your deployment).
 
 ## Quick Start
 
@@ -335,8 +298,8 @@ KEY=rg_xxx ./rocguard run -- python train.py
 Check state:
 
 ```bash
-./rocguard status
-./rocguard ps
+KEY=rg_xxx ./rocguard status
+KEY=rg_xxx ./rocguard ps
 KEY=rg_xxx ./rocguard token info
 ROOT_KEY=rk_xxx ./rocguard show-keys
 ```
@@ -368,7 +331,10 @@ KEY=rg_xxx rocguard allow user --name alice
 KEY=rg_xxx rocguard allow user --name 'team-*'
 ```
 
-Keep `allow` scopes as narrow as possible.
+Keep `allow` scopes as narrow as possible. Wildcards created through the web
+gateway require an admin account. A direct wildcard `rocguard allow` request on
+the local Unix socket additionally requires the CLI caller to be root; regular
+users can create exact scopes only.
 
 ## Admin Commands
 
@@ -390,7 +356,9 @@ Bypass a trusted PID:
 ROOT_KEY=rk_xxx rocguard bypass add --pid 1234 --ttl 24h --reason gpuagent
 ```
 
-Bypass a trusted command for one UID:
+Bypass a trusted root-owned command. Command-path bypasses are restricted to
+UID 0 because unprivileged mount namespaces can spoof executable pathnames;
+use a PID bypass for non-root processes:
 
 ```bash
 ROOT_KEY=rk_xxx rocguard bypass add --command /usr/bin/gpuagent --uid 0 --ttl 24h --reason gpuagent
@@ -407,11 +375,11 @@ KEY=... rocguard run -- <command>
 KEY=... rocguard allow docker --container <name-or-id>
 KEY=... rocguard allow k8s --namespace <name>
 KEY=... rocguard allow user --name <name>
-rocguard status
-rocguard ps
+KEY=... rocguard status  # root may omit KEY for the full node view
+KEY=... rocguard ps      # root may omit KEY for the full node view
 KEY=... rocguard token info
 ROOT_KEY=... rocguard show-keys
-ROOT_KEY=... rocguard bypass add (--pid <pid> | --command <path> --uid <uid>) --ttl <duration> --reason <text>
+ROOT_KEY=... rocguard bypass add (--pid <pid> | --command <path> --uid 0) --ttl <duration> --reason <text>
 ROOT_KEY=... rocguard revoke <id>
 ```
 
@@ -427,7 +395,16 @@ ROCGUARD_AUDIT_LOG=/var/log/rocguard/audit.log
 ROCGUARD_NODE_ADDR=
 ROCGUARD_NODE_TLS_CERT=
 ROCGUARD_NODE_TLS_KEY=
+ROCGUARD_NODE_ALLOW_INSECURE=0
 ROCGUARD_WEB_ADDR=127.0.0.1:8080
+ROCGUARD_WEB_TLS_CERT=
+ROCGUARD_WEB_TLS_KEY=
+ROCGUARD_WEB_ALLOW_INSECURE=0
+ROCGUARD_WEB_ALLOW_INSECURE_NODES=0
+ROCGUARD_WEB_ALLOW_REGISTRATION=0
+ROCGUARD_WEB_SECURE_COOKIES=0
+ROCGUARD_WEB_TRUST_PROXY=0
+ROCGUARD_WEB_SESSION_KEY=/var/lib/rocguard/web-session.key
 ROCGUARD_WEB_USER=admin
 ROCGUARD_WEB_PASSWORD=
 ROCGUARD_WEB_USERS=/var/lib/rocguard/web-users.json
@@ -436,6 +413,21 @@ ROCGUARD_WEB_UI_DIR=web/ui/dist
 ROCGUARD_GPU_COUNT=0
 ROCGUARD_DRY_RUN=0
 ```
+
+All insecure transport switches default to false. `ROCGUARD_NODE_ALLOW_INSECURE`
+and `ROCGUARD_WEB_ALLOW_INSECURE` govern the node and browser-facing plaintext
+listeners, including loopback. `ROCGUARD_WEB_ALLOW_INSECURE_NODES` separately
+governs outbound gateway-to-node HTTP. `ROCGUARD_WEB_SECURE_COOKIES` forces the
+browser cookie's `Secure` flag when HTTPS terminates at a reverse proxy. Native
+gateway TLS sets that flag automatically.
+`ROCGUARD_WEB_ALLOW_REGISTRATION` shows the public `Create account` flow and
+permits rate-limited regular-user registration; it never permits an account to
+select the administrator role. Because every registered user can reserve GPUs,
+enable it only for controlled onboarding or a gateway intentionally open to all
+reachable users.
+`ROCGUARD_WEB_TRUST_PROXY` should be enabled only for a loopback reverse proxy
+that overwrites `X-Forwarded-For`; it prevents all proxied clients from sharing
+one login-rate-limit bucket.
 
 Development-only overrides:
 
