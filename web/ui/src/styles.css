@@ -27,8 +27,14 @@
 
 .history-page {
   display: grid;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  align-content: start;
   gap: 18px;
-  padding-bottom: 28px;
+  margin: 0 20px;
+  overflow: auto;
+  padding-bottom: 20px;
 }
 
 .history-filters {
@@ -1866,5 +1872,10 @@ select:focus {
   .keys-panel {
     margin: 0;
     padding: 16px;
+  }
+
+  .history-page {
+    margin: 0;
+    padding: 0 16px 16px;
   }
 }
