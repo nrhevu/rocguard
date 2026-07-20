@@ -27,6 +27,7 @@ const sessionFactsCTE = `WITH session_facts AS (
 			WHEN r.starts_at_ms>? THEN 'scheduled'
 			WHEN r.expires_at_ms>? THEN 'active' ELSE 'completed' END AS derived_status,
 		(SELECT COUNT(*) FROM session_gpus g WHERE g.session_id=r.session_id) AS gpu_count,
+		(SELECT MIN(g.gpu) FROM session_gpus g WHERE g.session_id=r.session_id) AS first_gpu,
 		(SELECT COUNT(*) FROM jobs j WHERE j.session_id=r.session_id) AS job_count,
 		(SELECT MIN(j.started_at_ms) FROM jobs j WHERE j.session_id=r.session_id) AS first_job_at_ms,
 		(SELECT MAX(COALESCE(j.finished_at_ms,j.started_at_ms)) FROM jobs j WHERE j.session_id=r.session_id) AS last_job_at_ms,
@@ -43,10 +44,14 @@ const sessionFactsCTE = `WITH session_facts AS (
 // Search returns a summary and one keyset-paginated page from the same SQLite
 // read transaction. Session detail enrichment happens after the selected IDs
 // are fixed so the transaction does not hold a read lock across N+1 queries.
-func (s *Store) Search(ctx context.Context, expression SearchExpression, limit int, beforeMS int64, beforeID string) (DashboardSummary, []Session, error) {
+func (s *Store) Search(ctx context.Context, expression SearchExpression, sort SearchSort, limit int, cursor SearchCursor) (DashboardSummary, []Session, SearchCursor, error) {
 	predicate, predicateArgs, err := compileSearchExpression(expression)
 	if err != nil {
-		return DashboardSummary{}, nil, err
+		return DashboardSummary{}, nil, SearchCursor{}, err
+	}
+	sortSpec, err := compileSearchSort(sort)
+	if err != nil {
+		return DashboardSummary{}, nil, SearchCursor{}, err
 	}
 	if limit <= 0 {
 		limit = 50
@@ -58,7 +63,7 @@ func (s *Store) Search(ctx context.Context, expression SearchExpression, limit i
 	cteArgs := []any{now, now}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return DashboardSummary{}, nil, err
+		return DashboardSummary{}, nil, SearchCursor{}, err
 	}
 	defer tx.Rollback()
 
@@ -70,7 +75,7 @@ func (s *Store) Search(ctx context.Context, expression SearchExpression, limit i
 		SUM(utilization_integral),COALESCE(SUM(job_count),0) FROM session_facts f WHERE ` + predicate
 	summaryArgs := append(append([]any{}, cteArgs...), predicateArgs...)
 	if err := tx.QueryRowContext(ctx, summaryQuery, summaryArgs...).Scan(&summary.Sessions, &reserved, &observed, &busy, &integral, &summary.Jobs); err != nil {
-		return DashboardSummary{}, nil, err
+		return DashboardSummary{}, nil, SearchCursor{}, err
 	}
 	if reserved > 0 {
 		summary.ReservedGPUHours = float64(reserved) / float64(time.Hour/time.Millisecond)
@@ -85,43 +90,126 @@ func (s *Store) Search(ctx context.Context, expression SearchExpression, limit i
 
 	pagePredicate := predicate
 	pageArgs := append([]any{}, predicateArgs...)
-	if beforeMS > 0 {
-		pagePredicate += " AND (f.starts_at_ms<? OR (f.starts_at_ms=? AND f.session_id<?))"
-		pageArgs = append(pageArgs, beforeMS, beforeMS, beforeID)
+	if cursor.ID != "" {
+		if cursor.Field != sortSpec.field || cursor.Direction != sortSpec.direction {
+			return DashboardSummary{}, nil, SearchCursor{}, invalidFilter("cursor does not match sort")
+		}
+		value, valueErr := sortSpec.cursorValue(cursor)
+		if valueErr != nil {
+			return DashboardSummary{}, nil, SearchCursor{}, valueErr
+		}
+		comparison := ">"
+		if sortSpec.direction == "desc" {
+			comparison = "<"
+		}
+		pagePredicate += fmt.Sprintf(" AND (%s%s? OR (%s=? AND f.session_id%s?))", sortSpec.expression, comparison, sortSpec.expression, comparison)
+		pageArgs = append(pageArgs, value, value, cursor.ID)
 	}
 	listQuery := sessionFactsCTE + ` SELECT f.session_id,f.server_id,f.server_name,f.node_id,f.owner_username,f.owner_editable,f.purpose,f.source,
 		f.created_at_ms,f.starts_at_ms,f.expires_at_ms,f.revoked_at_ms,f.finalized_at_ms,f.history_quality,
 		f.job_count,f.first_job_at_ms,f.last_job_at_ms FROM session_facts f WHERE ` + pagePredicate +
-		" ORDER BY f.starts_at_ms DESC,f.session_id DESC LIMIT ?"
+		" ORDER BY " + sortSpec.expression + " " + strings.ToUpper(sortSpec.direction) + ",f.session_id " + strings.ToUpper(sortSpec.direction) + " LIMIT ?"
 	listArgs := append(append([]any{}, cteArgs...), pageArgs...)
 	listArgs = append(listArgs, limit)
 	rows, err := tx.QueryContext(ctx, listQuery, listArgs...)
 	if err != nil {
-		return DashboardSummary{}, nil, err
+		return DashboardSummary{}, nil, SearchCursor{}, err
 	}
 	var sessions []Session
 	for rows.Next() {
 		item, scanErr := scanSession(rows)
 		if scanErr != nil {
 			rows.Close()
-			return DashboardSummary{}, nil, scanErr
+			return DashboardSummary{}, nil, SearchCursor{}, scanErr
 		}
 		sessions = append(sessions, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return DashboardSummary{}, nil, err
+		return DashboardSummary{}, nil, SearchCursor{}, err
 	}
 	if err := rows.Close(); err != nil {
-		return DashboardSummary{}, nil, err
+		return DashboardSummary{}, nil, SearchCursor{}, err
+	}
+	next := SearchCursor{Field: sortSpec.field, Direction: sortSpec.direction}
+	if len(sessions) > 0 {
+		next.ID = sessions[len(sessions)-1].ID
+		cursorQuery := sessionFactsCTE + " SELECT " + sortSpec.expression + " FROM session_facts f WHERE f.session_id=?"
+		cursorArgs := append(append([]any{}, cteArgs...), next.ID)
+		if sortSpec.kind == "text" {
+			var value string
+			if err := tx.QueryRowContext(ctx, cursorQuery, cursorArgs...).Scan(&value); err != nil {
+				return DashboardSummary{}, nil, SearchCursor{}, err
+			}
+			next.Text = &value
+		} else {
+			var value float64
+			if err := tx.QueryRowContext(ctx, cursorQuery, cursorArgs...).Scan(&value); err != nil {
+				return DashboardSummary{}, nil, SearchCursor{}, err
+			}
+			next.Number = &value
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return DashboardSummary{}, nil, err
+		return DashboardSummary{}, nil, SearchCursor{}, err
 	}
 	if err := s.enrichSessions(ctx, sessions); err != nil {
-		return DashboardSummary{}, nil, err
+		return DashboardSummary{}, nil, SearchCursor{}, err
 	}
-	return summary, sessions, nil
+	return summary, sessions, next, nil
+}
+
+type searchSortSpec struct {
+	field      string
+	direction  string
+	expression string
+	kind       string
+}
+
+func compileSearchSort(sort SearchSort) (searchSortSpec, error) {
+	field := strings.TrimSpace(sort.Field)
+	if field == "" {
+		field = "starts_at"
+	}
+	fields := map[string]searchSortSpec{
+		"purpose":                     {expression: "LOWER(COALESCE(f.purpose,''))", kind: "text"},
+		"owner":                       {expression: "LOWER(COALESCE(f.owner_username,''))", kind: "text"},
+		"starts_at":                   {expression: "CAST(f.starts_at_ms AS REAL)", kind: "number"},
+		"gpu":                         {expression: "CAST(COALESCE(f.first_gpu,-1) AS REAL)", kind: "number"},
+		"average_utilization_percent": {expression: "COALESCE(f.utilization_integral/NULLIF(f.observed_ms,0),-1)", kind: "number"},
+		"job_count":                   {expression: "CAST(f.job_count AS REAL)", kind: "number"},
+		"status":                      {expression: "LOWER(f.derived_status)", kind: "text"},
+	}
+	spec, ok := fields[field]
+	if !ok {
+		return searchSortSpec{}, invalidFilter("unsupported sort field %q", field)
+	}
+	direction := strings.ToLower(strings.TrimSpace(sort.Direction))
+	if direction == "" {
+		direction = "asc"
+		if field == "starts_at" {
+			direction = "desc"
+		}
+	}
+	if direction != "asc" && direction != "desc" {
+		return searchSortSpec{}, invalidFilter("sort direction must be asc or desc")
+	}
+	spec.field = field
+	spec.direction = direction
+	return spec, nil
+}
+
+func (s searchSortSpec) cursorValue(cursor SearchCursor) (any, error) {
+	if s.kind == "text" {
+		if cursor.Text == nil {
+			return nil, invalidFilter("cursor is missing text sort value")
+		}
+		return *cursor.Text, nil
+	}
+	if cursor.Number == nil {
+		return nil, invalidFilter("cursor is missing numeric sort value")
+	}
+	return *cursor.Number, nil
 }
 
 func compileSearchExpression(expression SearchExpression) (string, []any, error) {

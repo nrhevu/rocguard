@@ -21,6 +21,7 @@ type historyResultRequest struct {
 
 type historySearchRequest struct {
 	Filter history.SearchExpression `json:"filter"`
+	Sort   history.SearchSort       `json:"sort"`
 	Limit  int                      `json:"limit"`
 	Cursor string                   `json:"cursor"`
 }
@@ -46,12 +47,12 @@ func (s *Server) handleHistorySearch(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "limit must be between 1 and 100")
 		return
 	}
-	cursor, ok := decodeHistoryCursor(request.Cursor)
+	cursor, ok := decodeHistorySearchCursor(request.Cursor)
 	if request.Cursor != "" && !ok {
 		writeJSONError(w, http.StatusBadRequest, "invalid cursor")
 		return
 	}
-	summary, sessions, err := s.History.Search(r.Context(), request.Filter, request.Limit, cursor.At, cursor.ID)
+	summary, sessions, nextCursor, err := s.History.Search(r.Context(), request.Filter, request.Sort, request.Limit, cursor)
 	if errors.Is(err, history.ErrInvalidSearchFilter) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -62,8 +63,7 @@ func (s *Server) handleHistorySearch(w http.ResponseWriter, r *http.Request) {
 	}
 	next := ""
 	if len(sessions) == request.Limit && len(sessions) > 0 {
-		last := sessions[len(sessions)-1]
-		next = encodeHistoryCursor(last.StartsAt.UnixMilli(), last.ID)
+		next = encodeHistorySearchCursor(nextCursor)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "sessions": sessions, "next_cursor": next})
 }
@@ -238,6 +238,42 @@ func parseBoundedInt(value string, fallback, minimum, maximum int) int {
 type historyPageCursor struct {
 	At int64  `json:"at"`
 	ID string `json:"id"`
+}
+
+type historySearchPageCursor struct {
+	Field     string   `json:"field"`
+	Direction string   `json:"direction"`
+	ID        string   `json:"id"`
+	Text      *string  `json:"text,omitempty"`
+	Number    *float64 `json:"number,omitempty"`
+}
+
+func encodeHistorySearchCursor(cursor history.SearchCursor) string {
+	data, _ := json.Marshal(historySearchPageCursor{
+		Field: cursor.Field, Direction: cursor.Direction, ID: cursor.ID, Text: cursor.Text, Number: cursor.Number,
+	})
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func decodeHistorySearchCursor(value string) (history.SearchCursor, bool) {
+	if value == "" {
+		return history.SearchCursor{}, true
+	}
+	if len(value) > 1024 {
+		return history.SearchCursor{}, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return history.SearchCursor{}, false
+	}
+	var cursor historySearchPageCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.Field == "" || cursor.Direction == "" || cursor.ID == "" || len(cursor.ID) > 256 {
+		return history.SearchCursor{}, false
+	}
+	if (cursor.Text == nil) == (cursor.Number == nil) {
+		return history.SearchCursor{}, false
+	}
+	return history.SearchCursor{Field: cursor.Field, Direction: cursor.Direction, ID: cursor.ID, Text: cursor.Text, Number: cursor.Number}, true
 }
 
 func encodeHistoryCursor(at int64, id string) string {

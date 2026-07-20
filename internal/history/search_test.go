@@ -36,7 +36,7 @@ func TestSearchExpressionFiltersSessionFactsAndJobs(t *testing.T) {
 			{Rules: []SearchRule{searchRule("purpose", "contains", "alpha"), searchRule("status", "equals", "revoked")}},
 			{Rules: []SearchRule{searchRule("job.command", "contains", "train.py"), searchRule("job.exit_code", "equals", 99)}},
 		}}
-		summary, sessions, err := store.Search(ctx, expression, 50, 0, "")
+		summary, sessions, _, err := store.Search(ctx, expression, SearchSort{}, 50, SearchCursor{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -52,7 +52,7 @@ func TestSearchExpressionFiltersSessionFactsAndJobs(t *testing.T) {
 			{Rules: []SearchRule{searchRule("job.gpu", "equals", 0)}},
 			{Rules: []SearchRule{searchRule("job.source", "equals", "rocguard_run")}},
 		}}
-		_, sessions, err := store.Search(ctx, expression, 50, 0, "")
+		_, sessions, _, err := store.Search(ctx, expression, SearchSort{}, 50, SearchCursor{})
 		if err != nil || len(sessions) != 1 || sessions[0].ID != "alpha" {
 			t.Fatalf("metric/job result=%+v err=%v", sessions, err)
 		}
@@ -62,7 +62,7 @@ func TestSearchExpressionFiltersSessionFactsAndJobs(t *testing.T) {
 		expression := SearchExpression{Groups: []SearchGroup{{Rules: []SearchRule{
 			searchRule("session_window", "overlaps", []string{now.Add(-40 * time.Minute).Format(time.RFC3339), now.Add(10 * time.Minute).Format(time.RFC3339)}),
 		}}}}
-		_, sessions, err := store.Search(ctx, expression, 50, 0, "")
+		_, sessions, _, err := store.Search(ctx, expression, SearchSort{}, 50, SearchCursor{})
 		if err != nil || len(sessions) != 2 || sessions[0].ID != "revoked" || sessions[1].ID != "alpha" {
 			t.Fatalf("time overlap result=%+v err=%v", sessions, err)
 		}
@@ -73,7 +73,7 @@ func TestSearchExpressionFiltersSessionFactsAndJobs(t *testing.T) {
 			{Rules: []SearchRule{searchRuleWithoutValue("average_utilization_percent", "is_empty")}},
 			{Rules: []SearchRule{searchRule("job.command", "not_contains", "train.py")}},
 		}}
-		_, sessions, err := store.Search(ctx, expression, 50, 0, "")
+		_, sessions, _, err := store.Search(ctx, expression, SearchSort{}, 50, SearchCursor{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,9 +83,9 @@ func TestSearchExpressionFiltersSessionFactsAndJobs(t *testing.T) {
 	})
 
 	t.Run("literal injection-like text", func(t *testing.T) {
-		_, sessions, err := store.Search(ctx, SearchExpression{Groups: []SearchGroup{{Rules: []SearchRule{
+		_, sessions, _, err := store.Search(ctx, SearchExpression{Groups: []SearchGroup{{Rules: []SearchRule{
 			searchRule("purpose", "contains", `alpha%' OR 1=1 --`),
-		}}}}, 50, 0, "")
+		}}}}, SearchSort{}, 50, SearchCursor{})
 		if err != nil || len(sessions) != 0 {
 			t.Fatalf("literal text result=%+v err=%v", sessions, err)
 		}
@@ -101,21 +101,32 @@ func TestSearchExpressionValidationAndCursor(t *testing.T) {
 	now := time.Now().UTC()
 	createSearchSession(t, store, "first", "node", "server", "alice", "first", now.Add(-time.Hour), now.Add(time.Hour), []int{0})
 	createSearchSession(t, store, "second", "node", "server", "alice", "second", now.Add(-2*time.Hour), now.Add(-time.Hour), []int{0})
-	_, firstPage, err := store.Search(context.Background(), SearchExpression{}, 1, 0, "")
+	_, firstPage, cursor, err := store.Search(context.Background(), SearchExpression{}, SearchSort{}, 1, SearchCursor{})
 	if err != nil || len(firstPage) != 1 || firstPage[0].ID != "first" {
 		t.Fatalf("first page=%+v err=%v", firstPage, err)
 	}
-	_, secondPage, err := store.Search(context.Background(), SearchExpression{}, 1, firstPage[0].StartsAt.UnixMilli(), firstPage[0].ID)
+	_, secondPage, _, err := store.Search(context.Background(), SearchExpression{}, SearchSort{}, 1, cursor)
 	if err != nil || len(secondPage) != 1 || secondPage[0].ID != "second" {
 		t.Fatalf("second page=%+v err=%v", secondPage, err)
 	}
-	_, _, err = store.Search(context.Background(), SearchExpression{Groups: []SearchGroup{{Rules: []SearchRule{searchRule("unknown", "equals", "x")}}}}, 10, 0, "")
+	_, sorted, sortCursor, err := store.Search(context.Background(), SearchExpression{}, SearchSort{Field: "purpose", Direction: "asc"}, 1, SearchCursor{})
+	if err != nil || len(sorted) != 1 || sorted[0].ID != "first" {
+		t.Fatalf("sorted first page=%+v err=%v", sorted, err)
+	}
+	_, sortedNext, _, err := store.Search(context.Background(), SearchExpression{}, SearchSort{Field: "purpose", Direction: "asc"}, 1, sortCursor)
+	if err != nil || len(sortedNext) != 1 || sortedNext[0].ID != "second" {
+		t.Fatalf("sorted second page=%+v err=%v", sortedNext, err)
+	}
+	_, _, _, err = store.Search(context.Background(), SearchExpression{Groups: []SearchGroup{{Rules: []SearchRule{searchRule("unknown", "equals", "x")}}}}, SearchSort{}, 10, SearchCursor{})
 	if !errors.Is(err, ErrInvalidSearchFilter) {
 		t.Fatalf("unknown field error=%v", err)
 	}
 	tooMany := SearchExpression{Groups: make([]SearchGroup, maxSearchGroups+1)}
-	if _, _, err := store.Search(context.Background(), tooMany, 10, 0, ""); !errors.Is(err, ErrInvalidSearchFilter) {
+	if _, _, _, err := store.Search(context.Background(), tooMany, SearchSort{}, 10, SearchCursor{}); !errors.Is(err, ErrInvalidSearchFilter) {
 		t.Fatalf("group limit error=%v", err)
+	}
+	if _, _, _, err := store.Search(context.Background(), SearchExpression{}, SearchSort{Field: "private_sql", Direction: "asc"}, 10, SearchCursor{}); !errors.Is(err, ErrInvalidSearchFilter) {
+		t.Fatalf("sort validation error=%v", err)
 	}
 	revokedSummary, err := store.Summary(context.Background(), SessionFilter{Status: "revoked"})
 	if err != nil || revokedSummary.Sessions != 0 {

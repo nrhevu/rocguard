@@ -133,3 +133,16 @@ type SearchRule struct {
 	Operator string          `json:"operator"`
 	Value    json.RawMessage `json:"value,omitempty"`
 }
+
+type SearchSort struct {
+	Field     string `json:"field"`
+	Direction string `json:"direction"`
+}
+
+type SearchCursor struct {
+	Field     string
+	Direction string
+	ID        string
+	Text      *string
+	Number    *float64
+}

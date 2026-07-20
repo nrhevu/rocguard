@@ -50,6 +50,7 @@ function App() {
   const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
   const [historyNextCursor, setHistoryNextCursor] = useState("");
   const [historyFilters, setHistoryFilters] = useState({ groups: [] });
+  const [historySort, setHistorySort] = useState({ field: "starts_at", direction: "desc" });
   const settingsRef = useRef(null);
   const historyRequestRef = useRef(0);
 
@@ -135,6 +136,7 @@ function App() {
       return undefined;
     }
     historyRequestRef.current += 1;
+    setHistoryNextCursor("");
     if (historyFilterErrors(historyFilters).length > 0) {
       return undefined;
     }
@@ -146,7 +148,7 @@ function App() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [auth.authenticated, view, historyFilters]);
+  }, [auth.authenticated, view, historyFilters, historySort]);
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -250,6 +252,7 @@ function App() {
       setHistoryJobs([]);
       setHistoryNextCursor("");
       setHistoryFilters({ groups: [] });
+      setHistorySort({ field: "starts_at", direction: "desc" });
       historyRequestRef.current += 1;
     }
   }
@@ -270,7 +273,7 @@ function App() {
     }
   }
 
-  async function loadHistory({ filters = historyFilters, cursor = "", append = false, signal } = {}) {
+  async function loadHistory({ filters = historyFilters, sort = historySort, cursor = "", append = false, signal } = {}) {
     if (historyFilterErrors(filters).length > 0) {
       return;
     }
@@ -286,6 +289,7 @@ function App() {
         signal,
         body: JSON.stringify({
           filter: historySearchExpression(filters),
+          sort,
           limit: historyPageSize,
           cursor,
         }),
@@ -770,10 +774,12 @@ function App() {
             sessions={historySessions}
             servers={servers}
             filters={historyFilters}
+            sort={historySort}
             loading={historyLoading}
             loadingMore={historyLoadingMore}
             nextCursor={historyNextCursor}
             onFilters={setHistoryFilters}
+            onSort={setHistorySort}
             onLoadMore={() => loadHistory({ cursor: historyNextCursor, append: true })}
             onOpen={openHistorySession}
           />
@@ -866,7 +872,7 @@ function App() {
   );
 }
 
-function HistoryDashboard({ summary, sessions, servers, filters, loading, loadingMore, nextCursor, onFilters, onLoadMore, onOpen }) {
+function HistoryDashboard({ summary, sessions, servers, filters, sort, loading, loadingMore, nextCursor, onFilters, onSort, onLoadMore, onOpen }) {
   const [filterOpen, setFilterOpen] = useState(false);
   const filterRef = useRef(null);
   const errors = historyFilterErrors(filters);
@@ -926,6 +932,15 @@ function HistoryDashboard({ summary, sessions, servers, filters, loading, loadin
   function addGroup() {
     if (filters.groups.length >= 8 || ruleCount >= 32) return;
     onFilters({ groups: [...filters.groups, newHistoryGroup()] });
+  }
+
+  function changeSort(field) {
+    onSort((current) => {
+      if (current.field === field) {
+        return { field, direction: current.direction === "asc" ? "desc" : "asc" };
+      }
+      return { field, direction: ["starts_at", "average_utilization_percent", "job_count"].includes(field) ? "desc" : "asc" };
+    });
   }
 
   return (
@@ -988,7 +1003,15 @@ function HistoryDashboard({ summary, sessions, servers, filters, loading, loadin
         </div>
         <div className="history-table-scroll">
           <div className="history-table">
-            <div className="history-table-head"><span>Session</span><span>Owner</span><span>Window</span><span>GPU</span><span>Utilization</span><span>Jobs</span><span>Status</span></div>
+            <div className="history-table-head">
+              <HistorySortHeader label="Session" field="purpose" sort={sort} onSort={changeSort} />
+              <HistorySortHeader label="Owner" field="owner" sort={sort} onSort={changeSort} />
+              <HistorySortHeader label="Window" field="starts_at" sort={sort} onSort={changeSort} />
+              <HistorySortHeader label="GPU" field="gpu" sort={sort} onSort={changeSort} />
+              <HistorySortHeader label="Utilization" field="average_utilization_percent" sort={sort} onSort={changeSort} />
+              <HistorySortHeader label="Jobs" field="job_count" sort={sort} onSort={changeSort} />
+              <HistorySortHeader label="Status" field="status" sort={sort} onSort={changeSort} />
+            </div>
             {sessions.map((session) => {
               const observed = (session.gpu_summaries || []).reduce((sum, gpu) => sum + (gpu.observed_ms || 0), 0);
               const weighted = (session.gpu_summaries || []).reduce((sum, gpu) => sum + (gpu.average_utilization_percent || 0) * (gpu.observed_ms || 0), 0);
@@ -1011,6 +1034,18 @@ function HistoryDashboard({ summary, sessions, servers, filters, loading, loadin
         </div>
       </section>
     </section>
+  );
+}
+
+function HistorySortHeader({ label, field, sort, onSort }) {
+  const active = sort.field === field;
+  const direction = active ? sort.direction : "none";
+  return (
+    <span role="columnheader" aria-sort={direction === "none" ? "none" : direction === "asc" ? "ascending" : "descending"}>
+      <button type="button" onClick={() => onSort(field)} title={`Sort by ${label}`}>
+        {label}{active && <i>{sort.direction === "asc" ? "↑" : "↓"}</i>}
+      </button>
+    </span>
   );
 }
 

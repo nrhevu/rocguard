@@ -26,6 +26,18 @@ func TestTelemetryCapabilityRequiresExplicitAdvertisement(t *testing.T) {
 	}
 }
 
+func TestHistorySearchCursorRoundTrip(t *testing.T) {
+	number := 42.5
+	original := history.SearchCursor{Field: "average_utilization_percent", Direction: "desc", ID: "session-a", Number: &number}
+	decoded, ok := decodeHistorySearchCursor(encodeHistorySearchCursor(original))
+	if !ok || decoded.Field != original.Field || decoded.Direction != original.Direction || decoded.ID != original.ID || decoded.Number == nil || *decoded.Number != number {
+		t.Fatalf("cursor round trip = %+v ok=%v", decoded, ok)
+	}
+	if _, ok := decodeHistorySearchCursor("not-a-cursor"); ok {
+		t.Fatal("invalid search cursor was accepted")
+	}
+}
+
 func TestUnsupportedExternalSessionError(t *testing.T) {
 	if !unsupportedExternalSessionError(errors.New(`node: unknown register argument "external_session_id"`)) {
 		t.Fatal("legacy parser error was not detected")
