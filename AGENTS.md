@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Workspace instructions for ZCode agents working in this repository.
+Workspace instructions for coding agents working in this repository.
 Read this before editing. Project setup and operator workflows live in
 `README.md` (production) and `DEVELOPMENT.md` (local no-TLS dev); this file
 captures only things future agents would otherwise miss.
@@ -25,6 +25,10 @@ Three components share a single Go module (`module gpuardian`, Go 1.25):
 3. **Web gateway** (`internal/web`) — Dockerized, non-root (UID/GID `65532`),
    serves accounts, scheduling, keys, fleet of nodes. Port `8443` (prod) or
    loopback `18080` (dev). Frontend is a React 19 + Vite SPA in `web/ui/`.
+4. **MCP server** (`mcp/gpuardian_mcp`) — Python 3.11+ stdio server that
+   exposes reservation operations as MCP tools for AI assistants. Talks to
+   the web gateway over HTTP (no Go-module dependency); configured entirely
+   via `GPUARDIAN_MCP_*` env vars. Not part of the Go build.
 
 ## Layout
 
@@ -46,6 +50,7 @@ internal/proc/        /proc parsing
 internal/runtime/     Workload process runtime
 internal/telemetry/   Telemetry outbox
 web/ui/               Vite + React 19 SPA (src/main.jsx, src/styles.css — single-file app)
+mcp/                  Python stdio MCP server exposing gateway ops to AI assistants (own venv/egg-info, not Go)
 scripts/              Python helpers (integration_test.py, hold_gpu.py) — not part of build
 compose.web.yml       Production gateway Compose
 compose.web-dev.yml   Dev gateway Compose (loopback, no TLS, --dry-run node)
@@ -57,11 +62,11 @@ Dockerfile.web        Hardened non-root gateway image
 Run from repo root:
 
 ```bash
-# UI (must build before gateway so embedded assets exist)
+# UI (build before the gateway image so assets exist on disk)
 npm --prefix web/ui ci
-npm --prefix web/ui run build      # outputs web/ui/dist/, embedded via web/gpuardian-ui/
+npm --prefix web/ui run build      # outputs web/ui/dist/, served at runtime via GPUARDIAN_WEB_UI_DIR
 
-# Go
+# Go (no UI build needed — the gateway serves UI from disk, not via go:embed)
 go test ./...
 go build -buildvcs=false -o gpuardian ./cmd/gpuardian
 
@@ -69,13 +74,17 @@ go build -buildvcs=false -o gpuardian ./cmd/gpuardian
 go test ./internal/web/...
 go test -run TestName ./internal/web/
 
+# MCP server (separate Python venv; not part of the Go build)
+cd mcp && python3 -m venv .venv && .venv/bin/pip install -e .
+
 # Gateway image
 sudo docker compose -f compose.web.yml build        # prod
 sudo docker compose -f compose.web-dev.yml up -d --build   # dev
 ```
 
 There is no separate lint config in the repo; `go vet ./...` and `go test
-./...` are the gates. The UI has no test runner configured.
+./...` are the gates. The UI has no test runner configured. The MCP server
+has no test suite; verify it against a running gateway by hand.
 
 ## Architecture boundaries
 
@@ -99,7 +108,11 @@ There is no separate lint config in the repo; `go vet ./...` and `go test
   through the protocol client.
 - **UI is a single-file SPA** (`web/ui/src/main.jsx`). Do not introduce a
   framework, router, or build tooling beyond Vite + React 19 without explicit
-  intent. Build output in `web/ui/dist/` is what gets served/embedded.
+  intent. The gateway serves `web/ui/dist/` from disk at runtime via
+  `GPUARDIAN_WEB_UI_DIR` (default `web/ui/dist`; `/usr/local/share/gpuardian/ui`
+  inside the Docker image) — there is **no `go:embed`** of UI assets, so do
+  not add one. `handleStatic` in `server.go` falls back to `index.html` for
+  unknown non-`/api/` paths.
 - **`internal/history` is SQLite-backed** via `modernc.org/sqlite` (pure Go,
   no CGO). Do not switch to a CGO sqlite driver — the gateway image is
   non-root and CGO-free.
@@ -122,6 +135,11 @@ There is no separate lint config in the repo; `go vet ./...` and `go test
 - **Secrets never go in source control.** `.dev/`, `*.key`, `web.env`,
   `users.json`, `servers.json`, `session.key`, `user-key.key`, `history.db`,
   and the built `gpuardian` binary are all gitignored or operator-only.
+- **The MCP server is env-var driven and stdio-only.** All config is
+  `GPUARDIAN_MCP_*` (`URL`, `USER`, `PASSWORD`, `TIMEOUT`, `VERIFY_TLS`); it
+  speaks MCP over stdio and has no CLI flags. It logs in eagerly at startup
+  so bad credentials fail fast. Keep it a thin client over the gateway HTTP
+  API — do not duplicate reservation logic in Python.
 
 ## Gotchas
 
@@ -144,7 +162,9 @@ There is no separate lint config in the repo; `go vet ./...` and `go test
   add filesystem writes elsewhere without updating the Compose files.
 - **`web/ui/dist/` and `web/ui/node_modules/` are gitignored.** Run
   `npm --prefix web/ui ci && npm --prefix web/ui run build` before building
-  the gateway image or running Go tests that embed UI assets.
+  the gateway image (the Dockerfile builds the UI in a `node` stage and
+  copies `dist/` to `/usr/local/share/gpuardian/ui`). Go tests do **not**
+  need the UI built — they never touch the static handler's disk path.
 - **`modernc.org/sqlite` requires no CGO**, but its transactions and WAL
   semantics still apply. Back up `history.db` with SQLite Online Backup /
   `VACUUM INTO`, not a live file copy.
