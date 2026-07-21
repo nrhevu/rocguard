@@ -381,7 +381,11 @@ function App() {
   const authorizations = current?.snapshot?.authorizations || [];
   const isAdmin = auth.role === "admin";
   const fixedKey = fixedKeys.find((key) => sameText(key.owner, auth.user)) || null;
-  const scheduleToken = scheduleTarget && sameText(scheduleTarget.holder, auth.user) ? fixedKey : null;
+  const scheduleToken = scheduleTarget
+    ? (isAdmin
+        ? (fixedKeys.find((key) => sameText(key.owner, scheduleTarget.holder)) || fixedKey)
+        : (sameText(scheduleTarget.holder, auth.user) ? fixedKey : null))
+    : null;
   const selectedGPUList = Array.from(selectedGPUs).sort((a, b) => a - b);
   const allGPUIds = gpus.map((gpu) => gpu.id);
   const availableGPUIds = gpus
@@ -756,10 +760,13 @@ function App() {
           </div>
         ) : view === "keys" ? (
           <KeysView
-            keys={fixedKey ? [fixedKey] : []}
+            keys={isAdmin ? fixedKeys : (fixedKey ? [fixedKey] : [])}
+            reservations={isAdmin ? reservations : reservations.filter((r) => sameText(r.holder, auth.user))}
+            isAdmin={isAdmin}
             onAllow={setAllowTarget}
             onShow={showKey}
             onRegenerate={regenerateKey}
+            onOpenReservation={setScheduleTarget}
           />
         ) : view === "history" ? (
           <HistoryDashboard
@@ -832,11 +839,9 @@ function App() {
           title="Reservation created"
           target={reservationSuccess}
           canAuthorize={Boolean(reservationSuccess.id)}
-		  canShowKey={Boolean(fixedKey)}
           canRevoke={Boolean(reservationSuccess.id)}
           onClose={() => setReservationSuccess(null)}
           onAuthorize={() => setAllowTarget(reservationSuccess.token)}
-		  onShowKey={() => showKey(auth.user)}
           onRevoke={() => setRevokeTarget(reservationSuccess)}
         />
       )}
@@ -1747,13 +1752,17 @@ function ReserveForm({ owner, selected, gpus, reservations, onMissingSelection, 
   );
 }
 
-function KeysView({ keys, onAllow, onShow, onRegenerate }) {
+function KeysView({ keys, reservations, isAdmin, onAllow, onShow, onRegenerate, onOpenReservation }) {
+  const reservationList = groupScheduleReservations(reservations).map((reservation) => ({
+    ...reservation,
+    start: new Date(reservation.starts_at || reservation.created_at),
+    end: new Date(reservation.expires_at),
+  }));
   return (
     <section className="keys-panel">
       <div className="section-heading">
         <div>
-          <h2>My fixed key</h2>
-          <p className="muted">This key works for every reservation on every synchronized node, and can claim an unreserved GPU.</p>
+            <h2>Key</h2>
         </div>
       </div>
       <div className="key-list">
@@ -1763,11 +1772,6 @@ function KeysView({ keys, onAllow, onShow, onRegenerate }) {
               <strong>{key.owner}</strong>
               <span className="key-subtitle">Fixed · version {key.version} · created {new Date(key.created_at).toLocaleDateString()}</span>
               <span className="key-subtitle">{key.id}</span>
-              {(key.node_sync || []).map((node) => (
-                <span className={`key-sync key-sync-${node.status}`} key={node.node_id} title={node.error || ""}>
-                  {node.node}: {node.status}
-                </span>
-              ))}
             </div>
             <div className="key-actions">
               <button className="primary-button" onClick={() => onAllow(key)}>Authorize</button>
@@ -1778,8 +1782,59 @@ function KeysView({ keys, onAllow, onShow, onRegenerate }) {
         ))}
         {keys.length === 0 && <div className="empty">Your fixed key is being initialized.</div>}
       </div>
+      <div className="key-reservations">
+        <div className="section-heading">
+          <div>
+            <h2>Reservations</h2>
+          </div>
+        </div>
+        <div className="key-list">
+          {reservationList.map((reservation) => {
+            const status = reservationListStatus(reservation).toLowerCase();
+            return (
+              <div className="key-row" key={reservation.id}>
+                <div className="key-summary">
+                  <div className="reserved-key-details">
+                    <KeyDetail label="Purpose" value={reservation.purpose || "--"} />
+                    <KeyDetail label="Start" value={dateTimeLabel(reservation.starts_at)} />
+                    <KeyDetail label="End" value={dateTimeLabel(reservation.expires_at)} />
+                    <KeyDetail label="GPUs" value={reservation.gpus.length ? reservation.gpus.join(", ") : "--"} />
+                  </div>
+                  {isAdmin && <span className="reserved-key-user">{reservation.holder || "Unknown user"}</span>}
+                </div>
+                <div className="key-actions">
+                  <button type="button" className="small-button" onClick={() => onOpenReservation(reservation)}>Details</button>
+                  <span className={`reserved-key-status ${status}`}>{reservationListStatus(reservation)}</span>
+                </div>
+              </div>
+            );
+          })}
+          {reservationList.length === 0 && <div className="empty">No reservations on this node.</div>}
+        </div>
+      </div>
     </section>
   );
+}
+
+function KeyDetail({ label, value }) {
+  return (
+    <div className="reserved-key-detail">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function reservationListStatus(reservation) {
+  const start = reservation.start.getTime();
+  const end = reservation.end.getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    return "Unknown window";
+  }
+  if (start > Date.now()) {
+    return "Scheduled";
+  }
+  return end > Date.now() ? "Active" : "Completed";
 }
 
 function AllowKeyModal({ token, rules, onClose, onSubmit, onRemove }) {
@@ -2314,8 +2369,7 @@ function SuccessKey({ token, onClose }) {
   return (
     <div className="modal-backdrop">
       <section className="success-panel">
-        <h2>Your fixed key</h2>
-        <p>This same key is used for every reservation and synchronized node.</p>
+        <h2>Key</h2>
         <div className="copy-row">
           <input className="key-output" readOnly spellCheck="false" value={token || "rg ..."} aria-label="Fixed API key" />
           <button

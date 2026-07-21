@@ -247,7 +247,6 @@ func (s *UserStore) RegenerateFixedKey(username string) (FixedUserKey, error) {
 		if err := s.keyCipher.assign(&users[i], version); err != nil {
 			return FixedUserKey{}, err
 		}
-		users[i].UpdatedAt = time.Now().UTC()
 		if err := s.saveLocked(users); err != nil {
 			return FixedUserKey{}, err
 		}

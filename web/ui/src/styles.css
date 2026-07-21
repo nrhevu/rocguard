@@ -27,14 +27,14 @@
 
 .history-page {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto;
   min-width: 0;
   min-height: 0;
   flex: 1 1 auto;
   align-content: start;
   gap: 18px;
   margin: 0 20px;
-  overflow: hidden;
+  overflow-y: auto;
   padding-top: 14px;
   padding-bottom: 20px;
 }
@@ -267,9 +267,8 @@
 
 .history-list-panel {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
   min-height: 0;
-  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 18px;
@@ -279,6 +278,7 @@
 .history-table-scroll {
   min-width: 0;
   min-height: 0;
+  max-height: min(62vh, 620px);
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1694,12 +1694,37 @@ select:focus {
 }
 
 .keys-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   margin: 24px 28px;
 }
 
 .key-list {
-  display: grid;
-  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.key-reservations {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin-top: 32px;
+}
+
+.key-reservations .key-list {
+  min-height: 0;
+  max-height: min(62vh, 620px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  margin-top: 4px;
+}
+
+.key-reservations .section-heading {
+  margin-bottom: 14px;
 }
 
 .key-row {
@@ -1707,9 +1732,13 @@ select:focus {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  min-height: 72px;
-  border-bottom: 1px solid var(--line);
-  padding: 16px 0;
+  border-top: 1px solid var(--line);
+  padding: 18px 0;
+}
+
+.key-row:first-child {
+  border-top: 0;
+  padding-top: 4px;
 }
 
 .key-summary {
@@ -1769,11 +1798,60 @@ select:focus {
   overflow-wrap: anywhere;
 }
 
+.reserved-key-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.reserved-key-user {
+  display: block;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.reserved-key-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.reserved-key-status.active {
+  color: #166534;
+  background: var(--green-soft);
+}
+
+.reserved-key-status.scheduled {
+  color: #92400e;
+  background: var(--amber-soft);
+}
+
+.reserved-key-status.completed {
+  color: #475569;
+  background: #eef2f7;
+}
+
+.reserved-key-status.unknown {
+  color: #991b1b;
+  background: var(--red-soft);
+}
+
 .key-actions {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
+}
+
+.key-reservations .key-actions {
+  flex-direction: column;
+  align-items: center;
 }
 
 .empty {

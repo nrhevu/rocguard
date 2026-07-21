@@ -288,6 +288,10 @@ func TestFixedKeyAPIRestrictsRevealAndRegenerate(t *testing.T) {
 	if replacement.Version != first.Version+1 || replacement.ID == first.ID || replacement.Secret == first.Secret {
 		t.Fatalf("key was not replaced: before=%+v after=%+v", first, replacement)
 	}
+	stillAuthenticated := requestJSON(handler, http.MethodGet, "/api/keys", "", aliceCookie)
+	if stillAuthenticated.Code != http.StatusOK {
+		t.Fatalf("key regeneration invalidated the owner session: %d %s", stillAuthenticated.Code, stillAuthenticated.Body.String())
+	}
 }
 
 func TestManagedGatewayIgnoresClientKeyIdentity(t *testing.T) {
