@@ -946,14 +946,14 @@ h2 {
 }
 
 .key-button {
-  border-color: #c2410c;
-  background: #c2410c;
-  color: #fff;
+  border-color: var(--line-strong);
+  background: #fff;
+  color: var(--text);
 }
 
 .key-button:hover {
-  border-color: #9a3412;
-  background: #9a3412;
+  border-color: #94a3b8;
+  background: #f8fafc;
 }
 
 .danger-button {
@@ -1708,6 +1708,18 @@ select:focus {
   gap: 0;
 }
 
+.keys-panel > .key-list {
+  min-height: 0;
+  max-height: min(38vh, 380px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.users-panel > .key-list {
+  max-height: none;
+  flex: 1 1 auto;
+}
+
 .key-reservations {
   display: flex;
   flex-direction: column;
@@ -1751,6 +1763,18 @@ select:focus {
   margin-top: 5px;
   color: var(--muted);
   font-size: 13px;
+}
+
+.key-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.key-id {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 400;
 }
 
 .key-sync {

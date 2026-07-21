@@ -1769,13 +1769,15 @@ function KeysView({ keys, reservations, isAdmin, onAllow, onShow, onRegenerate, 
         {keys.map((key) => (
           <div className="key-row" key={key.id}>
             <div className="key-summary">
-              <strong>{key.owner}</strong>
-              <span className="key-subtitle">Fixed · version {key.version} · created {new Date(key.created_at).toLocaleDateString()}</span>
-              <span className="key-subtitle">{key.id}</span>
+              <div className="key-title-row">
+                <strong>{key.owner}</strong>
+                <span className="key-id"> · {key.id}</span>
+              </div>
+              <span className="key-subtitle">Version {key.version} · created {new Date(key.created_at).toLocaleDateString()}</span>
             </div>
             <div className="key-actions">
-              <button className="primary-button" onClick={() => onAllow(key)}>Authorize</button>
               <button className="key-button" onClick={() => onShow(key.owner)}>Show key</button>
+              <button className="primary-button" onClick={() => onAllow(key)}>Authorize</button>
               <button type="button" className="danger-button" onClick={() => onRegenerate(key.owner)}>Regenerate</button>
             </div>
           </div>
