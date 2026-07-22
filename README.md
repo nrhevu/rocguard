@@ -1,7 +1,14 @@
-<div align="center">
-  <img src="web/ui/public/gpuardian-icon.svg" alt="GPUardian" width="128" />
-  <h1>GPUardian</h1>
-</div>
+<!-- markdownlint-disable MD001 MD041 -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/nrhevu/GPUardian/main/web/ui/public/gpuardian-icon.svg">
+    <img alt="GPUardian" src="https://raw.githubusercontent.com/nrhevu/GPUardian/main/web/ui/public/gpuardian-icon.svg" width=15%>
+  </picture>
+</p>
+
+<h3 align="center">
+GPUardian
+</h3>
 
 ---
 
