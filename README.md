@@ -26,7 +26,9 @@ isolation. A user with root, sudo, or root-equivalent Docker access can bypass
 it.
 
 This README is the complete production installation and user guide. Production
-requires HTTPS for both the node API and web gateway. For an isolated no-TLS
+requires HTTPS for both the node API and web gateway. For a production install
+without TLS on a trusted network, see
+[docs/NO-TLS-INSTALL.md](docs/NO-TLS-INSTALL.md). For an isolated no-TLS
 development environment, use [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Deployment layout
@@ -533,7 +535,8 @@ Also remove the firewall rules for ports `8192` and `8443`.
 
 Development uses separate ports, keys, state, cgroups, and a no-TLS Docker
 Compose project. Follow [DEVELOPMENT.md](DEVELOPMENT.md). Never use the
-development configuration for production.
+development configuration for production. For a production install without TLS,
+see [docs/NO-TLS-INSTALL.md](docs/NO-TLS-INSTALL.md).
 
 ## License
 
