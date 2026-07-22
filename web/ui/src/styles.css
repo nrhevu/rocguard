@@ -999,12 +999,36 @@ h2 {
 
 .dashboard-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 376px;
-  gap: 14px;
+  /* grid-template-columns is set inline by the drag handler; the fallback
+     below applies before the component mounts or if JS is disabled. */
+  grid-template-columns: minmax(0, 1fr) 14px 376px;
+  gap: 0;
   min-height: 0;
   flex: 1 1 auto;
   overflow: hidden;
   padding: 18px 20px;
+}
+
+.splitter {
+  align-self: stretch;
+  justify-self: center;
+  width: 4px;
+  margin: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  cursor: col-resize;
+  transition: background 0.15s ease;
+  position: relative;
+}
+.splitter::before {
+  content: "";
+  position: absolute;
+  inset: 0 -5px;
+}
+.splitter:hover,
+.splitter:active {
+  background: var(--line, #d1d5db);
 }
 
 .content-panel,
@@ -1033,6 +1057,11 @@ h2 {
 .content-panel {
   display: flex;
   flex-direction: column;
+  min-width: 460px;
+}
+
+.inspector {
+  min-width: 380px;
 }
 
 .section-heading {
@@ -1148,8 +1177,8 @@ h2 {
 .gpu-card {
   position: relative;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  align-content: start;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  align-content: stretch;
   min-height: 0;
   border: 1px solid #bbf7d0;
   border-radius: 8px;
@@ -1215,7 +1244,7 @@ h2 {
 }
 
 .gpu-subtitle {
-  margin: 8px 0 0;
+  margin: 8px 0 3px;
   text-align: center;
   font-size: 11px;
   font-weight: 400;

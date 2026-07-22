@@ -42,6 +42,7 @@ function App() {
   const [successKey, setSuccessKey] = useState("");
   const [error, setError] = useState("");
   const [loginError, setLoginError] = useState("");
+  const [inspectorWidth, setInspectorWidth] = useState(376);
   const [historySummary, setHistorySummary] = useState(null);
   const [historySessions, setHistorySessions] = useState([]);
   const [historyTarget, setHistoryTarget] = useState(null);
@@ -53,6 +54,38 @@ function App() {
   const [historySort, setHistorySort] = useState({ field: "starts_at", direction: "desc" });
   const settingsRef = useRef(null);
   const historyRequestRef = useRef(0);
+  const dashboardRef = useRef(null);
+
+  // Draggable splitter between the GPU grid (left) and the inspector/schedule
+  // (right). startInspectorDrag attaches mousemove/mouseup listeners on the
+  // document and resizes the inspector column by the inverse of the cursor
+  // delta (drag right => narrower inspector). Both panels are clamped to
+  // minimums so neither collapses: inspector >= 320px, GPU grid >= 360px.
+  const startInspectorDrag = (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = inspectorWidth;
+    const onMove = (ev) => {
+      const grid = dashboardRef.current;
+      if (!grid) return;
+      const rect = grid.getBoundingClientRect();
+      const minInspector = 380;
+      const minGrid = 460;
+      // rect.width includes grid padding (20px each side = 40px) and the
+      // splitter column (14px). Subtract all so the 1fr content panel never
+      // gets squeezed below minGrid and the splitter gap never collapses.
+      const overhead = 40 + 14;
+      const max = rect.width - minGrid - overhead;
+      const next = Math.min(max, Math.max(minInspector, startWidth - (ev.clientX - startX)));
+      setInspectorWidth(next);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
 
   useEffect(() => {
     checkSession();
@@ -706,7 +739,11 @@ function App() {
         {current?.error && <div className="banner" role="alert">{current.error}</div>}
 
         {view === "gpu" ? (
-          <div className="dashboard-grid">
+          <div
+            className="dashboard-grid"
+            ref={dashboardRef}
+            style={{ gridTemplateColumns: `minmax(0, 1fr) 14px ${inspectorWidth}px` }}
+          >
             <section className="content-panel">
               <div className="section-heading">
                 <div>
@@ -737,6 +774,13 @@ function App() {
                 ))}
               </div>
             </section>
+            <div
+              className="splitter"
+              onMouseDown={startInspectorDrag}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize panels"
+            />
             <aside className="inspector">
               <Schedule
                 gpu={displayGPU}
