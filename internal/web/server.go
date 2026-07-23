@@ -521,6 +521,7 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 		}
 		args.ID = strings.TrimSpace(args.ID)
 		args.Mode = strings.TrimSpace(args.Mode)
+		args.User = strings.TrimSpace(args.User)
 		if _, managedClient := s.Client.(ManagedKeyNodeAPI); managedClient {
 			key, keyErr := s.Users.FixedKeyForUser(session.User)
 			if keyErr != nil {
@@ -537,6 +538,16 @@ func (s *Server) handleServerAction(w http.ResponseWriter, r *http.Request) {
 		if session.Role != RoleAdmin && allowArgsHaveWildcard(args) {
 			writeJSONError(w, http.StatusForbidden, "wildcard authorization requires admin access")
 			return
+		}
+		if args.Mode == model.ModePodman {
+			if args.User == "" {
+				writeJSONError(w, http.StatusBadRequest, "podman linux user is required")
+				return
+			}
+			if session.Role != RoleAdmin && !sameOwner(args.User, session.User) {
+				writeJSONError(w, http.StatusForbidden, "non-admin users may only authorize their own podman containers")
+				return
+			}
 		}
 		allowed, err := s.canUseKey(r.Context(), record, session, args.ID)
 		if err != nil {

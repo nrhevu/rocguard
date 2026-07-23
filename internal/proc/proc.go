@@ -78,7 +78,7 @@ func (r FSReader) Info(pid int) (model.ProcInfo, error) {
 		Cgroup:      strings.TrimSpace(string(cgroupBytes)),
 		StderrPath:  stderrPath,
 	}
-	info.ContainerID = ExtractContainerID(info.Cgroup)
+	info.ContainerRuntime, info.ContainerID = ExtractContainer(info.Cgroup)
 	return info, nil
 }
 
@@ -202,6 +202,7 @@ func parseUID(status string) int {
 
 var (
 	dockerCgroupPattern = regexp.MustCompile(`(?i)^/(?:docker/([0-9a-f]{64})(?:/.*)?|system\.slice/docker-([0-9a-f]{64})\.scope(?:/.*)?)$`)
+	podmanCgroupPattern = regexp.MustCompile(`(?i)(?:^|/)libpod-([0-9a-f]{64})(?:\.scope)?(?:/|$)`)
 	// A Kubernetes runtime owns the cgroup immediately beneath the pod cgroup.
 	// Descendants are delegated to the workload and cannot be trusted as
 	// container identity, even if their names resemble runtime scopes.
@@ -209,6 +210,11 @@ var (
 )
 
 func ExtractContainerID(cgroup string) string {
+	_, id := ExtractContainer(cgroup)
+	return id
+}
+
+func ExtractContainer(cgroup string) (string, string) {
 	for _, line := range strings.Split(cgroup, "\n") {
 		_, path, ok := strings.Cut(line, ":")
 		if !ok {
@@ -218,21 +224,31 @@ func ExtractContainerID(cgroup string) string {
 		if !ok {
 			continue
 		}
-		patterns := []*regexp.Regexp{dockerCgroupPattern}
-		if strings.HasPrefix(strings.TrimSpace(path), "/kubepods") {
-			patterns = append(patterns, k8sPodChildPattern)
+		path = strings.TrimSpace(path)
+		patterns := []struct {
+			runtime string
+			pattern *regexp.Regexp
+		}{
+			{model.ModeDocker, dockerCgroupPattern},
+			{model.ModePodman, podmanCgroupPattern},
 		}
-		for _, pattern := range patterns {
-			match := pattern.FindStringSubmatch(strings.TrimSpace(path))
+		if strings.HasPrefix(path, "/kubepods") {
+			patterns = append([]struct {
+				runtime string
+				pattern *regexp.Regexp
+			}{{model.ModeK8s, k8sPodChildPattern}}, patterns...)
+		}
+		for _, candidatePattern := range patterns {
+			match := candidatePattern.pattern.FindStringSubmatch(path)
 			if len(match) < 2 {
 				continue
 			}
 			for _, candidate := range match[1:] {
 				if candidate != "" {
-					return strings.ToLower(candidate)
+					return candidatePattern.runtime, strings.ToLower(candidate)
 				}
 			}
 		}
 	}
-	return ""
+	return "", ""
 }

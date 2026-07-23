@@ -2,7 +2,7 @@
 
 This guide runs a development node and web gateway on a host that may already
 run the production GPUardian daemon. The development environment uses separate
-ports, state, keys, sockets, cgroups, Docker project names, and web storage.
+ports, state, keys, sockets, cgroups, Compose project names, and web storage.
 
 This is the only supported plaintext/no-TLS workflow. Both development APIs
 use HTTP and bind browser access to host loopback. Production must instead
@@ -18,7 +18,7 @@ node or during a maintenance window.
 ## Requirements
 
 - The toolchains listed in [README.md](README.md#requirements)
-- Docker Engine with the Compose plugin
+- Docker Engine with the Compose plugin, or rootful Podman with a Compose provider
 - A production daemon on port `8192`, if one is already running
 - Ports `8193` and `18080` available for development
 
@@ -100,14 +100,22 @@ Expected separation:
 ## 4. Start the development web gateway
 
 The development Compose file builds the same hardened non-root image as the
-deployment files, but uses a separate Docker project, local `.dev/web` state,
+deployment files, but uses a separate Compose project, local `.dev/web` state,
 and loopback port `18080`. It also maps `host.docker.internal` to the Linux
-Docker host so the container can reach the development node API.
+container host so the gateway can reach the development node API.
 
 ```bash
 sudo docker compose -f compose.web-dev.yml up -d --build
 sudo docker compose -f compose.web-dev.yml ps
 sudo docker compose -f compose.web-dev.yml logs --tail=100 gateway
+```
+
+Podman uses the same file:
+
+```bash
+sudo podman compose -f compose.web-dev.yml up -d --build
+sudo podman compose -f compose.web-dev.yml ps
+sudo podman compose -f compose.web-dev.yml logs --tail=100 gateway
 ```
 
 Open [http://127.0.0.1:18080](http://127.0.0.1:18080). For development on a
@@ -163,6 +171,9 @@ Stop the web gateway:
 ```bash
 sudo docker compose -f compose.web-dev.yml down
 ```
+
+Use `sudo podman compose -f compose.web-dev.yml down` when Podman started the
+gateway.
 
 Stop the development daemon with `Ctrl-C` in its terminal. The production
 daemon remains running because it has a separate process, socket, state, and

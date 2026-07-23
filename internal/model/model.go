@@ -6,6 +6,7 @@ const (
 	ModeBare   = "bare"
 	ModeDocker = "docker"
 	ModeK8s    = "k8s"
+	ModePodman = "podman"
 	ModeUser   = "user"
 
 	TokenModeReserved = "reserved"
@@ -35,15 +36,16 @@ type GPUMetric struct {
 }
 
 type ProcInfo struct {
-	PID         int
-	StartTime   uint64
-	UID         int
-	Username    string
-	Cmdline     []string
-	CommandPath string
-	Cgroup      string
-	ContainerID string
-	StderrPath  string
+	PID              int
+	StartTime        uint64
+	UID              int
+	Username         string
+	Cmdline          []string
+	CommandPath      string
+	Cgroup           string
+	ContainerID      string
+	ContainerRuntime string
+	StderrPath       string
 }
 
 type Token struct {

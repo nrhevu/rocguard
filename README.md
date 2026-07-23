@@ -19,11 +19,11 @@ servers. It provides:
 
 - a root node daemon that observes GPU processes and enforces reservations;
 - a CLI for running and authorizing workloads; and
-- a Dockerized web gateway for accounts, scheduling, keys, and multiple nodes.
+- a containerized web gateway for accounts, scheduling, keys, and multiple nodes.
 
 GPUardian uses monitor-and-kill enforcement; it is not kernel-level device
-isolation. A user with root, sudo, or root-equivalent Docker access can bypass
-it.
+isolation. A user with root, sudo, or root-equivalent container-engine access
+can bypass it.
 
 This README is the complete production installation and user guide. Production
 requires HTTPS for both the node API and web gateway. For a production install
@@ -36,11 +36,11 @@ development environment, use [DEVELOPMENT.md](DEVELOPMENT.md).
 | Component | Where it runs | Manager | Port |
 | --- | --- | --- | --- |
 | `gpuardian daemon` | Every AMD or NVIDIA GPU node | systemd | HTTPS `8192` |
-| GPUardian web gateway | One gateway host | Docker Compose | HTTPS `8443` |
+| GPUardian web gateway | One gateway host | Docker or Podman Compose | HTTPS `8443` |
 
 The node daemon must run directly on the host because it reads `/proc`, uses
 the GPU vendor's SMI tooling, manages cgroups, and launches workloads. Only
-the web gateway runs in Docker.
+the web gateway runs in a container.
 
 ## Requirements
 
@@ -49,7 +49,9 @@ the web gateway runs in Docker.
   - AMD: ROCm tooling with a working `amd-smi` command
   - NVIDIA: the NVIDIA driver with a working `nvidia-smi` command
 - Root access on the GPU nodes and gateway host
-- Docker Engine with the Compose plugin on the gateway host
+- Docker Engine with the Compose plugin, or rootful Podman with a Compose
+  provider, on the gateway host
+- Podman on GPU nodes that run Podman workloads
 - OpenSSL
 - Go 1.25 or newer and Node.js LTS with npm for local builds
 - A CA capable of issuing TLS server certificates
@@ -84,6 +86,12 @@ npm --prefix web/ui run build
 go test ./...
 go build -buildvcs=false -o gpuardian ./cmd/gpuardian
 sudo docker compose -f compose.web.yml build
+```
+
+With Podman, replace the last command with:
+
+```bash
+sudo podman compose -f compose.web.yml build
 ```
 
 On every GPU node, from a repository checkout for the same revision, build and
@@ -251,6 +259,18 @@ sudo docker compose -f compose.web.yml ps
 sudo docker compose -f compose.web.yml logs --tail=100 gateway
 ```
 
+For a rootful Podman deployment, use the same Compose file:
+
+```bash
+sudo podman compose -f compose.web.yml up -d
+sudo podman compose -f compose.web.yml ps
+sudo podman compose -f compose.web.yml logs --tail=100 gateway
+```
+
+All later `docker compose` operations have the equivalent `podman compose`
+form. Production Podman runs rootful because the gateway binds state and TLS
+files from `/var/lib/gpuardian-web` and `/etc/gpuardian`.
+
 Store the displayed password in an approved password manager. To disable
 self-registration later, paste:
 
@@ -404,8 +424,8 @@ KEY=gk_xxx gpuardian run -- torchrun --nproc_per_node=8 train.py
 Everything after `--` is the workload command. Child processes inherit the
 authorization.
 
-Do not use `gpuardian run -- docker run ...`; Docker places the real workload
-in a different cgroup. Authorize the container instead:
+Do not wrap Docker or Podman with `gpuardian run`; the engine places the real
+workload in a different cgroup. Authorize the container instead:
 
 ```bash
 KEY=gk_xxx gpuardian allow docker --container trainer
@@ -415,8 +435,21 @@ Other exact authorization scopes:
 
 ```bash
 KEY=gk_xxx gpuardian allow k8s --namespace training
+KEY=gk_xxx gpuardian allow podman --container trainer
 KEY=gk_xxx gpuardian allow user --name alice
 ```
+
+The Podman command without `--user` inspects the caller's rootless Podman
+store. Root/admin can target another rootless store or rootful Podman:
+
+```bash
+KEY=gk_xxx gpuardian allow podman --container trainer --user alice
+sudo env KEY=gk_xxx gpuardian allow podman --container trainer --user root
+```
+
+In the web UI, Podman rules require the Linux user that owns the container.
+Regular users may enter only their matching GPUardian username; admins may
+select another Linux user.
 
 Use the narrowest exact scope possible. Wildcard scopes are admin-only because
 they can authorize more workloads than intended.
@@ -462,6 +495,7 @@ gpuardian register (--reserved | --claimed)
 KEY=... gpuardian run -- <command>
 KEY=... gpuardian allow docker --container <name-or-id>
 KEY=... gpuardian allow k8s --namespace <name>
+KEY=... gpuardian allow podman --container <name-or-id> [--user <linux-user>]
 KEY=... gpuardian allow user --name <name>
 KEY=... gpuardian status
 KEY=... gpuardian ps
@@ -514,6 +548,9 @@ Production Compose forces browser-facing HTTP and HTTP node endpoints off.
 ## Web gateway operations
 
 Run these commands from the repository root:
+
+Use `sudo podman compose` in place of `sudo docker compose` for a Podman
+deployment.
 
 ```bash
 # Status
@@ -568,8 +605,8 @@ Also remove the firewall rules for ports `8192` and `8443`.
 
 ## Development
 
-Development uses separate ports, keys, state, cgroups, and a no-TLS Docker
-Compose project. Follow [DEVELOPMENT.md](DEVELOPMENT.md). Never use the
+Development uses separate ports, keys, state, cgroups, and a no-TLS Compose
+project. Follow [DEVELOPMENT.md](DEVELOPMENT.md). Never use the
 development configuration for production. For a production install without TLS,
 see [docs/NO-TLS-INSTALL.md](docs/NO-TLS-INSTALL.md).
 

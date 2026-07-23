@@ -246,6 +246,39 @@ func TestGatewayFiltersAndAuthorizesOwnedKeys(t *testing.T) {
 	}
 }
 
+func TestGatewayPodmanOwnerAuthorization(t *testing.T) {
+	server, client, serverID := newAuthzServer(t)
+	handler := server.routes()
+	userCookie := testSessionCookie(t, server, "alice", RoleUser)
+	adminCookie := testSessionCookie(t, server, "admin", RoleAdmin)
+	endpoint := "/api/servers/" + serverID + "/allow"
+
+	for _, test := range []struct {
+		name   string
+		body   string
+		cookie *http.Cookie
+		status int
+	}{
+		{"missing owner", `{"id":"tok_alice","mode":"podman","container":"trainer"}`, userCookie, http.StatusBadRequest},
+		{"other owner", `{"id":"tok_alice","mode":"podman","container":"trainer","user":"bob"}`, userCookie, http.StatusForbidden},
+		{"own owner", `{"id":"tok_alice","mode":"podman","container":"trainer","user":"alice"}`, userCookie, http.StatusCreated},
+		{"admin owner", `{"id":"tok_alice","mode":"podman","container":"trainer","user":"bob"}`, adminCookie, http.StatusCreated},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := requestJSON(handler, http.MethodPost, endpoint, test.body, test.cookie)
+			if response.Code != test.status {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.allowed) != 2 || client.allowed[0].Mode != model.ModePodman ||
+		client.allowed[0].User != "alice" || client.allowed[1].User != "bob" {
+		t.Fatalf("podman allow args = %+v", client.allowed)
+	}
+}
+
 func TestFixedKeyAPIRestrictsRevealAndRegenerate(t *testing.T) {
 	server, _, _ := newAuthzServer(t)
 	if err := server.Users.InitializeFixedKeys(bytes.Repeat([]byte{0x33}, 32)); err != nil {

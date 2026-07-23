@@ -19,6 +19,7 @@ import (
 	"gpuardian/internal/enforce"
 	"gpuardian/internal/model"
 	"gpuardian/internal/protocol"
+	"gpuardian/internal/runtime"
 	"gpuardian/internal/store"
 	"gpuardian/internal/telemetry"
 )
@@ -84,6 +85,14 @@ func (daemonFakeRuntime) DockerContainerName(context.Context, string) (string, e
 	return "trainer", nil
 }
 
+func (daemonFakeRuntime) InspectPodmanContainer(context.Context, int, string) (runtime.PodmanContainer, error) {
+	return runtime.PodmanContainer{
+		ID:         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Name:       "trainer",
+		CgroupPath: "/user.slice/libpod-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.scope",
+	}, nil
+}
+
 func (daemonFakeRuntime) NamespaceForContainer(context.Context, string) (string, error) {
 	return "training", nil
 }
@@ -108,6 +117,10 @@ func (daemonMissingDockerRuntime) ResolveDockerContainer(context.Context, string
 
 func (daemonMissingDockerRuntime) DockerContainerName(context.Context, string) (string, error) {
 	return "future-container", nil
+}
+
+func (daemonMissingDockerRuntime) InspectPodmanContainer(context.Context, int, string) (runtime.PodmanContainer, error) {
+	return runtime.PodmanContainer{}, errors.New("container not found")
 }
 
 func (daemonMissingDockerRuntime) NamespaceForContainer(context.Context, string) (string, error) {
@@ -629,6 +642,40 @@ func TestNodeHTTPAllowCreatesAuthorization(t *testing.T) {
 	}
 }
 
+func TestNodeHTTPAllowCreatesPodmanAuthorization(t *testing.T) {
+	server := testServer(t)
+	key, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := server.Store.RegisterSoftToken(key, "alice", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(protocol.AllowArgs{
+		ID: token.ID, Mode: model.ModePodman, Container: "trainer", User: "root",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/allow", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.nodeHTTPHandler().ServeHTTP(response, req)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("podman allow status = %d, body=%s", response.Code, response.Body.String())
+	}
+	status, err := server.Store.KeyStatus(key, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Authorizations) != 1 || status.Authorizations[0].Mode != model.ModePodman ||
+		status.Authorizations[0].Username != "root" {
+		t.Fatalf("podman authorizations = %+v", status.Authorizations)
+	}
+}
+
 func TestClaimedMonitorRejectsRunGPUWhenBusy(t *testing.T) {
 	server := testServer(t)
 	key, err := server.Store.ReadOrCreateRootKey()
@@ -1047,6 +1094,76 @@ func TestDockerAllowRejectsContainerWhenResolutionFails(t *testing.T) {
 	}
 	if len(status.Authorizations) != 0 {
 		t.Fatalf("failed container resolution persisted authorization: %+v", status.Authorizations)
+	}
+}
+
+func TestPodmanAllowCreatesRootfulAndRootlessAuthorizations(t *testing.T) {
+	server := testServer(t)
+	key, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _, err := server.Store.RegisterSoftToken(key, "alice", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfulArgs, _ := json.Marshal(protocol.PodmanAllowArgs{Container: "trainer"})
+	result, err := server.dispatch(context.Background(), peer{}, protocol.Request{
+		ID: "1", Method: "allow_podman", Token: secret, Args: rootfulArgs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootful := result.(model.AllowResult)
+	if rootful.Mode != model.ModePodman || rootful.ContainerID == "" || rootful.Username != "root" {
+		t.Fatalf("unexpected rootful podman authorization: %+v", rootful)
+	}
+
+	currentUID := os.Getuid()
+	currentGID := os.Getgid()
+	rootlessArgs, _ := json.Marshal(protocol.PodmanAllowArgs{Container: "worker"})
+	result, err = server.dispatch(context.Background(), peer{UID: currentUID, GID: currentGID}, protocol.Request{
+		ID: "2", Method: "allow_podman", Token: secret, Args: rootlessArgs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootless := result.(model.AllowResult)
+	if rootless.Mode != model.ModePodman || rootless.ContainerID == "" || rootless.Username == "" {
+		t.Fatalf("unexpected rootless podman authorization: %+v", rootless)
+	}
+	status, err := server.Store.Status(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Authorizations) != 2 || status.Authorizations[1].UID != currentUID || status.Authorizations[1].GID < 0 {
+		t.Fatalf("podman owner identity was not persisted: %+v", status.Authorizations)
+	}
+}
+
+func TestPodmanAllowRestrictsNonRootOwnerAndWildcard(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("requires a non-root test process")
+	}
+	server := testServer(t)
+	key, err := server.Store.ReadOrCreateRootKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _, err := server.Store.RegisterSoftToken(key, "alice", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range []protocol.PodmanAllowArgs{
+		{Container: "trainer", User: "root"},
+		{Container: "trainer-*"},
+	} {
+		data, _ := json.Marshal(args)
+		if _, err := server.dispatch(context.Background(), peer{UID: os.Getuid(), GID: os.Getgid()}, protocol.Request{
+			ID: "1", Method: "allow_podman", Token: secret, Args: data,
+		}); err == nil {
+			t.Fatalf("non-root podman authorization unexpectedly accepted: %+v", args)
+		}
 	}
 }
 

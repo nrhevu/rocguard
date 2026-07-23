@@ -501,6 +501,16 @@ func (s *Server) dispatch(ctx context.Context, p peer, req protocol.Request) (an
 			return nil, err
 		}
 		return s.createK8sAuthorization(ctx, req.Token, token, tokenHash, p, args)
+	case "allow_podman":
+		token, tokenHash, err := s.validateToken(req.Token, now)
+		if err != nil {
+			return nil, err
+		}
+		var args protocol.PodmanAllowArgs
+		if err := json.Unmarshal(req.Args, &args); err != nil {
+			return nil, err
+		}
+		return s.createPodmanAuthorization(ctx, req.Token, token, tokenHash, p, args)
 	case "allow_user":
 		token, tokenHash, err := s.validateToken(req.Token, now)
 		if err != nil {
@@ -695,6 +705,95 @@ func (s *Server) createDockerAuthorization(ctx context.Context, tokenSecret stri
 		return model.AllowResult{}, err
 	}
 	return model.AllowResult{AuthorizationID: authorization.ID, Mode: authorization.Mode, ContainerID: containerID, ContainerPattern: containerPattern, ExpiresAt: timePtrIfSet(authorization.ExpiresAt)}, nil
+}
+
+func (s *Server) createPodmanAuthorization(ctx context.Context, tokenSecret string, token model.Token, tokenHash string, p peer, args protocol.PodmanAllowArgs) (model.AllowResult, error) {
+	if err := s.ensureTokenCanAuthorize(tokenHash, token, time.Now()); err != nil {
+		return model.AllowResult{}, err
+	}
+	container := strings.TrimSpace(args.Container)
+	if container == "" {
+		return model.AllowResult{}, errors.New("container is required")
+	}
+	if err := validateRequestValue("container", container); err != nil {
+		return model.AllowResult{}, err
+	}
+	requestedOwner := strings.TrimSpace(args.User)
+	if err := validateRequestValue("user", requestedOwner); err != nil {
+		return model.AllowResult{}, err
+	}
+	owner, uid, gid, err := podmanOwner(requestedOwner, p)
+	if err != nil {
+		return model.AllowResult{}, err
+	}
+	if hasWildcard(container) && p.UID != 0 {
+		return model.AllowResult{}, errors.New("wildcard authorization requires root/admin access")
+	}
+	var containerID string
+	var containerPattern string
+	if hasWildcard(container) {
+		containerPattern = container
+	} else {
+		release, err := s.acquireDockerResolve(ctx)
+		if err != nil {
+			return model.AllowResult{}, err
+		}
+		defer release()
+		resolved, err := s.Runtime.InspectPodmanContainer(ctx, uid, container)
+		if err != nil {
+			return model.AllowResult{}, fmt.Errorf("resolve podman container: %w", err)
+		}
+		containerID = resolved.ID
+	}
+	now := time.Now()
+	authorization := model.Authorization{
+		ID:               store.NewAuthorizationID(),
+		Mode:             model.ModePodman,
+		TokenHash:        tokenHash,
+		TokenMode:        store.NormalizeTokenMode(token.Mode),
+		TokenVersion:     token.Version,
+		Holder:           token.Name,
+		UID:              uid,
+		GID:              gid,
+		Username:         owner,
+		ContainerID:      containerID,
+		ContainerPattern: containerPattern,
+		CreatedAt:        now.UTC(),
+		ExpiresAt:        token.ExpiresAt,
+		Active:           true,
+	}
+	if err := s.persistAuthorization(tokenSecret, token, &authorization); err != nil {
+		return model.AllowResult{}, err
+	}
+	return model.AllowResult{
+		AuthorizationID: authorization.ID, Mode: authorization.Mode, ContainerID: containerID,
+		ContainerPattern: containerPattern, Username: owner, ExpiresAt: timePtrIfSet(authorization.ExpiresAt),
+	}, nil
+}
+
+func podmanOwner(name string, p peer) (string, int, int, error) {
+	var identity *user.User
+	var err error
+	if name == "" {
+		identity, err = user.LookupId(strconv.Itoa(p.UID))
+	} else {
+		identity, err = user.Lookup(name)
+	}
+	if err != nil {
+		return "", -1, -1, fmt.Errorf("lookup podman owner: %w", err)
+	}
+	uid, err := strconv.Atoi(identity.Uid)
+	if err != nil {
+		return "", -1, -1, fmt.Errorf("parse podman owner uid: %w", err)
+	}
+	gid, err := strconv.Atoi(identity.Gid)
+	if err != nil {
+		return "", -1, -1, fmt.Errorf("parse podman owner gid: %w", err)
+	}
+	if p.UID != 0 && uid != p.UID {
+		return "", -1, -1, errors.New("non-root callers may only authorize their own podman containers")
+	}
+	return identity.Username, uid, gid, nil
 }
 
 func (s *Server) acquireDockerResolve(ctx context.Context) (func(), error) {

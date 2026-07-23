@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gpuardian/internal/model"
 )
 
 func TestFSReaderInfoUsesExeAndStartTime(t *testing.T) {
@@ -103,6 +105,21 @@ func TestExtractContainerIDRequiresRuntimeOwnedCgroupShape(t *testing.T) {
 	cgroupFSNested := "0::/kubepods/burstable/pod-workload/" + id + "/docker-" + spoofed + ".scope"
 	if got := ExtractContainerID(cgroupFSNested); got != id {
 		t.Fatalf("cgroupfs delegated scope selected %q, want immediate pod child %q", got, id)
+	}
+}
+
+func TestExtractContainerRecognizesPodmanCgroups(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	for _, cgroup := range []string{
+		"0::/machine.slice/libpod-" + id + ".scope",
+		"0::/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-" + id + ".scope",
+		"0::/machine.slice/machine-libpod_pod_deadbeef.slice/libpod-" + id + ".scope",
+		"0::/libpod_parent/libpod-" + id,
+	} {
+		runtimeName, got := ExtractContainer(cgroup)
+		if runtimeName != model.ModePodman || got != id {
+			t.Fatalf("ExtractContainer(%q) = %q, %q; want podman, %q", cgroup, runtimeName, got, id)
+		}
 	}
 }
 

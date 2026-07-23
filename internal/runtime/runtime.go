@@ -6,33 +6,44 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"os/user"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 type Resolver interface {
 	ResolveDockerContainer(ctx context.Context, nameOrID string) (string, error)
 	DockerContainerName(ctx context.Context, containerID string) (string, error)
+	InspectPodmanContainer(ctx context.Context, uid int, nameOrID string) (PodmanContainer, error)
 	NamespaceForContainer(ctx context.Context, containerID string) (string, error)
 }
 
 var ErrNotFound = errors.New("runtime object not found")
+
+type PodmanContainer struct {
+	ID         string
+	Name       string
+	CgroupPath string
+}
 
 type CLIResolver struct {
 	Timeout time.Duration
 }
 
 type cacheEntry struct {
-	value     string
+	value     any
 	err       error
 	expiresAt time.Time
 }
 
 type resolveCall struct {
 	done  chan struct{}
-	value string
+	value any
 	err   error
 }
 
@@ -43,9 +54,11 @@ type CachedResolver struct {
 	mu              sync.Mutex
 	dockerIDs       map[string]cacheEntry
 	dockerNames     map[string]cacheEntry
+	podman          map[string]cacheEntry
 	namespaces      map[string]cacheEntry
 	dockerIDCalls   map[string]*resolveCall
 	dockerNameCalls map[string]*resolveCall
+	podmanCalls     map[string]*resolveCall
 	namespaceCalls  map[string]*resolveCall
 	now             func() time.Time
 }
@@ -90,36 +103,59 @@ func (b *boundedOutput) Write(data []byte) (int, error) {
 func NewCachedResolver(base Resolver) *CachedResolver {
 	return &CachedResolver{
 		Base:      base,
-		dockerIDs: make(map[string]cacheEntry), dockerNames: make(map[string]cacheEntry), namespaces: make(map[string]cacheEntry),
-		dockerIDCalls: make(map[string]*resolveCall), dockerNameCalls: make(map[string]*resolveCall), namespaceCalls: make(map[string]*resolveCall),
+		dockerIDs: make(map[string]cacheEntry), dockerNames: make(map[string]cacheEntry), podman: make(map[string]cacheEntry), namespaces: make(map[string]cacheEntry),
+		dockerIDCalls: make(map[string]*resolveCall), dockerNameCalls: make(map[string]*resolveCall), podmanCalls: make(map[string]*resolveCall), namespaceCalls: make(map[string]*resolveCall),
 		now: time.Now,
 	}
 }
 
 func (r *CachedResolver) ResolveDockerContainer(ctx context.Context, nameOrID string) (string, error) {
 	key := strings.TrimSpace(nameOrID)
-	return r.resolve(ctx, r.dockerIDs, r.dockerIDCalls, key, func() (string, error) {
+	value, err := r.resolve(ctx, r.dockerIDs, r.dockerIDCalls, key, func() (any, error) {
 		return r.Base.ResolveDockerContainer(ctx, nameOrID)
 	})
+	if err != nil {
+		return "", err
+	}
+	return value.(string), nil
 }
 
 func (r *CachedResolver) DockerContainerName(ctx context.Context, containerID string) (string, error) {
 	key := strings.ToLower(strings.TrimSpace(containerID))
-	return r.resolve(ctx, r.dockerNames, r.dockerNameCalls, key, func() (string, error) {
+	value, err := r.resolve(ctx, r.dockerNames, r.dockerNameCalls, key, func() (any, error) {
 		return r.Base.DockerContainerName(ctx, containerID)
 	})
+	if err != nil {
+		return "", err
+	}
+	return value.(string), nil
+}
+
+func (r *CachedResolver) InspectPodmanContainer(ctx context.Context, uid int, nameOrID string) (PodmanContainer, error) {
+	key := strconv.Itoa(uid) + ":" + strings.TrimSpace(nameOrID)
+	value, err := r.resolve(ctx, r.podman, r.podmanCalls, key, func() (any, error) {
+		return r.Base.InspectPodmanContainer(ctx, uid, nameOrID)
+	})
+	if err != nil {
+		return PodmanContainer{}, err
+	}
+	return value.(PodmanContainer), nil
 }
 
 func (r *CachedResolver) NamespaceForContainer(ctx context.Context, containerID string) (string, error) {
 	key := strings.ToLower(strings.TrimSpace(containerID))
-	return r.resolve(ctx, r.namespaces, r.namespaceCalls, key, func() (string, error) {
+	value, err := r.resolve(ctx, r.namespaces, r.namespaceCalls, key, func() (any, error) {
 		return r.Base.NamespaceForContainer(ctx, containerID)
 	})
+	if err != nil {
+		return "", err
+	}
+	return value.(string), nil
 }
 
-func (r *CachedResolver) resolve(ctx context.Context, cache map[string]cacheEntry, calls map[string]*resolveCall, key string, call func() (string, error)) (string, error) {
+func (r *CachedResolver) resolve(ctx context.Context, cache map[string]cacheEntry, calls map[string]*resolveCall, key string, call func() (any, error)) (any, error) {
 	if r == nil || r.Base == nil {
-		return "", errors.New("runtime resolver is unavailable")
+		return nil, errors.New("runtime resolver is unavailable")
 	}
 	now := r.nowTime()
 	r.mu.Lock()
@@ -137,7 +173,7 @@ func (r *CachedResolver) resolve(ctx context.Context, cache map[string]cacheEntr
 		case <-pending.done:
 			return pending.value, pending.err
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 	pending := &resolveCall{done: make(chan struct{})}
@@ -225,6 +261,47 @@ func (r CLIResolver) DockerContainerName(ctx context.Context, containerID string
 		return "", errors.New("docker inspect returned empty container name")
 	}
 	return name, nil
+}
+
+func (r CLIResolver) InspectPodmanContainer(ctx context.Context, uid int, nameOrID string) (PodmanContainer, error) {
+	nameOrID = strings.TrimSpace(nameOrID)
+	if nameOrID == "" {
+		return PodmanContainer{}, errors.New("container name/id is required")
+	}
+	if uid < 0 {
+		return PodmanContainer{}, errors.New("podman owner uid is invalid")
+	}
+	ctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+	out, err := limitedCommandOutputAs(ctx, uid, "podman", "container", "inspect", nameOrID)
+	if err != nil {
+		if commandReportsNotFound(err) {
+			return PodmanContainer{}, fmt.Errorf("%w: podman container", ErrNotFound)
+		}
+		return PodmanContainer{}, err
+	}
+	var rows []struct {
+		ID    string `json:"Id"`
+		Name  string `json:"Name"`
+		State struct {
+			CgroupPath string `json:"CgroupPath"`
+		} `json:"State"`
+	}
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return PodmanContainer{}, fmt.Errorf("decode podman inspect: %w", err)
+	}
+	if len(rows) != 1 {
+		return PodmanContainer{}, fmt.Errorf("podman inspect returned %d containers", len(rows))
+	}
+	id := strings.ToLower(strings.TrimSpace(rows[0].ID))
+	name := strings.TrimSpace(rows[0].Name)
+	if len(id) != 64 || !isHex(id) {
+		return PodmanContainer{}, errors.New("podman inspect returned invalid container id")
+	}
+	if name == "" {
+		return PodmanContainer{}, errors.New("podman inspect returned empty container name")
+	}
+	return PodmanContainer{ID: id, Name: name, CgroupPath: strings.TrimSpace(rows[0].State.CgroupPath)}, nil
 }
 
 func (r CLIResolver) NamespaceForContainer(ctx context.Context, containerID string) (string, error) {
@@ -324,9 +401,16 @@ func (r CLIResolver) withTimeout(ctx context.Context) (context.Context, context.
 }
 
 func limitedCommandOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return limitedCommandOutputAs(ctx, 0, name, args...)
+}
+
+func limitedCommandOutputAs(ctx context.Context, uid int, name string, args ...string) ([]byte, error) {
 	output := boundedOutput{limit: maxRuntimeOutputBytes}
 	errorOutput := boundedOutput{limit: maxRuntimeErrorBytes}
 	cmd := exec.CommandContext(ctx, name, args...)
+	if err := configureCommandForUID(cmd, uid); err != nil {
+		return nil, err
+	}
 	cmd.Stdout = &output
 	cmd.Stderr = &errorOutput
 	if err := cmd.Run(); err != nil {
@@ -338,6 +422,44 @@ func limitedCommandOutput(ctx context.Context, name string, args ...string) ([]b
 	return output.Bytes(), nil
 }
 
+func configureCommandForUID(cmd *exec.Cmd, uid int) error {
+	if uid != 0 {
+		identity, err := user.LookupId(strconv.Itoa(uid))
+		if err != nil {
+			return fmt.Errorf("lookup uid %d: %w", uid, err)
+		}
+		gid, err := strconv.ParseUint(identity.Gid, 10, 32)
+		if err != nil {
+			return fmt.Errorf("parse gid for uid %d: %w", uid, err)
+		}
+		groupIDs, err := identity.GroupIds()
+		if err != nil {
+			return fmt.Errorf("lookup groups for uid %d: %w", uid, err)
+		}
+		groups := make([]uint32, 0, len(groupIDs))
+		for _, value := range groupIDs {
+			group, err := strconv.ParseUint(value, 10, 32)
+			if err != nil {
+				return fmt.Errorf("parse group for uid %d: %w", uid, err)
+			}
+			groups = append(groups, uint32(group))
+		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
+			Uid: uint32(uid), Gid: uint32(gid), Groups: groups,
+		}}
+		cmd.Env = []string{
+			"HOME=" + identity.HomeDir,
+			"USER=" + identity.Username,
+			"LOGNAME=" + identity.Username,
+			"XDG_RUNTIME_DIR=/run/user/" + strconv.Itoa(uid),
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		}
+	} else {
+		cmd.Env = os.Environ()
+	}
+	return nil
+}
+
 func commandReportsNotFound(err error) bool {
 	var commandErr *commandError
 	if !errors.As(err, &commandErr) || commandErr.stderrExceeded {
@@ -347,11 +469,24 @@ func commandReportsNotFound(err error) bool {
 	switch commandErr.name {
 	case "docker":
 		return strings.Contains(stderr, "no such object") || strings.Contains(stderr, "no such container")
+	case "podman":
+		return strings.Contains(stderr, "no such container") ||
+			strings.Contains(stderr, "no container with name or id") ||
+			strings.Contains(stderr, "container does not exist")
 	case "crictl":
 		return strings.Contains(stderr, "code = notfound")
 	default:
 		return false
 	}
+}
+
+func isHex(value string) bool {
+	for _, char := range value {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func findNamespace(value any) string {

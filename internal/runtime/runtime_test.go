@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +26,12 @@ func TestCommandReportsNotFoundRequiresBoundedDefinitiveStderr(t *testing.T) {
 	}
 	if commandReportsNotFound(&commandError{name: "docker", err: errors.New("exit 1"), stderr: `context "prod" not found`}) {
 		t.Fatal("missing Docker context was classified as a missing container")
+	}
+	if !commandReportsNotFound(&commandError{name: "podman", err: errors.New("exit 125"), stderr: "Error: no container with name or ID trainer found"}) {
+		t.Fatal("definitive podman not-found error was not classified")
+	}
+	if commandReportsNotFound(&commandError{name: "podman", err: errors.New("exit 125"), stderr: "database is locked"}) {
+		t.Fatal("podman infrastructure error was classified as not found")
 	}
 	if !commandReportsNotFound(&commandError{name: "crictl", err: errors.New("exit 1"), stderr: "rpc error: code = NotFound desc = container missing"}) {
 		t.Fatal("definitive CRI NotFound status was not classified")
@@ -108,6 +118,8 @@ func TestFindNamespaceRejectsUntrustedNestedFields(t *testing.T) {
 type countingResolver struct {
 	dockerNameCalls int
 	onDockerName    func()
+	podmanCalls     map[int]int
+	podmanPath      string
 }
 
 func (r *countingResolver) ResolveDockerContainer(context.Context, string) (string, error) {
@@ -120,6 +132,14 @@ func (r *countingResolver) DockerContainerName(context.Context, string) (string,
 		r.onDockerName()
 	}
 	return "trainer", nil
+}
+
+func (r *countingResolver) InspectPodmanContainer(_ context.Context, uid int, _ string) (PodmanContainer, error) {
+	if r.podmanCalls == nil {
+		r.podmanCalls = make(map[int]int)
+	}
+	r.podmanCalls[uid]++
+	return PodmanContainer{ID: "id", Name: "trainer", CgroupPath: r.podmanPath}, nil
 }
 
 type blockingResolver struct {
@@ -143,6 +163,10 @@ func (r *blockingResolver) DockerContainerName(context.Context, string) (string,
 	}
 	<-r.release
 	return "trainer", nil
+}
+
+func (r *blockingResolver) InspectPodmanContainer(context.Context, int, string) (PodmanContainer, error) {
+	return PodmanContainer{ID: "id", Name: "trainer"}, nil
 }
 
 func (r *blockingResolver) NamespaceForContainer(context.Context, string) (string, error) {
@@ -225,4 +249,99 @@ func TestCachedResolverReusesAndExpiresLookup(t *testing.T) {
 	if base.dockerNameCalls != 2 {
 		t.Fatalf("runtime lookups after expiry = %d, want 2", base.dockerNameCalls)
 	}
+}
+
+func TestCachedResolverSeparatesPodmanOwners(t *testing.T) {
+	base := &countingResolver{}
+	resolver := NewCachedResolver(base)
+	for _, uid := range []int{1000, 1000, 1001} {
+		if _, err := resolver.InspectPodmanContainer(context.Background(), uid, "TRAINER"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if base.podmanCalls[1000] != 1 || base.podmanCalls[1001] != 1 {
+		t.Fatalf("podman cache calls = %+v, want one lookup per uid", base.podmanCalls)
+	}
+}
+
+func TestCachedResolverRefreshesPodmanCgroupAfterExpiry(t *testing.T) {
+	now := time.Unix(100, 0)
+	base := &countingResolver{podmanPath: "/old"}
+	resolver := NewCachedResolver(base)
+	resolver.TTL = time.Second
+	resolver.now = func() time.Time { return now }
+	first, err := resolver.InspectPodmanContainer(context.Background(), 1000, "trainer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.podmanPath = "/new"
+	cached, err := resolver.InspectPodmanContainer(context.Background(), 1000, "trainer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	refreshed, err := resolver.InspectPodmanContainer(context.Background(), 1000, "trainer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.CgroupPath != "/old" || cached.CgroupPath != "/old" || refreshed.CgroupPath != "/new" {
+		t.Fatalf("podman cgroup cache: first=%q cached=%q refreshed=%q", first.CgroupPath, cached.CgroupPath, refreshed.CgroupPath)
+	}
+}
+
+func TestCLIResolverInspectsPodmanContainer(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	cgroup := "/user.slice/libpod-" + id + ".scope"
+	bin := filepath.Join(t.TempDir(), "podman")
+	script := "#!/bin/sh\nprintf '%s' '[{\"Id\":\"" + id + "\",\"Name\":\"trainer\",\"State\":{\"CgroupPath\":\"" + cgroup + "\"}}]'\n"
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(bin)+":"+os.Getenv("PATH"))
+	container, err := (CLIResolver{}).InspectPodmanContainer(context.Background(), 0, "trainer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if container.ID != id || container.Name != "trainer" || container.CgroupPath != cgroup {
+		t.Fatalf("podman inspect = %+v", container)
+	}
+}
+
+func TestConfigureCommandForUIDUsesRootlessIdentity(t *testing.T) {
+	uid := os.Getuid()
+	cmd := exec.Command("true")
+	if err := configureCommandForUID(cmd, uid); err != nil {
+		t.Fatal(err)
+	}
+	if uid == 0 {
+		if cmd.SysProcAttr != nil && cmd.SysProcAttr.Credential != nil {
+			t.Fatal("root command unexpectedly changed credentials")
+		}
+		return
+	}
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential == nil || int(cmd.SysProcAttr.Credential.Uid) != uid {
+		t.Fatalf("command credentials = %+v, want uid %d", cmd.SysProcAttr, uid)
+	}
+	wantRuntime := "XDG_RUNTIME_DIR=/run/user/" + strconv.Itoa(uid)
+	if !containsString(cmd.Env, wantRuntime) || !containsPrefix(cmd.Env, "HOME=") || !containsPrefix(cmd.Env, "USER=") {
+		t.Fatalf("rootless podman environment = %q", cmd.Env)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsPrefix(values []string, prefix string) bool {
+	for _, value := range values {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
 }

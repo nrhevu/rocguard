@@ -23,6 +23,8 @@ def parse_args():
     parser.add_argument("--no-auto-bypass", action="store_true", help="Do not bypass pre-existing GPU PIDs.")
     parser.add_argument("--docker-image", default="", help="Optional ROCm/PyTorch image for Docker test.")
     parser.add_argument("--docker-sudo", action="store_true", help="Run docker commands through sudo.")
+    parser.add_argument("--podman-image", default="", help="Optional ROCm/PyTorch image for Podman test.")
+    parser.add_argument("--podman-sudo", action="store_true", help="Run rootful podman commands through sudo.")
     parser.add_argument("--k8s-namespace", default="", help="Optional namespace for K8s test.")
     parser.add_argument("--k8s-image", default="", help="Optional ROCm/PyTorch image for K8s pod test.")
     parser.add_argument("--k8s-gpu-resource", default="amd.com/gpu", help="K8s GPU resource name.")
@@ -41,7 +43,7 @@ def parse_args():
         raise SystemExit("--children must be between 0 and 64")
     if not args.key:
         raise SystemExit("KEY token is required; export KEY=gk_... (secrets are not accepted in command-line arguments)")
-    needs_root_key = not args.no_auto_bypass or bool(args.docker_image) or bool(args.k8s_namespace and args.k8s_image)
+    needs_root_key = not args.no_auto_bypass or bool(args.docker_image) or bool(args.podman_image) or bool(args.k8s_namespace and args.k8s_image)
     if needs_root_key and not args.root_key:
         raise SystemExit("ROOT_KEY is required for auto-bypass and cleanup; export ROOT_KEY=rk_...")
     return args
@@ -94,9 +96,14 @@ def main():
         test_child_processes(args, root, gpuardian, token_env)
 
         if args.docker_image:
-            test_docker(args, root, gpuardian, clean_env, token_env, root_env)
+            test_container(args, root, gpuardian, clean_env, token_env, root_env, "docker", args.docker_image, args.docker_sudo)
         else:
             print("[skip] docker: pass --docker-image <rocm-pytorch-image> to run")
+
+        if args.podman_image:
+            test_container(args, root, gpuardian, clean_env, token_env, root_env, "podman", args.podman_image, args.podman_sudo)
+        else:
+            print("[skip] podman: pass --podman-image <rocm-pytorch-image> to run")
 
         if args.k8s_namespace and args.k8s_image:
             test_k8s(args, gpuardian, clean_env, token_env, root_env)
@@ -235,20 +242,19 @@ def test_child_processes(args, root, gpuardian, env):
     )
 
 
-def docker_cmd(args):
-    prefix = ["sudo"] if args.docker_sudo else []
-    return prefix + ["docker"]
-
-
-def test_docker(args, root, gpuardian, clean_env, token_env, root_env):
-    print("[test] docker container authorization")
+def test_container(args, root, gpuardian, clean_env, token_env, root_env, engine, image, use_sudo):
+    print(f"[test] {engine} container authorization")
+    command = (["sudo"] if use_sudo else []) + [engine]
     name = f"gpuardian-it-{os.getpid()}"
     mount = f"{root}:/work:ro"
     allow = {}
     try:
-        run(docker_cmd(args) + ["rm", "-f", name], env=clean_env, check=False)
+        run(command + ["rm", "-f", name], env=clean_env, check=False)
+        groups = ["--group-add", "keep-groups"] if engine == "podman" and not use_sudo else [
+            "--group-add", "video", "--group-add", "render"
+        ]
         run(
-            docker_cmd(args)
+            command
             + [
                 "run",
                 "-d",
@@ -256,30 +262,32 @@ def test_docker(args, root, gpuardian, clean_env, token_env, root_env):
                 name,
                 "--device=/dev/kfd",
                 "--device=/dev/dri",
-                "--group-add",
-                "video",
-                "--group-add",
-                "render",
+            ]
+            + groups
+            + [
                 "-v",
                 mount,
                 "-w",
                 "/work",
                 "--entrypoint",
                 "sleep",
-                args.docker_image,
+                image,
                 "infinity",
             ],
             env=clean_env,
         )
-        allow = run_json([gpuardian, "allow", "docker", "--container", name], env=token_env)
+        allow_cmd = [gpuardian, "allow", engine, "--container", name]
+        if engine == "podman" and use_sudo:
+            allow_cmd += ["--user", "root"]
+        allow = run_json(allow_cmd, env=token_env)
         run(
-            docker_cmd(args) + ["exec", name, "python3", "scripts/hold_gpu.py"] + hold_args(args, args.gpu_list[0]),
+            command + ["exec", name, "python3", "scripts/hold_gpu.py"] + hold_args(args, args.gpu_list[0]),
             env=clean_env,
         )
     finally:
         if allow.get("authorization_id"):
             run([gpuardian, "revoke", allow["authorization_id"]], env=root_env, check=False)
-        run(docker_cmd(args) + ["rm", "-f", name], env=clean_env, check=False)
+        run(command + ["rm", "-f", name], env=clean_env, check=False)
 
 
 def test_k8s(args, gpuardian, clean_env, token_env, root_env):

@@ -2076,12 +2076,13 @@ function AllowKeyModal({ token, rules, onClose, onSubmit, onRemove }) {
 }
 
 function AddRuleModal({ onClose, onSubmit }) {
-  const [form, setForm] = useState({ mode: "docker", value: "" });
+  const [form, setForm] = useState({ mode: "docker", value: "", user: "" });
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const modeFields = {
     docker: { by: "Container name", placeholder: "trainer or trainer-*", key: "container" },
     k8s: { by: "Namespace", placeholder: "training or training-*", key: "namespace" },
+    podman: { by: "Container name", placeholder: "trainer or trainer-*", key: "container" },
     user: { by: "User", placeholder: "alice or team-*", key: "user" },
   };
   const field = modeFields[form.mode] || modeFields.docker;
@@ -2096,10 +2097,19 @@ function AddRuleModal({ onClose, onSubmit }) {
       setError("Value is required");
       return;
     }
+    const owner = form.user.trim();
+    if (form.mode === "podman" && !owner) {
+      setError("Linux user is required");
+      return;
+    }
     setPending(true);
     setError("");
     try {
-      await onSubmit({ mode: form.mode, [field.key]: value });
+      await onSubmit({
+        mode: form.mode,
+        [field.key]: value,
+        ...(form.mode === "podman" ? { user: owner } : {}),
+      });
     } catch (err) {
       setError(err.message);
       setPending(false);
@@ -2116,11 +2126,12 @@ function AddRuleModal({ onClose, onSubmit }) {
               value={form.mode}
               onChange={(event) => {
                 setError("");
-                setForm({ mode: event.target.value, value: "" });
+                setForm({ mode: event.target.value, value: "", user: "" });
               }}
             >
               <option value="docker">Docker</option>
               <option value="k8s">Kubernetes</option>
+              <option value="podman">Podman</option>
               <option value="user">Linux</option>
             </select>
           </label>
@@ -2138,6 +2149,17 @@ function AddRuleModal({ onClose, onSubmit }) {
             />
           </label>
         </div>
+        {form.mode === "podman" && (
+          <label>
+            Linux user
+            <input
+              value={form.user}
+              onChange={(event) => setForm({ ...form, user: event.target.value })}
+              placeholder="alice or root"
+              autoComplete="username"
+            />
+          </label>
+        )}
         {error && <div className="form-warning">{error}</div>}
         <div className="modal-actions">
           <button type="button" className="small-button" onClick={onClose} disabled={pending}>Cancel</button>
@@ -2152,6 +2174,7 @@ function authorizationRuleScope(mode) {
   return {
     docker: "Docker",
     k8s: "Kubernetes",
+    podman: "Podman",
     user: "Linux",
     bare: "Process",
   }[mode] || mode;
@@ -2161,6 +2184,7 @@ function authorizationRuleBy(mode) {
   return {
     docker: "Container name",
     k8s: "Namespace",
+    podman: "Linux user / container",
     user: "User",
     bare: "Command",
   }[mode] || "";
@@ -2178,6 +2202,10 @@ function authorizationRuleValue(rule) {
   }
   if (rule.mode === "k8s") {
     return rule.namespace || "Kubernetes namespace";
+  }
+  if (rule.mode === "podman") {
+    const container = rule.container_pattern || rule.container_id || "Podman container";
+    return rule.username ? `${rule.username}: ${container}` : container;
   }
   if (rule.mode === "user") {
     return rule.username || `UID ${rule.uid}`;

@@ -74,6 +74,7 @@ func (f fakeProc) Info(pid int) (model.ProcInfo, error) {
 type fakeRuntime struct {
 	namespaces map[string]string
 	names      map[string]string
+	podmanErr  error
 }
 
 type notFoundRuntime struct{}
@@ -84,6 +85,10 @@ func (notFoundRuntime) ResolveDockerContainer(context.Context, string) (string, 
 
 func (notFoundRuntime) DockerContainerName(context.Context, string) (string, error) {
 	return "", runtime.ErrNotFound
+}
+
+func (notFoundRuntime) InspectPodmanContainer(context.Context, int, string) (runtime.PodmanContainer, error) {
+	return runtime.PodmanContainer{}, runtime.ErrNotFound
 }
 
 func (notFoundRuntime) NamespaceForContainer(context.Context, string) (string, error) {
@@ -100,6 +105,17 @@ func (f fakeRuntime) DockerContainerName(_ context.Context, id string) (string, 
 		return "", errors.New("missing container name")
 	}
 	return name, nil
+}
+
+func (f fakeRuntime) InspectPodmanContainer(_ context.Context, _ int, id string) (runtime.PodmanContainer, error) {
+	if f.podmanErr != nil {
+		return runtime.PodmanContainer{}, f.podmanErr
+	}
+	name, ok := f.names[id]
+	if !ok {
+		return runtime.PodmanContainer{}, errors.New("missing podman container")
+	}
+	return runtime.PodmanContainer{ID: id, Name: name, CgroupPath: "/libpod-" + id + ".scope"}, nil
 }
 
 func (f fakeRuntime) NamespaceForContainer(_ context.Context, id string) (string, error) {
@@ -963,6 +979,18 @@ func TestHardReservationAllowsMatchingAuthorizationScopes(t *testing.T) {
 			runtime: fakeRuntime{namespaces: map[string]string{containerID: "training"}},
 		},
 		{
+			name: "podman",
+			auth: authorization("auth_podman", "hash_reserved", model.TokenModeReserved, model.ModePodman, func(a *model.Authorization) {
+				a.UID = 1000
+				a.ContainerID = containerID
+			}),
+			info: model.ProcInfo{
+				PID: 10, ContainerRuntime: model.ModePodman, ContainerID: containerID,
+				Cgroup: "0::/libpod-" + containerID + ".scope",
+			},
+			runtime: fakeRuntime{names: map[string]string{containerID: "trainer"}},
+		},
+		{
 			name: "user",
 			auth: authorization("auth_user", "hash_reserved", model.TokenModeReserved, model.ModeUser, func(a *model.Authorization) {
 				a.UID = 1000
@@ -984,6 +1012,18 @@ func TestHardReservationAllowsMatchingAuthorizationScopes(t *testing.T) {
 			}),
 			info:    model.ProcInfo{PID: 10, ContainerID: containerID},
 			runtime: fakeRuntime{names: map[string]string{containerID: "future-container"}},
+		},
+		{
+			name: "podman wildcard",
+			auth: authorization("auth_podman_wildcard", "hash_reserved", model.TokenModeReserved, model.ModePodman, func(a *model.Authorization) {
+				a.UID = 1000
+				a.ContainerPattern = "codex*"
+			}),
+			info: model.ProcInfo{
+				PID: 10, ContainerRuntime: model.ModePodman, ContainerID: containerID,
+				Cgroup: "0::/libpod-" + containerID + ".scope",
+			},
+			runtime: fakeRuntime{names: map[string]string{containerID: "codex-worker"}},
 		},
 		{
 			name: "k8s wildcard",
@@ -1031,6 +1071,66 @@ func TestHardReservationAllowsMatchingAuthorizationScopes(t *testing.T) {
 				t.Fatalf("unexpected decisions=%+v killed=%v", decisions, killer.killed)
 			}
 		})
+	}
+}
+
+func TestPodmanAuthorizationRejectsSpoofedCgroupAndReportsResolverFailure(t *testing.T) {
+	containerID := strings.Repeat("a", 64)
+	authorization := model.Authorization{
+		ID: "auth_podman", Mode: model.ModePodman, UID: 1000, ContainerID: containerID, Active: true,
+	}
+	info := model.ProcInfo{
+		ContainerRuntime: model.ModePodman,
+		ContainerID:      containerID,
+		Cgroup:           "0::/attacker/libpod-" + containerID + ".scope",
+	}
+	authorizer := Authorizer{Runtime: fakeRuntime{names: map[string]string{containerID: "trainer"}}}
+	matched, err := authorizer.authorizationScopeMatchesForEviction(context.Background(), authorization, info)
+	if err != nil || matched {
+		t.Fatalf("spoofed podman cgroup matched=%v err=%v", matched, err)
+	}
+
+	authorizer.Runtime = fakeRuntime{podmanErr: errors.New("podman unavailable")}
+	if _, err := authorizer.authorizationScopeMatchesForEviction(context.Background(), authorization, info); err == nil {
+		t.Fatal("podman resolver failure was treated as a definitive mismatch")
+	}
+
+	dockerAuthorization := authorization
+	dockerAuthorization.Mode = model.ModeDocker
+	dockerAuthorization.ContainerID = containerID
+	if matched, err := (Authorizer{}).authorizationScopeMatchesForEviction(context.Background(), dockerAuthorization, info); err != nil || matched {
+		t.Fatalf("podman cgroup borrowed docker authorization: matched=%v err=%v", matched, err)
+	}
+}
+
+func TestPodmanResolverFailureDoesNotKill(t *testing.T) {
+	containerID := strings.Repeat("a", 64)
+	killer := &fakeKiller{}
+	authorizer := Authorizer{
+		Proc: fakeProc{infos: map[int]model.ProcInfo{10: {
+			PID: 10, StartTime: 10, ContainerRuntime: model.ModePodman, ContainerID: containerID,
+			Cgroup: "0::/libpod-" + containerID + ".scope",
+		}}},
+		Runtime: fakeRuntime{podmanErr: errors.New("podman unavailable")},
+		Killer:  killer,
+		Now:     fixedNow,
+	}
+	state := model.State{
+		Tokens:       []model.Token{token("hash_reserved", model.TokenModeReserved)},
+		Reservations: []model.Reservation{reservation("hash_reserved", 0)},
+		Authorizations: []model.Authorization{authorization(
+			"auth_podman", "hash_reserved", model.TokenModeReserved, model.ModePodman,
+			func(a *model.Authorization) {
+				a.UID = 1000
+				a.ContainerID = containerID
+			},
+		)},
+	}
+	if _, err := authorizer.Enforce(context.Background(), state, []model.GPUProcess{gpuProcess(0, 10)}); err == nil {
+		t.Fatal("podman resolver failure was not reported")
+	}
+	if len(killer.killed) != 0 {
+		t.Fatalf("podman resolver failure killed processes: %v", killer.killed)
 	}
 }
 

@@ -1075,6 +1075,9 @@ func (a Authorizer) authorizationScopeMatchesForEviction(ctx context.Context, au
 	case model.ModeBare:
 		return bareCgroupMatches(info.Cgroup, authorization.CgroupRel, authorization.CgroupPath), nil
 	case model.ModeDocker:
+		if info.ContainerRuntime != "" && info.ContainerRuntime != model.ModeDocker {
+			return false, nil
+		}
 		if authorization.ContainerPattern != "" {
 			if info.ContainerID == "" {
 				return false, nil
@@ -1092,7 +1095,12 @@ func (a Authorizer) authorizationScopeMatchesForEviction(ctx context.Context, au
 			return wildcardMatch(authorization.ContainerPattern, name), nil
 		}
 		return sameContainer(info.ContainerID, authorization.ContainerID), nil
+	case model.ModePodman:
+		return a.podmanScopeMatches(ctx, authorization.UID, authorization.ContainerID, authorization.ContainerPattern, info)
 	case model.ModeK8s:
+		if info.ContainerRuntime != "" && info.ContainerRuntime != model.ModeK8s {
+			return false, nil
+		}
 		if info.ContainerID == "" {
 			return false, nil
 		}
@@ -1173,7 +1181,12 @@ func (a Authorizer) leaseScopeMatchesForEviction(ctx context.Context, lease mode
 	case model.ModeBare:
 		return bareCgroupMatches(info.Cgroup, lease.CgroupRel, lease.CgroupPath), nil
 	case model.ModeDocker:
+		if info.ContainerRuntime != "" && info.ContainerRuntime != model.ModeDocker {
+			return false, nil
+		}
 		return sameContainer(info.ContainerID, lease.ContainerID), nil
+	case model.ModePodman:
+		return a.podmanScopeMatches(ctx, lease.UID, lease.ContainerID, "", info)
 	case model.ModeK8s:
 		if info.ContainerID == "" {
 			return false, nil
@@ -1192,6 +1205,35 @@ func (a Authorizer) leaseScopeMatchesForEviction(ctx context.Context, lease mode
 	default:
 		return false, nil
 	}
+}
+
+func (a Authorizer) podmanScopeMatches(ctx context.Context, uid int, containerID, pattern string, info model.ProcInfo) (bool, error) {
+	if info.ContainerRuntime != model.ModePodman || info.ContainerID == "" {
+		return false, nil
+	}
+	if a.Runtime == nil {
+		return false, errors.New("resolve podman scope: runtime resolver is unavailable")
+	}
+	container, err := a.Runtime.InspectPodmanContainer(ctx, uid, info.ContainerID)
+	if err != nil {
+		if errors.Is(err, runtime.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("resolve podman scope: %w", err)
+	}
+	if !sameContainer(info.ContainerID, container.ID) {
+		return false, errors.New("resolve podman scope: inspect returned a different container id")
+	}
+	if container.CgroupPath == "" {
+		return false, errors.New("resolve podman scope: inspect returned an empty cgroup path")
+	}
+	if !bareCgroupMatches(info.Cgroup, container.CgroupPath, "") {
+		return false, nil
+	}
+	if pattern != "" {
+		return wildcardMatch(pattern, container.Name), nil
+	}
+	return sameContainer(info.ContainerID, containerID), nil
 }
 
 func bareCgroupMatches(raw, relative, absolute string) bool {

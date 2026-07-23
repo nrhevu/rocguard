@@ -22,7 +22,7 @@ Three components share a single Go module (`module gpuardian`, Go 1.25):
 2. **CLI** (`cmd/gpuardian`) — `run`, `allow`, `status`, `ps`, `register`,
    `token info`, `show-keys`, `bypass`, `revoke`. Single binary shared by
    daemon and CLI; subcommand dispatch is in `cmd/gpuardian/main.go`.
-3. **Web gateway** (`internal/web`) — Dockerized, non-root (UID/GID `65532`),
+3. **Web gateway** (`internal/web`) — containerized, non-root (UID/GID `65532`),
    serves accounts, scheduling, keys, fleet of nodes. Port `8443` (prod) or
    loopback `18080` (dev). Frontend is a React 19 + Vite SPA in `web/ui/`.
 4. **MCP server** (`mcp/gpuardian_mcp`) — Python 3.11+ stdio server that
@@ -80,6 +80,7 @@ cd mcp && python3 -m venv .venv && .venv/bin/pip install -e .
 # Gateway image
 sudo docker compose -f compose.web.yml build        # prod
 sudo docker compose -f compose.web-dev.yml up -d --build   # dev
+# The same files also support rootful `sudo podman compose`.
 ```
 
 There is no separate lint config in the repo; `go vet ./...` and `go test
@@ -150,9 +151,9 @@ has no test suite; verify it against a running gateway by hand.
 - **Dev and prod share `/var/lib/gpuardian-web` as a bind mount path inside
   the container** but dev points the host side at `.dev/web`. Don't confuse
   the two — dev state must stay under `.dev/`.
-- **`gpuardian run -- docker run ...` is unsupported.** Docker puts the
-  workload in a different cgroup; authorize the container instead with
-  `gpuardian allow docker --container <name>`. Keep this invariant in any
+- **Wrapping Docker or Podman with `gpuardian run` is unsupported.** The
+  engine puts the workload in a different cgroup; use `gpuardian allow
+  docker` or `gpuardian allow podman` instead. Keep this invariant in any
   enforcement changes.
 - **Command-path bypasses are UID-0 only** (unprivileged mount namespaces can
   spoof executable paths). Prefer PID bypasses. See `bypass` in `main.go`.

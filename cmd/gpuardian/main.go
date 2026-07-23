@@ -262,7 +262,7 @@ func runCommand(cfg config.Config, args []string) error {
 
 func allowCommand(cfg config.Config, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: KEY=... gpuardian allow (docker|k8s|user) ...")
+		return errors.New("usage: KEY=... gpuardian allow (docker|k8s|podman|user) ...")
 	}
 	switch args[0] {
 	case "docker":
@@ -281,6 +281,15 @@ func allowCommand(cfg config.Config, args []string) error {
 			return err
 		}
 		return printRPC(cfg, "allow_k8s", requiredToken(), protocol.K8sAllowArgs{Namespace: *namespace})
+	case "podman":
+		fs := flag.NewFlagSet("allow podman", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		container := fs.String("container", "", "container name or id")
+		username := fs.String("user", "", "linux user owning the rootless podman store")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return printRPC(cfg, "allow_podman", requiredToken(), protocol.PodmanAllowArgs{Container: *container, User: *username})
 	case "user":
 		fs := flag.NewFlagSet("allow user", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)
@@ -679,6 +688,7 @@ func usageText() string {
   KEY=... gpuardian run -- <command>
   KEY=... gpuardian allow docker --container <name-or-id>
   KEY=... gpuardian allow k8s --namespace <name>
+  KEY=... gpuardian allow podman --container <name-or-id> [--user <linux-user>]
   KEY=... gpuardian allow user --name <name>
   KEY=... gpuardian status  (root may omit KEY)
   KEY=... gpuardian ps      (root may omit KEY)

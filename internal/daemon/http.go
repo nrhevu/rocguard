@@ -357,6 +357,13 @@ func (s *Server) handleNodeAllow(w http.ResponseWriter, r *http.Request, rootKey
 		} else {
 			result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_k8s", protocol.K8sAllowArgs{Namespace: args.Namespace}, secret))
 		}
+	case model.ModePodman:
+		podmanArgs := protocol.PodmanAllowArgs{Container: args.Container, User: args.User}
+		if managed {
+			result, err = s.createPodmanAuthorization(r.Context(), "", token, token.Hash, peer{}, podmanArgs)
+		} else {
+			result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_podman", podmanArgs, secret))
+		}
 	case model.ModeUser:
 		if managed {
 			result, err = s.createUserAuthorization("", token, token.Hash, peer{}, protocol.UserAllowArgs{User: args.User})
@@ -364,7 +371,7 @@ func (s *Server) handleNodeAllow(w http.ResponseWriter, r *http.Request, rootKey
 			result, err = s.dispatch(r.Context(), peer{}, protocolRequest("allow_user", protocol.UserAllowArgs{User: args.User}, secret))
 		}
 	default:
-		writeHTTPError(w, http.StatusBadRequest, "mode must be docker, k8s, or user")
+		writeHTTPError(w, http.StatusBadRequest, "mode must be docker, k8s, podman, or user")
 		return
 	}
 	if err != nil {

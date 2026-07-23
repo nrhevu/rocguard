@@ -90,6 +90,7 @@ func TestUsageTextShowsOnlyCurrentCommands(t *testing.T) {
 		"gpuardian register (--reserved | --claimed)",
 		"KEY=... gpuardian run -- <command>",
 		"KEY=... gpuardian allow docker --container <name-or-id>",
+		"KEY=... gpuardian allow podman --container <name-or-id> [--user <linux-user>]",
 		"KEY=... gpuardian allow user --name <name>",
 		"ROOT_KEY=... gpuardian show-keys",
 	} {
@@ -102,7 +103,6 @@ func TestUsageTextShowsOnlyCurrentCommands(t *testing.T) {
 		"--" + "hard",
 		"--" + "soft",
 		"--" + "gpu",
-		"--" + "user",
 		"gpuardian " + "docker allow",
 		"gpuardian " + "k8s allow",
 	} {

@@ -50,6 +50,11 @@ type DockerAllowArgs struct {
 	Container string `json:"container"`
 }
 
+type PodmanAllowArgs struct {
+	Container string `json:"container"`
+	User      string `json:"user,omitempty"`
+}
+
 type K8sAllowArgs struct {
 	Namespace string `json:"namespace"`
 }
