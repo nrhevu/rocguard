@@ -389,6 +389,61 @@ func (s *Store) DropProvisioningSession(ctx context.Context, id string) error {
 	return err
 }
 
+// ReconcileOpenSessions closes scheduled or active history sessions that are
+// absent from the node's current reservation snapshot. Missing end telemetry
+// can otherwise leave a session looking active after the node has already
+// removed it.
+func (s *Store) ReconcileOpenSessions(ctx context.Context, serverID string, liveGroupIDs []string, observedAt time.Time) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if strings.TrimSpace(serverID) == "" || observedAt.IsZero() {
+		return errors.New("reservation reconciliation requires server id and observation time")
+	}
+	live := make(map[string]bool, len(liveGroupIDs))
+	for _, groupID := range liveGroupIDs {
+		if groupID = strings.TrimSpace(groupID); groupID != "" {
+			live[groupID] = true
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	at := millis(observedAt.UTC())
+	rows, err := tx.QueryContext(ctx, `SELECT session_id,group_id FROM reservation_sessions
+		WHERE server_id=? AND provisioning=0 AND revoked_at_ms IS NULL AND finalized_at_ms IS NULL AND expires_at_ms>?`, serverID, at)
+	if err != nil {
+		return err
+	}
+	var missing []string
+	for rows.Next() {
+		var sessionID, groupID string
+		if err := rows.Scan(&sessionID, &groupID); err != nil {
+			rows.Close()
+			return err
+		}
+		if !live[groupID] {
+			missing = append(missing, sessionID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, sessionID := range missing {
+		if _, err := tx.ExecContext(ctx, `UPDATE reservation_sessions
+			SET revoked_at_ms=?,finalized_at_ms=?,history_quality='partial',updated_at_ms=?
+			WHERE session_id=? AND revoked_at_ms IS NULL AND finalized_at_ms IS NULL`, at, at, at, sessionID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func scanSession(scanner interface{ Scan(...any) error }) (Session, error) {
 	var item Session
 	var ownerEditable bool

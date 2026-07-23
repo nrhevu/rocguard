@@ -688,6 +688,15 @@ func (s *Server) fetchFleetSnapshot(ctx context.Context) (fleetSnapshot, error) 
 				} else if err := budget.accept(snapshot); err != nil {
 					item.Error = err.Error()
 				} else {
+					if s.History != nil {
+						groups := make([]string, 0, len(snapshot.Reservations))
+						for _, reservation := range snapshot.Reservations {
+							if reservation.GroupID != "" {
+								groups = append(groups, reservation.GroupID)
+							}
+						}
+						_ = s.History.ReconcileOpenSessions(ctx, job.record.ID, groups, s.nowTime())
+					}
 					item.Online = true
 					item.Snapshot = &snapshot
 				}

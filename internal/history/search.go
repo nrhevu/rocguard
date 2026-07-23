@@ -227,6 +227,10 @@ func compileSearchExpression(expression SearchExpression) (string, []any, error)
 	}
 	var groups []string
 	var args []any
+	if serverID := strings.TrimSpace(expression.ServerID); serverID != "" {
+		groups = append(groups, "f.server_id=?")
+		args = append(args, serverID)
+	}
 	total := 0
 	for groupIndex, group := range expression.Groups {
 		if len(group.Rules) == 0 {

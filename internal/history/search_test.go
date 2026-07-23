@@ -45,6 +45,16 @@ func TestSearchExpressionFiltersSessionFactsAndJobs(t *testing.T) {
 		}
 	})
 
+	t.Run("server scope", func(t *testing.T) {
+		summary, sessions, _, err := store.Search(ctx, SearchExpression{ServerID: "server-b"}, SearchSort{}, 50, SearchCursor{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if summary.Sessions != 1 || len(sessions) != 1 || sessions[0].ID != "beta" {
+			t.Fatalf("unexpected server-scoped result: summary=%+v sessions=%+v", summary, sessions)
+		}
+	})
+
 	t.Run("metrics gpu and job details", func(t *testing.T) {
 		expression := SearchExpression{Groups: []SearchGroup{
 			{Rules: []SearchRule{searchRule("average_utilization_percent", "gt", 7)}},

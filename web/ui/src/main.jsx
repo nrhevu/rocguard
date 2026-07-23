@@ -183,7 +183,7 @@ function App() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [auth.authenticated, view, historyFilters, historySort]);
+  }, [auth.authenticated, view, historyFilters, historySort, selectedServerId]);
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -309,8 +309,17 @@ function App() {
     }
   }
 
-  async function loadHistory({ filters = historyFilters, sort = historySort, cursor = "", append = false, signal } = {}) {
+  async function loadHistory({ filters = historyFilters, sort = historySort, serverId = selectedServerId, cursor = "", append = false, signal } = {}) {
     if (historyFilterErrors(filters).length > 0) {
+      return;
+    }
+    if (!serverId) {
+      historyRequestRef.current += 1;
+      setHistorySummary(null);
+      setHistorySessions([]);
+      setHistoryNextCursor("");
+      setHistoryLoading(false);
+      setHistoryLoadingMore(false);
       return;
     }
     const requestID = ++historyRequestRef.current;
@@ -324,7 +333,7 @@ function App() {
         method: "POST",
         signal,
         body: JSON.stringify({
-          filter: historySearchExpression(filters),
+          filter: historySearchExpression(filters, serverId),
           sort,
           limit: historyPageSize,
           cursor,
@@ -436,6 +445,12 @@ function App() {
     setActiveGPU(null);
     setReservationSuccess(null);
     setSuccessKey("");
+    if (view === "history") {
+      historyRequestRef.current += 1;
+      setHistorySummary(null);
+      setHistorySessions([]);
+      setHistoryNextCursor("");
+    }
   }
 
   function toggleGPU(id) {
@@ -1413,8 +1428,9 @@ function historyFilterErrors(filters) {
   return errors;
 }
 
-function historySearchExpression(filters) {
+function historySearchExpression(filters, serverId = "") {
   return {
+    server_id: serverId,
     groups: (filters.groups || []).map((group) => ({
       rules: group.rules.map((rule) => {
         const field = historyFilterField(rule.field);

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"gpuardian/internal/config"
+	"gpuardian/internal/history"
 	"gpuardian/internal/model"
 	"gpuardian/internal/protocol"
 )
@@ -419,6 +420,44 @@ func TestFleetSnapshotUsesOneSecondCache(t *testing.T) {
 	}
 	if !third.Servers[0].Snapshot.Now.After(second.Servers[0].Snapshot.Now) {
 		t.Fatalf("third snapshot did not refresh after cache expiry")
+	}
+}
+
+func TestFleetSnapshotReconcilesMissingHistoryReservation(t *testing.T) {
+	dir := t.TempDir()
+	historyStore, err := history.Open(filepath.Join(dir, "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer historyStore.Close()
+	now := time.Now().UTC()
+	client := &cacheTestNodeClient{snapshot: func(int) model.NodeSnapshot {
+		return model.NodeSnapshot{Now: now}
+	}}
+	server := New(config.Config{WebRegistry: filepath.Join(dir, "servers.json")})
+	server.Client = client
+	server.History = historyStore
+	record, err := server.Registry.Upsert(ServerRecord{Name: "node-a", Endpoint: "https://node-a:8443", RootKey: "rk_test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := historyStore.PrepareSession(t.Context(), "sess_missing", "node-a", record.ID, record.Name, "alice", "training",
+		now.Add(-time.Minute), now.Add(time.Hour), []int{0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := historyStore.ConfirmSession(t.Context(), "sess_missing", "group-missing", []string{"reservation-missing"}, []int{0}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := server.fetchFleetSnapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := historyStore.ListSessions(t.Context(), history.SessionFilter{ServerID: record.ID, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].Status != "revoked" || sessions[0].HistoryQuality != "partial" {
+		t.Fatalf("reconciled sessions = %+v", sessions)
 	}
 }
 

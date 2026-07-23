@@ -146,6 +146,59 @@ func TestOneJobCanBelongToMultipleReservationSessionsWithoutInflatingSummary(t *
 	}
 }
 
+func TestReconcileOpenSessionsClosesReservationsMissingFromNodeSnapshot(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	start := time.Now().UTC().Truncate(time.Millisecond).Add(-5 * time.Minute)
+	page := telemetry.Page{NodeID: "node-a", StreamID: "stream-a", NextCursor: "cursor-2", Events: []telemetry.Event{
+		event(t, 1, telemetry.EventReservationUpsert, start, telemetry.ReservationUpsert{
+			GroupID: "group-live", Holder: "alice", CreatedAt: start, StartsAt: start, ExpiresAt: start.Add(time.Hour),
+			Members: []telemetry.ReservationMember{{ReservationID: "r0", GPU: 0}},
+		}),
+		event(t, 2, telemetry.EventReservationUpsert, start, telemetry.ReservationUpsert{
+			GroupID: "group-missing", Holder: "bob", CreatedAt: start, StartsAt: start, ExpiresAt: start.Add(time.Hour),
+			Members: []telemetry.ReservationMember{{ReservationID: "r1", GPU: 1}},
+		}),
+	}}
+	if err := store.ApplyPage(ctx, "server-a", "GPU node", page); err != nil {
+		t.Fatal(err)
+	}
+	observedAt := start.Add(10 * time.Minute)
+	if err := store.ReconcileOpenSessions(ctx, "server-a", []string{"group-live"}, observedAt); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := store.ListSessions(ctx, SessionFilter{ServerID: "server-a", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("sessions = %+v", sessions)
+	}
+	for _, session := range sessions {
+		switch session.Owner {
+		case "alice":
+			if session.Status != "active" || session.RevokedAt != nil {
+				t.Fatalf("live reservation was closed: %+v", session)
+			}
+		case "bob":
+			if session.Status != "revoked" || session.RevokedAt == nil || !session.RevokedAt.Equal(observedAt) ||
+				session.FinalizedAt == nil || !session.FinalizedAt.Equal(observedAt) || session.HistoryQuality != "partial" {
+				t.Fatalf("missing reservation was not reconciled: %+v", session)
+			}
+		default:
+			t.Fatalf("unexpected session: %+v", session)
+		}
+	}
+	active, err := store.ListSessions(ctx, SessionFilter{ServerID: "server-a", Status: "active", Limit: 10})
+	if err != nil || len(active) != 1 || active[0].Owner != "alice" {
+		t.Fatalf("active sessions = %+v, error = %v", active, err)
+	}
+}
+
 func TestResultOwnershipAndOptimisticVersion(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "history.db"))
 	if err != nil {
