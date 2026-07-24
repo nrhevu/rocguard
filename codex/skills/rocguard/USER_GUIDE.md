@@ -1,164 +1,180 @@
 # RocGuard Skill User Guide
 
-Use the `$rocguard` skill when you want Codex to protect, share, or reclaim a
-shared GPU session with as little manual work as possible.
+Use `$rocguard` when you want Codex to reserve/protect, authorize, yield, or
+inspect GPUardian GPU access with minimal typing.
 
-## What you provide
+The skill name stays **RocGuard**, but the backend is **GPUardian**.
 
-At minimum, provide:
+## Team Setup
+
+Each teammate only needs to tag the skill once. The gateway URL is fixed; they
+only paste their GPUardian username and password.
+
+Lazy prompt:
+
+```text
+$rocguard setup
+username: your_username
+password: your_password
+```
+
+Then restart Codex and use `$rocguard`.
+
+Codex will automatically:
+
+- clone/update `nrhevu/GPUardian`;
+- install the GPUardian MCP server in `~/.codex/mcp`;
+- write `~/.codex/config.toml` MCP config if missing;
+- save credentials to `~/.codex/secrets/gpuardian-mcp.env` with mode `600`;
+- avoid storing credentials in the skill folder.
+
+If `username` or `password` is missing, Codex asks only for the missing field.
+
+## Protect
+
+Protect means: ensure exact GPU IDs are reserved continuously for the requested
+duration, then authorize one scope.
+
+Required:
+
+- `GPU`: exact GPU IDs.
+- `duration`: number of hours.
+- `purpose`: why you need the reservation.
+
+Optional:
+
+- `authorize`: defaults to current Linux user.
+- `node`: defaults to current GPUardian node.
+
+Lean prompt:
 
 ```text
 $rocguard protect
-key: rg_xxx
+GPU: 0
+duration: 2
+purpose: dev session
 ```
 
-For handoff:
+Long reservation:
+
+```text
+$rocguard protect
+GPU: 0,1
+duration: 72
+purpose: train benchmark
+```
+
+Codex will split this into back-to-back chunks of at most 24 hours. If it cannot
+reserve the full 72 hours continuously, the protect request fails and Codex
+reports the maximum continuously reservable hours plus conflict details.
+
+Container authorization:
+
+```text
+$rocguard protect
+GPU: 2
+duration: 3
+purpose: docker training
+authorize: docker: trainer
+```
+
+Kubernetes namespace:
+
+```text
+$rocguard protect
+GPU: 0,1
+duration: 4
+purpose: k8s training
+authorize: k8s: training
+node: gpu-node-01
+```
+
+If `GPU` is missing, Codex stops and asks for exact GPU IDs. It will not
+auto-pick GPUs from `1 GPU`, `auto`, or `any`.
+
+If `duration` is missing, Codex stops and asks for duration in hours, for
+example `duration: 4`.
+
+If `purpose` is missing, Codex stops and asks for `purpose`.
+
+If you already have a reservation covering the requested GPUs and duration,
+Codex does not create another reservation. If your existing reservation is too
+short, Codex tries to reserve only the missing tail window. If the tail is more
+than 24 hours, Codex splits it into multiple 24h-or-smaller chunks. If it cannot
+cover the full requested duration continuously, it reports failure with:
+
+- requested node and GPUs;
+- requested duration;
+- existing coverage;
+- maximum continuously reservable hours;
+- first visible conflict/blocker.
+
+## Authorize Only
+
+Use this when a reservation already exists and you only want to add a rule.
+
+```text
+$rocguard authorize using KEY
+authorize: current user
+```
+
+```text
+$rocguard authorize using KEY
+authorize: docker: trainer
+```
+
+If no `authorize` is provided, Codex uses the current Linux user.
+
+## Yield
+
+Yield adds someone else's authorization. It does not revoke your reservation,
+rotate your key, stop your workload, or delete old rules.
 
 ```text
 $rocguard yield
-key: rg_xxx
-to user: alice
-```
-
-For reclaim:
-
-```text
-$rocguard protect lại
-key: rg_xxx
-```
-
-You can also target Docker or Kubernetes explicitly:
-
-```text
-$rocguard protect
-key: rg_xxx
-docker: trainer
+to: user: alice
 ```
 
 ```text
 $rocguard yield
-key: rg_xxx
-to k8s namespace: training
-```
-
-## What Codex does
-
-Codex will:
-
-1. Treat the key as a secret and avoid repeating it.
-2. Check key metadata with `rocguard token info`.
-3. Check current GPU ownership with `rocguard ps`.
-4. Default to the current Linux user unless you specify Docker/Kubernetes.
-5. Add the needed RocGuard rule.
-6. Verify and report non-secret metadata only.
-
-## Protect your own session
-
-Use this when you want your GPU process protected.
-
-```text
-$rocguard protect
-key: rg_xxx
-```
-
-If you know the scope, include it:
-
-```text
-$rocguard protect
-key: rg_xxx
-docker: <container-name-or-id>
-```
-
-```text
-$rocguard protect
-key: rg_xxx
-k8s namespace: <namespace>
-```
-
-```text
-$rocguard protect
-key: rg_xxx
-linux user: <username>
-```
-
-If you do not include a scope, Codex will use the current Linux user:
-
-```bash
-KEY=... rocguard allow user --name "$(id -un)"
-```
-
-Use Docker or Kubernetes only when you want a narrower rule and know the target.
-
-## Yield GPU to someone else
-
-Use this when you want someone else to use the GPU without revoking your
-scheduled reservation.
-
-```text
-$rocguard yield
-key: rg_xxx
-to user: alice
-```
-
-Other target forms:
-
-```text
-$rocguard yield
-key: rg_xxx
-to docker: trainer
+to: docker: trainer
 ```
 
 ```text
 $rocguard yield
-key: rg_xxx
-to k8s namespace: training
+to: k8s: training
 ```
 
-Codex will add an authorization rule for the recipient. It will not revoke the
-reservation or token. If an old authorization rule should be removed cleanly,
-that needs an admin/root key for `rocguard revoke <authorization-id>`.
+## Reclaim
 
-## Use GPU again after yielding
-
-Use the same protect prompt again:
+Use this after yielding when you want your current user/scope authorized again.
 
 ```text
-$rocguard protect lại
-key: rg_xxx
+$rocguard reclaim
+authorize: current user
 ```
 
-Codex will check whether your old rule still exists. If it does, it will avoid
-creating a duplicate rule. If not, it will add a new narrow rule for your current
-session.
+If you want a new reservation, use `$rocguard protect` with `GPU`, `duration`,
+and `purpose`.
 
-## Best low-friction pattern
-
-If you do not want to paste the key into chat, set it in your shell:
-
-```bash
-export ROCGUARD_KEY=rg_xxx
-```
-
-Then tell Codex:
+## Inspect
 
 ```text
-$rocguard protect
-use ROCGUARD_KEY
+$rocguard status
 ```
 
-The skill knows RocGuard itself expects `KEY`, so Codex will map it locally as:
-
-```bash
-KEY="$ROCGUARD_KEY" rocguard token info
+```text
+$rocguard xem ai đang dùng GPU
 ```
 
-## Safety notes
+## Notes
 
-- Do not paste the key into shared logs or public chat.
-- Docker workloads should use `rocguard allow docker`, not
-  `rocguard run -- docker run ...`.
-- Kubernetes authorization is namespace-level, not pod-level.
-- Linux user authorization is broad, but it is the default because it works
-  across dev sessions when container names are unknown.
-- Yielding means adding/changing authorization rules, not deleting the scheduler
-  reservation.
+- Protect/reserve requires GPUardian MCP connected to the web gateway.
+- First-time setup should be done with `$rocguard setup`; users normally do not
+  run the setup script by hand.
+- Node defaults to the current node only when Codex can resolve it uniquely.
+- Regular CLI operations use `KEY=gk_xxx`; do not paste secrets into public
+  logs or screenshots.
+- Docker workloads need `allow docker`, not `gpuardian run -- docker run ...`.
+- Kubernetes authorization is namespace-level.
+- Wildcards are admin-only by default.

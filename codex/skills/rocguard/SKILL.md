@@ -1,160 +1,314 @@
 ---
 name: rocguard
-description: Protect or yield a user's shared AMD GPU development session with RocGuard. Use when the user tags RocGuard or asks to protect, authorize, allow, claim, share, yield, release, or hand off GPU usage with a RocGuard key, especially for Docker containers, Kubernetes namespaces, Linux users, or bare shell commands.
+description: Set up GPUardian MCP, reserve/protect, extend, authorize, yield, reclaim, or inspect shared GPU access with RocGuard. Use when the user tags RocGuard/$rocguard or asks to setup, configure, protect, reserve, guard, authorize, allow, claim, share, release, yield, hand off, resume, or inspect GPU access. For protect/reserve, require exact GPU IDs, duration in hours, and a purpose; default authorization to the current Linux user; default node to the current GPUardian node; split reservations into 24h-or-smaller chunks while requiring continuous coverage.
 ---
 
 # RocGuard
 
-Use this skill to make RocGuard low-friction for the user. The ideal user flow is:
-they paste or provide a RocGuard key, tag this skill, and Codex chooses the
-safe default authorization needed to protect or yield the GPU session.
+Use this skill as a low-friction wrapper around GPUardian. Keep the user-facing
+name "RocGuard", but use the current GPUardian CLI, MCP, and fixed-key model.
+
+The main user flow is:
+
+```text
+$rocguard setup
+username: alice
+password: ...
+
+$rocguard protect
+GPU: 0,1
+duration: 4
+purpose: dev session
+authorize: current user
+node: current node
+```
+
+Setup is one-time per Codex user and configures GPUardian MCP automatically.
+`GPU`, `duration`, and `purpose` are required for protect/reserve. `duration`
+uses hours as the unit. `authorize` defaults to the current Linux user. `node`
+defaults to the current GPUardian node.
 
 ## Operating Rules
 
-- Treat the RocGuard key as a secret. Do not repeat it in responses, logs, or
-  summaries. Redact it as `rg_...`.
-- The RocGuard CLI reads the secret from `KEY`, not `ROCGUARD_KEY`.
-- Always run `KEY=... rocguard token info` before creating or changing rules.
-- If the user does not provide a scope, default to current Linux user
-  authorization with `rocguard allow user --name "$(id -un)"`.
-- Use Docker or Kubernetes scope only when the user provides it or asks for
-  narrower scope detection.
-- Do not create wildcard rules for regular users. Treat wildcard scopes as
-  admin-only and require explicit admin intent before using a user-supplied
-  wildcard pattern.
-- Do not revoke scheduler reservations or tokens during yield handoffs unless
-  the user explicitly asks for that destructive action.
-- Only revoke authorization IDs when the user explicitly provides/admin-authorizes
-  a root key. Never guess whether an ID is safe to revoke without checking
-  `token info`.
-- Do not stop or kill workloads just to yield GPU access unless the user
-  explicitly asks and the exact target process/container is identified.
+- Treat every `gk_...`, `rk_...`, password, cookie, token, or secret as
+  sensitive. Never repeat it in responses, logs, summaries, or examples beyond
+  redacted placeholders.
+- Never place a password in shell argv, environment examples, pipes, heredocs,
+  or final responses. Feed setup passwords through stdin/PTY only.
+- Use GPUardian MCP for reservation/protect flows. The MCP server authenticates
+  to the web gateway with GPUardian username/password and exposes
+  `list_servers`, `fleet_snapshot`, `create_reservation`, and `allow`.
+- Do not call `reveal_key`, `regenerate_key`, `revoke`, or admin/root actions
+  unless the user explicitly asks and is authorized.
+- GPUardian CLI node-side operations read a fixed key from `KEY`. Admin
+  operations read the node root key from `ROOT_KEY`.
+- Prefer using an existing shell `KEY` when a CLI allow/run flow is needed. If
+  the user supplied `GPUARDIAN_KEY` or legacy `ROCGUARD_KEY`, map it to `KEY`
+  locally without printing the value.
+- The node CLI talks to `GPUARDIAN_SOCKET`, defaulting to `/run/gpuardian.sock`;
+  it does not talk to the web gateway.
+- Use the narrowest exact authorization scope. Treat wildcard scopes as
+  admin-only.
+- Do not revoke reservations, rotate keys, kill workloads, or stop containers
+  during a yield handoff unless the user explicitly asks and the target is exact.
 
-## Default Flow
+## Intents
 
-1. Identify intent:
-   - **Protect**: "protect", "claim", "authorize", "allow", "guard", or a key
-     with no handoff wording.
-   - **Yield**: "yield", "release", "share", "handoff", "nhuong", "nhường",
-     "cho người khác dùng", or similar handoff wording.
-2. Get the key from the user message or the user's shell variable. If the user
-   provided `ROCGUARD_KEY`, map it as `KEY="$ROCGUARD_KEY"`.
-3. Inspect key metadata:
+- **Setup**: Configure the local Codex GPUardian MCP connection from
+  username/password so future `$rocguard protect` requests work without manual
+  setup.
+- **Protect/reserve**: Ensure exact GPU IDs are reserved continuously for the
+  requested duration and authorize a scope. This requires `GPU`, `duration`, and
+  `purpose`.
+- **Authorize-only**: Add an authorization rule for an existing reservation/key
+  without creating a new reservation.
+- **Yield/share**: Add a recipient authorization without revoking the user's
+  reservation or key.
+- **Reclaim**: Re-authorize the current user/scope after yielding; do not create
+  a new reservation unless the user uses the protect contract with `GPU`,
+  `duration`, and `purpose`.
+- **Inspect**: Show status, current processes, reservations, keys, or history
+  without changing state.
 
-```bash
-KEY=rg_xxx rocguard token info
-rocguard ps
+## Setup Workflow
+
+Use this for `$rocguard setup`.
+
+Inputs:
+
+- `username`: required unless the script will ask interactively.
+- `password`: required unless the script will ask interactively. Treat as a
+  secret and never echo it.
+
+If the user provides username/password in the prompt, run the bundled setup
+script with the username in argv and the password via stdin:
+
+```text
+scripts/setup-gpuardian-mcp --username "<username>" --password-stdin
 ```
 
-4. Read token mode, reservation window, GPUs, existing authorizations, and
-   whether active rules already cover the intended scope.
-5. If no scope is supplied, use current Linux user as the default scope.
-6. Choose the safe action and execute it.
-7. Verify with `KEY=... rocguard token info` and report only non-secret
-   metadata: mode, scope, authorization ID, GPUs/window, and any remaining
-   active rules.
+Start the command in a PTY/session, then send only the password line to stdin.
+Do not use shell pipes, heredocs, inline env vars, or command arguments that
+contain the password.
+
+The script uses the fixed gateway URL, clones/updates `nrhevu/GPUardian`,
+installs the MCP server under `~/.codex/mcp`, writes the MCP config to
+`~/.codex/config.toml` if missing, and stores credentials in
+`~/.codex/secrets/gpuardian-mcp.env` with mode `600`.
+
+After setup, say only that GPUardian MCP is configured for the username and that
+the user should restart Codex before the first protect request. Do not print the
+password or credential file contents.
+
+## Protect Contract
+
+For `$rocguard protect` or `$rocguard reserve`, require:
+
+- `GPU`: exact numeric GPU IDs, such as `0`, `0,1`, or `[0, 1]`.
+- `duration`: numeric duration in hours, such as `1`, `2`, or `4.5`.
+- `purpose`: non-empty reservation purpose.
+
+Optional fields:
+
+- `authorize`: defaults to the current Linux user.
+- `node`: defaults to the current GPUardian node.
+- `starts_at`: defaults to now. Compute `expires_at` from `starts_at` plus
+  `duration` hours.
+
+Reject missing or non-exact GPUs. Do not auto-pick GPUs. Treat `GPU: auto`,
+`GPU: any`, or `GPU: 1 GPU` as missing/invalid and ask for exact IDs.
+
+Reject missing, non-numeric, or non-hour duration. Accept `duration: 4` or
+`duration: 4h` as 4 hours; reject minute/day units and ask for hours.
+
+If `GPU`, `duration`, or `purpose` is missing, stop before any mutating tool
+call and report only the missing fields, for example:
+
+```text
+Thiếu GPU IDs. Dùng: GPU: 0 hoặc GPU: 0,1
+Thiếu duration. Dùng: duration: 4
+Thiếu purpose. Dùng: purpose: dev session
+```
+
+## Node Resolution
+
+Resolve `node` before reserving:
+
+1. If the user provides `node`, match it to a GPUardian `server_id`, node name,
+   or endpoint from `list_servers`.
+2. If `node` is omitted, default to the current node:
+   - read local `hostname`, `hostname -f`, and host IPs when available;
+   - call `list_servers`;
+   - match current hostname/IP against server ID, name, or endpoint host;
+   - if there is exactly one registered server, use it;
+   - otherwise stop and ask for `node`.
+3. Never guess between multiple plausible nodes.
+
+## Authorization Resolution
+
+Resolve `authorize` into one exact `allow` scope:
+
+- Omitted, `current user`, or `user: current` → current Linux user from `id -un`.
+- `user: <name>` or `linux user: <name>` → `allow` mode `user`.
+- `container: <name-or-id>` or `docker: <name-or-id>` → `allow` mode `docker`.
+- `k8s: <namespace>` or `namespace: <namespace>` → `allow` mode `k8s`.
+
+If `authorize` is provided but lacks a clear type, ask for one of:
+`user:<name>`, `docker:<container>`, or `k8s:<namespace>`.
+
+## Reservation Limits
+
+- A single `create_reservation` call must request at most 24 hours.
+- Requested coverage can exceed 24 hours only when it can be represented as
+  multiple back-to-back reservation chunks with no gap.
+- If the requested GPUs cannot be reserved continuously for the full requested
+  duration, treat protect as failed. Do not present partial coverage as success.
+- On failure, report the maximum continuously reservable hours from `starts_at`
+  across all requested GPUs on the selected node, plus conflict details visible
+  in `fleet_snapshot`.
 
 ## Protect Workflow
 
-Use this when the user wants their current development session protected.
+Use this sequence for `$rocguard protect`:
 
-1. If the user gives an explicit scope, use it:
+1. Validate required fields: exact `GPU` IDs, `duration` in hours, and
+   `purpose`.
+2. Resolve `node` to `server_id`.
+3. Resolve `authorize` to one exact scope.
+4. Inspect current state with `fleet_snapshot`.
+5. Compute the requested coverage window:
+   - `starts_at`: supplied value or now.
+   - `target_expires_at`: `starts_at + duration hours`.
+6. For every requested GPU, compute existing continuous coverage owned by the
+   current GPUardian user from `starts_at`.
+7. Compute the maximum continuously reservable hours:
+   - start at `starts_at`;
+   - include the user's already-owned continuous reservations;
+   - then extend through visible free time until the first conflicting
+     reservation, active lease, or blocking process on any requested GPU;
+   - take the minimum continuous end across all requested GPUs.
+8. If `max_contiguous_hours < duration`, stop before creating reservations and
+   report failure details: node, requested GPUs, requested duration, existing
+   coverage, max continuously reservable hours, and the first blocker per GPU
+   when visible.
+9. If existing reservations continuously cover every requested GPU through
+   `target_expires_at`, do not create a new reservation.
+10. Otherwise create only missing reservation windows. Split each missing window
+    into chunks of at most 24 hours. Group GPUs with the same missing chunk
+    window into one MCP reservation when possible:
 
-```bash
-KEY=rg_xxx rocguard allow docker --container <container-name-or-id>
-KEY=rg_xxx rocguard allow k8s --namespace <namespace>
-KEY=rg_xxx rocguard allow user --name <linux-user>
+```text
+create_reservation(server_id, gpus=[...], purpose, starts_at, expires_at, mode="reserved")
 ```
 
-2. If no scope is supplied, default to the current Linux user:
+For an immediate chunk of 24 hours or less, `ttl` may be used as `<hours>h`.
+For chained chunks, extensions, or future starts, use explicit `starts_at` and
+`expires_at`.
 
-```bash
-id -un
-KEY=rg_xxx rocguard allow user --name "$(id -un)"
+11. If a chunk creation fails despite preflight, stop and report failed protect:
+    created chunks if any, missing chunks, max continuously reservable hours
+    from the latest verified snapshot if available, and the tool error. Do not
+    revoke created chunks unless the user explicitly asks for cleanup.
+12. Ensure authorization through MCP. Avoid duplicates when an active rule
+    already covers the scope:
+
+```text
+allow(server_id, mode="user", user="<linux-user>")
+allow(server_id, mode="docker", container="<container>")
+allow(server_id, mode="k8s", namespace="<namespace>")
 ```
 
-3. If the user asks for narrower scope detection, use read-only probes:
+13. Verify with `fleet_snapshot` or `status` and report non-secret metadata:
+    node, GPUs, purpose, requested duration, reused coverage, chunks created,
+    authorization scope, and IDs returned by tools.
+
+If GPUardian MCP tools are not available, say that reservation/protect requires
+the GPUardian MCP connection. Do not fall back to raw web API calls or root-key
+CLI registration unless the user explicitly asks.
+
+## Authorize-Only and CLI Workflow
+
+Use this when the user asks only to authorize/allow an existing reservation or
+when MCP is unavailable but a fixed key is available.
+
+Inspect first:
 
 ```bash
-id -un
-hostname
-test -f /.dockerenv && echo docker
-cat /proc/self/cgroup
-test -f /var/run/secrets/kubernetes.io/serviceaccount/namespace && cat /var/run/secrets/kubernetes.io/serviceaccount/namespace
-docker ps --no-trunc --format '{{.ID}}\t{{.Names}}' 2>/dev/null
+KEY=gk_xxx gpuardian token info
+KEY=gk_xxx gpuardian ps
 ```
 
-4. Pick a narrower rule only when the user supplied or requested it:
-   - If a Docker container name or ID is supplied/resolvable, run
-     `rocguard allow docker --container ...`.
-   - Else if a Kubernetes namespace is supplied/detected, run
-     `rocguard allow k8s --namespace ...`.
-   - Else keep the default Linux user rule.
-5. For a bare command that Codex is actually launching, prefer:
+Then authorize exact scopes:
 
 ```bash
-KEY=rg_xxx rocguard run -- <command>
+KEY=gk_xxx gpuardian allow user --name "$(id -un)"
+KEY=gk_xxx gpuardian allow docker --container <container-name-or-id>
+KEY=gk_xxx gpuardian allow k8s --namespace <namespace>
 ```
 
-Do not use `rocguard run -- docker run ...` for Docker workloads. Docker places
-the real workload in a separate container cgroup; protect Docker with
-`rocguard allow docker`.
+For a bare command that Codex is actually launching, use:
+
+```bash
+KEY=gk_xxx gpuardian run -- <command>
+```
+
+Do not use `gpuardian run -- docker run ...`; Docker runs the real workload in
+a different cgroup. Protect Docker workloads with `gpuardian allow docker`.
 
 ## Yield Workflow
 
-Use this when the user wants to let someone else use the GPU without revoking
-the scheduled reservation.
+Use this when the user wants another person/session to use the GPU without
+revoking the scheduled reservation or rotating the fixed key.
 
-1. Inspect the key:
-
-```bash
-KEY=rg_xxx rocguard token info
-rocguard ps
-```
-
-2. Identify the recipient scope. If the user did not provide it, ask only for
-   the missing target: Linux username, Docker container name/ID, or Kubernetes
-   namespace.
-3. Add the recipient authorization with the same key:
+1. Inspect with `fleet_snapshot` when MCP is available, otherwise use:
 
 ```bash
-KEY=rg_xxx rocguard allow user --name <other-linux-user>
-KEY=rg_xxx rocguard allow docker --container <other-container>
-KEY=rg_xxx rocguard allow k8s --namespace <other-namespace>
+KEY=gk_xxx gpuardian token info
+KEY=gk_xxx gpuardian ps
 ```
 
-4. Do not revoke the reservation/token. If the current user's old allow rule
-   should be removed, revoke only that authorization ID and only with explicit
-   root-key/admin authorization:
+2. Identify the recipient exact scope. If missing or ambiguous, ask only for
+   `user:<name>`, `docker:<container>`, or `k8s:<namespace>`.
+3. Add the recipient authorization with MCP `allow` or CLI `gpuardian allow`.
+4. Do not revoke the reservation or key. Leave old authorizations alone unless
+   the user explicitly asks for admin cleanup.
 
-```bash
-ROOT_KEY=rk_xxx rocguard revoke <authorization-id>
-```
+## Account and Key Notes
 
-5. If no root key is available, tell the user the new recipient rule was added
-   but the old authorization still exists. Ask them to stop their workload or
-   ask an admin to revoke the specific authorization ID if they want a clean
-   handoff.
+- Users get GPUardian access through the web gateway: create/sign in, reserve
+  GPUs in Schedule or via MCP, then use the fixed key from the Key tab for
+  node-side CLI workflows.
+- Each account has one fixed `gk_...` key shared across synced nodes and
+  reservations. Reserving another window does not change the key.
+- Revoking a reservation does not rotate or invalidate the fixed key.
+- GPUardian supports AMD and NVIDIA nodes.
+- Kubernetes authorization is namespace-level, not pod-level.
+- Wildcards can authorize more than intended; treat them as admin-only.
 
-## Scope Detection Notes
+## Failure Handling
 
-- Docker rules may use exact container names or IDs. Treat wildcard container
-  patterns as admin-only.
-- Kubernetes rules authorize a namespace, not a single pod. Avoid using a shared
-  namespace unless the user explicitly wants that scope.
-- Linux user rules authorize all matching processes from that user. This is the
-  default for low-friction Codex dev sessions where container names are unknown.
-- Reserved keys work only inside the reservation window. Claimed keys claim a
-  GPU when an authorized process starts using GPU memory.
-- If a claimed GPU is already busy with another workload before the claim
-  starts, RocGuard rejects the new claimed process and leaves the existing
-  workload alone.
+- If required protect fields are missing, report `GPU`, `duration`, and/or
+  `purpose` as missing and stop.
+- If setup fields are missing, ask only for `username` and/or `password`.
+- If requested continuous coverage cannot be satisfied, report failed protect
+  with max continuously reservable hours and visible blockers.
+- If MCP is unavailable for protect/reserve, ask the user to connect/configure
+  GPUardian MCP with gateway URL and account credentials.
+- If current node cannot be resolved uniquely, ask for `node`.
+- If a recipient authorization is ambiguous, ask for the exact typed scope.
+- If a tool returns a secret, redact it before responding.
 
 ## Response Pattern
 
 Keep responses short:
 
-- Say whether the action was protect or yield.
-- Report `mode`, `scope`, `authorization_id`, and GPU/window metadata.
-- Mention any remaining active authorizations and whether they were left alone.
-- Never include the raw Rocguard key.
+- On setup success, report configured username and ask the user to restart Codex
+  before first use.
+- Say whether the action was protect/reserve, authorize-only, yield, reclaim, or
+  inspect.
+- On success, report node, GPUs, purpose/window, requested duration, reused
+  coverage, chunks created, authorization scope, and relevant IDs.
+- On failed protect, report node, GPUs, requested duration, max continuously
+  reservable hours, existing coverage, and first visible blocker details.
+- Mention if old rules were intentionally left alone.
+- Never include raw keys, passwords, tokens, cookies, or secrets.
