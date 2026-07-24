@@ -21,9 +21,13 @@ var ErrInvalidSearchFilter = errors.New("invalid history filter")
 
 const sessionFactsCTE = `WITH session_facts AS (
 	SELECT r.*,
-		MIN(r.expires_at_ms,COALESCE(r.revoked_at_ms,r.expires_at_ms)) AS effective_end_ms,
-		MAX(0,MIN(r.expires_at_ms,COALESCE(r.revoked_at_ms,r.expires_at_ms))-r.starts_at_ms) AS duration_ms,
-		CASE WHEN r.revoked_at_ms IS NOT NULL THEN 'revoked'
+		CASE WHEN r.kind='claimed_run' THEN COALESCE(r.finalized_at_ms,r.updated_at_ms)
+			ELSE MIN(r.expires_at_ms,COALESCE(r.revoked_at_ms,r.expires_at_ms)) END AS effective_end_ms,
+		MAX(0,CASE WHEN r.kind='claimed_run' THEN COALESCE(r.finalized_at_ms,r.updated_at_ms)
+			ELSE MIN(r.expires_at_ms,COALESCE(r.revoked_at_ms,r.expires_at_ms),?) END-r.starts_at_ms) AS duration_ms,
+		CASE WHEN r.kind='claimed_run' AND r.finalized_at_ms IS NULL THEN 'active'
+			WHEN r.kind='claimed_run' THEN 'completed'
+			WHEN r.revoked_at_ms IS NOT NULL THEN 'revoked'
 			WHEN r.starts_at_ms>? THEN 'scheduled'
 			WHEN r.expires_at_ms>? THEN 'active' ELSE 'completed' END AS derived_status,
 		(SELECT COUNT(*) FROM session_gpus g WHERE g.session_id=r.session_id) AS gpu_count,
@@ -60,7 +64,7 @@ func (s *Store) Search(ctx context.Context, expression SearchExpression, sort Se
 		limit = 100
 	}
 	now := time.Now().UTC().UnixMilli()
-	cteArgs := []any{now, now}
+	cteArgs := []any{now, now, now}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return DashboardSummary{}, nil, SearchCursor{}, err
@@ -71,10 +75,13 @@ func (s *Store) Search(ctx context.Context, expression SearchExpression, sort Se
 	var reserved, observed, busy int64
 	var integral sql.NullFloat64
 	summaryQuery := sessionFactsCTE + ` SELECT COUNT(*),
-		COALESCE(SUM(duration_ms*gpu_count),0),COALESCE(SUM(observed_ms),0),COALESCE(SUM(busy_ms),0),
-		SUM(utilization_integral) FROM session_facts f WHERE ` + predicate
+		COUNT(CASE WHEN kind='reservation' THEN 1 END),COUNT(CASE WHEN kind='claimed_run' THEN 1 END),
+		COALESCE(SUM(CASE WHEN kind='reservation' THEN duration_ms*gpu_count ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN kind='reservation' THEN observed_ms ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN kind='reservation' THEN busy_ms ELSE 0 END),0),
+		SUM(CASE WHEN kind='reservation' THEN utilization_integral ELSE 0 END) FROM session_facts f WHERE ` + predicate
 	summaryArgs := append(append([]any{}, cteArgs...), predicateArgs...)
-	if err := tx.QueryRowContext(ctx, summaryQuery, summaryArgs...).Scan(&summary.Sessions, &reserved, &observed, &busy, &integral); err != nil {
+	if err := tx.QueryRowContext(ctx, summaryQuery, summaryArgs...).Scan(&summary.Sessions, &summary.Reservations, &summary.ClaimedRuns, &reserved, &observed, &busy, &integral); err != nil {
 		return DashboardSummary{}, nil, SearchCursor{}, err
 	}
 	jobSummaryQuery := sessionFactsCTE + `, matched_sessions AS (SELECT f.session_id FROM session_facts f WHERE ` + predicate + `)
@@ -89,6 +96,13 @@ func (s *Store) Search(ctx context.Context, expression SearchExpression, sort Se
 	if reserved > 0 {
 		summary.ReservedGPUHours = float64(reserved) / float64(time.Hour/time.Millisecond)
 		summary.TelemetryCoverage = float64(observed) / float64(reserved)
+	}
+	globalObserved, globalBusy, globalIntegral, hasGlobalMetrics, err := nodeWideGPUMetrics(ctx, tx, expression.ServerID)
+	if err != nil {
+		return DashboardSummary{}, nil, SearchCursor{}, err
+	}
+	if hasGlobalMetrics {
+		observed, busy, integral = globalObserved, globalBusy, globalIntegral
 	}
 	summary.BusyGPUHours = float64(busy) / float64(time.Hour/time.Millisecond)
 	if observed > 0 {
@@ -114,7 +128,7 @@ func (s *Store) Search(ctx context.Context, expression SearchExpression, sort Se
 		pagePredicate += fmt.Sprintf(" AND (%s%s? OR (%s=? AND f.session_id%s?))", sortSpec.expression, comparison, sortSpec.expression, comparison)
 		pageArgs = append(pageArgs, value, value, cursor.ID)
 	}
-	listQuery := sessionFactsCTE + ` SELECT f.session_id,f.server_id,f.server_name,f.node_id,f.owner_username,f.owner_editable,f.purpose,f.source,
+	listQuery := sessionFactsCTE + ` SELECT f.session_id,f.kind,f.server_id,f.server_name,f.node_id,f.owner_username,f.owner_editable,f.purpose,f.source,
 		f.created_at_ms,f.starts_at_ms,f.expires_at_ms,f.revoked_at_ms,f.finalized_at_ms,f.history_quality,
 		f.job_count,f.first_job_at_ms,f.last_job_at_ms FROM session_facts f WHERE ` + pagePredicate +
 		" ORDER BY " + sortSpec.expression + " " + strings.ToUpper(sortSpec.direction) + ",f.session_id " + strings.ToUpper(sortSpec.direction) + " LIMIT ?"
@@ -296,11 +310,11 @@ func compileSearchRule(rule SearchRule) (string, []any, error) {
 
 var searchTextFields = map[string]string{
 	"purpose": "f.purpose", "owner": "f.owner_username", "node": "f.server_id", "source": "f.source",
-	"status": "f.derived_status", "history_quality": "f.history_quality", "result_outcome": "f.result_outcome",
+	"kind": "f.kind", "status": "f.derived_status", "history_quality": "f.history_quality", "result_outcome": "f.result_outcome",
 }
 
 var searchNumberFields = map[string]string{
-	"duration_ms": "f.duration_ms", "gpu_count": "f.gpu_count", "reserved_ms": "(f.duration_ms*f.gpu_count)",
+	"duration_ms": "f.duration_ms", "gpu_count": "f.gpu_count", "reserved_ms": "(CASE WHEN f.kind='reservation' THEN f.duration_ms*f.gpu_count ELSE 0 END)",
 	"busy_ms": "f.busy_ms", "average_utilization_percent": "(f.utilization_integral/NULLIF(f.observed_ms,0))",
 	"busy_ratio": "(1.0*f.busy_ms/NULLIF(f.observed_ms,0))", "coverage": "(1.0*f.observed_ms/NULLIF(f.duration_ms*f.gpu_count,0))",
 	"average_vram_bytes": "(f.memory_integral/NULLIF(f.memory_observed_ms,0))", "peak_vram_bytes": "f.peak_memory_bytes",

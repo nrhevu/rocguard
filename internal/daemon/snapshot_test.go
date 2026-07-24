@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"gpuardian/internal/model"
+	"gpuardian/internal/telemetry"
 )
 
 type countingSnapshotAMD struct {
@@ -54,4 +57,44 @@ func TestSnapshotSamplesProcessesOnce(t *testing.T) {
 		}
 	}
 	t.Fatalf("snapshot does not contain sampled process: %+v", snapshot.GPUs)
+}
+
+func TestTelemetrySamplesGPUWithoutReservation(t *testing.T) {
+	server := testServer(t)
+	usedBytes := uint64(1024)
+	utilization := 25.0
+	server.GPU = &countingSnapshotAMD{
+		metrics: []model.GPUMetric{{
+			GPU:              3,
+			UtilizationPct:   &utilization,
+			MemoryUsedBytes:  &usedBytes,
+			MemoryTotalBytes: &usedBytes,
+		}},
+	}
+	dir := t.TempDir()
+	box, err := telemetry.Open(filepath.Join(dir, "node.id"), filepath.Join(dir, "outbox"), "boot-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer box.Close()
+	server.Telemetry = box
+
+	start := time.Now().UTC().Add(-5 * time.Second)
+	server.sampleTelemetryMetrics(context.Background(), start, start.Add(5*time.Second))
+
+	page, err := box.Page("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 1 || page.Events[0].Type != telemetry.EventGPUSample {
+		t.Fatalf("events = %+v, want one GPU sample", page.Events)
+	}
+	var sample telemetry.GPUSample
+	if err := json.Unmarshal(page.Events[0].Payload, &sample); err != nil {
+		t.Fatal(err)
+	}
+	if len(sample.GPUs) != 1 || sample.GPUs[0].GPU != 3 || sample.GPUs[0].GroupID != "" ||
+		sample.GPUs[0].UtilizationPct == nil || *sample.GPUs[0].UtilizationPct != utilization {
+		t.Fatalf("unreserved GPU sample = %+v", sample.GPUs)
+	}
 }

@@ -743,7 +743,7 @@ function App() {
         <header className="topbar">
           <div>
             <p className="eyebrow">{view === "history" ? "History" : "Nodes"}</p>
-            <h1>{view === "history" ? "Reservation dashboard" : current?.server?.name || "No server selected"}</h1>
+            <h1>{view === "history" ? "GPU activity dashboard" : current?.server?.name || "No server selected"}</h1>
             {view !== "history" && !current?.server && <p className="muted">Add a GPUardian node to begin.</p>}
           </div>
           <div className="topbar-actions">
@@ -969,7 +969,7 @@ function HistoryDashboard({ summary, sessions, servers, filters, sort, loading, 
   const errorByRule = new Map(errors.map((item) => [item.id, item.message]));
   const ruleCount = historyRuleCount(filters);
   const cards = [
-    ["Reservations", summary?.sessions ?? 0],
+    ["Reservations", summary?.reservations ?? summary?.sessions ?? 0],
     ["Reserved GPU hours", fixedNumber(summary?.reserved_gpu_hours, 1)],
     ["Busy GPU hours", fixedNumber(summary?.busy_gpu_hours, 1)],
     ["Busy ratio", percentLabel(summary?.busy_ratio)],
@@ -1043,7 +1043,7 @@ function HistoryDashboard({ summary, sessions, servers, filters, sort, loading, 
         ))}
       </div>
       <div className="history-filter-controls">
-        <p className="muted history-metric-note">Utilization and VRAM describe the whole GPU during the reservation; bypass workloads may contribute to these values.</p>
+        <p className="muted history-metric-note">Reserved GPU hours = elapsed reserved time × GPU count; future time and time after revoke are excluded. Busy GPU hours, busy ratio, and average utilization cover all observed GPU activity on the selected node, including workloads outside reservations and claims. Telemetry coverage remains reservation telemetry coverage.</p>
         {loading && <span className="muted history-filter-refreshing">Refreshing…</span>}
         <div className="history-filter-menu" ref={filterRef}>
           <button
@@ -1080,7 +1080,7 @@ function HistoryDashboard({ summary, sessions, servers, filters, sort, loading, 
                     <button type="button" className="history-filter-add" disabled={group.rules.length >= 8 || ruleCount >= 32} onClick={() => addRule(group.id)}>+ Add OR rule</button>
                   </div>
                 ))}
-                {filters.groups.length === 0 && <div className="history-filter-empty">No filters. All reservation sessions are shown.</div>}
+                {filters.groups.length === 0 && <div className="history-filter-empty">No filters. All GPU activity is shown.</div>}
               </div>
               <button type="button" className="small-button" disabled={filters.groups.length >= 8 || ruleCount >= 32} onClick={addGroup}>+ Add AND group</button>
             </div>
@@ -1089,7 +1089,7 @@ function HistoryDashboard({ summary, sessions, servers, filters, sort, loading, 
       </div>
       <section className="history-list-panel">
         <div className="section-heading">
-          <div><h2>Reservation sessions</h2><p className="muted">GPU utilization, observed jobs and user results are retained after the reservation ends.</p></div>
+          <div><h2>GPU activity</h2><p className="muted">Reservation sessions and claimed runs are retained after they end.</p></div>
         </div>
         <div className="history-table-scroll">
           <div className="history-table">
@@ -1118,7 +1118,7 @@ function HistoryDashboard({ summary, sessions, servers, filters, sort, loading, 
                 </button>
               );
             })}
-            {!loading && sessions.length === 0 && <div className="empty">No reservation history matches these filters.</div>}
+            {!loading && sessions.length === 0 && <div className="empty">No GPU activity matches these filters.</div>}
             {nextCursor && <button type="button" className="history-load-more" disabled={loadingMore} onClick={onLoadMore}>{loadingMore ? "Loading…" : "Load more"}</button>}
           </div>
         </div>
@@ -1205,9 +1205,10 @@ function HistorySessionModal({ session, jobs, currentUser, onClose, onSave }) {
   const canEdit = session.result_editable && sameText(session.owner, currentUser);
   const timeline = (session.timeline || []).slice(-180);
   return (
-    <Modal title={session.purpose || "Reservation session"} onClose={onClose} className="history-modal">
+    <Modal title={session.purpose || (session.kind === "claimed_run" ? "Claimed run" : "Reservation session")} onClose={onClose} className="history-modal">
       <div className="history-detail">
         <div className="history-detail-meta">
+          <KeyDetail label="Type" value={session.kind === "claimed_run" ? "Claimed run" : "Reservation"} />
           <KeyDetail label="Owner" value={session.owner} />
           <KeyDetail label="Node" value={session.server_name} />
           <KeyDetail label="Window" value={`${dateTimeLabel(session.starts_at)} – ${dateTimeLabel(session.expires_at)}`} />
@@ -1239,7 +1240,7 @@ function HistorySessionModal({ session, jobs, currentUser, onClose, onSave }) {
         )}
         {(session.authorization_scopes || []).length > 0 && (
           <section className="history-jobs">
-            <div className="section-heading compact"><div><h3>Authorization scopes</h3><p className="muted">Permissions active during this reservation.</p></div></div>
+            <div className="section-heading compact"><div><h3>Authorization scopes</h3><p className="muted">Permissions active during this activity.</p></div></div>
             {session.authorization_scopes.map((scope, index) => (
               <article className="history-job" key={`${scope.created_at}-${index}`}>
                 <div><strong>{scope.mode}</strong><span>{scope.holder}</span></div>
@@ -1258,7 +1259,7 @@ function HistorySessionModal({ session, jobs, currentUser, onClose, onSave }) {
               <small>{job.started_at ? compactDateTime(job.started_at) : "unknown start"}{job.start_precision ? ` (${job.start_precision})` : ""} → {job.finished_at ? compactDateTime(job.finished_at) : "running"}{job.finish_precision ? ` (${job.finish_precision})` : ""}{job.exit_code != null ? ` · exit ${job.exit_code}` : ""}{job.reason ? ` · ${job.reason}` : ""}</small>
             </article>
           ))}
-          {jobs.length === 0 && <div className="empty">No authorized jobs were observed in this reservation.</div>}
+          {jobs.length === 0 && <div className="empty">No authorized jobs were observed in this activity.</div>}
         </section>
         <HistoryResultForm result={session.result || { version: 0 }} canEdit={canEdit} onSave={onSave} />
       </div>
@@ -1291,7 +1292,7 @@ function HistoryResultForm({ result, canEdit, onSave }) {
   }
   return (
     <form className="history-result" onSubmit={submit}>
-      <div><h3>Session result</h3><p className="muted">Visible to every signed-in user. Only the reservation owner can edit it.</p></div>
+      <div><h3>Session result</h3><p className="muted">Visible to every signed-in user. Only the activity owner can edit it.</p></div>
       {error && <div className="modal-error">{error}</div>}
       <label>Outcome<select disabled={!canEdit} value={outcome} onChange={(event) => setOutcome(event.target.value)}><option value="">Not set</option><option value="success">Success</option><option value="partial">Partial</option><option value="failed">Failed</option><option value="aborted">Aborted</option></select></label>
       <label>Note<textarea disabled={!canEdit} value={note} maxLength={16384} onChange={(event) => setNote(event.target.value)} placeholder="Summary, findings, or follow-up…" /></label>
@@ -1330,6 +1331,7 @@ function historyFilterFields(servers = []) {
     { value: "purpose", label: "Session name / purpose", type: "text", placeholder: "training" },
     { value: "owner", label: "Owner", type: "text", placeholder: "username" },
     { value: "node", label: "Node", type: "enum", options: servers.map((server) => ({ value: server.id, label: server.name })) },
+    { value: "kind", label: "Activity type", type: "enum", options: options([["reservation", "Reservation"], ["claimed_run", "Claimed run"]]) },
     { value: "source", label: "Session source", type: "enum", options: options([["web", "Web"], ["cli", "CLI"]]) },
     { value: "status", label: "Status", type: "enum", options: options([["scheduled", "Scheduled"], ["active", "Active"], ["completed", "Completed"], ["revoked", "Revoked"]]) },
     { value: "history_quality", label: "Telemetry quality", type: "enum", options: options([["complete", "Complete"], ["partial", "Partial"]]) },

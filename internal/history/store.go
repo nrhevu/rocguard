@@ -106,10 +106,13 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	for index, migration := range []string{migrationV1, migrationV2} {
+	migrations := []string{migrationV1, migrationV2, migrationV3, migrationV4}
+	for index, migration := range migrations {
 		version := index + 1
-		if _, err := tx.ExecContext(ctx, migration); err != nil {
-			return fmt.Errorf("apply history migration v%d: %w", version, err)
+		if version == 1 {
+			if _, err := tx.ExecContext(ctx, migration); err != nil {
+				return fmt.Errorf("apply history migration v%d: %w", version, err)
+			}
 		}
 		checksumBytes := sha256.Sum256([]byte(migration))
 		checksum := hex.EncodeToString(checksumBytes[:])
@@ -117,6 +120,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		err = tx.QueryRowContext(ctx, "SELECT checksum FROM schema_migrations WHERE version=?", version).Scan(&existing)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
+			if version != 1 {
+				if _, err := tx.ExecContext(ctx, migration); err != nil {
+					return fmt.Errorf("apply history migration v%d: %w", version, err)
+				}
+			}
 			if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version,checksum,applied_at_ms) VALUES(?,?,?)", version, checksum, time.Now().UTC().UnixMilli()); err != nil {
 				return err
 			}
@@ -130,7 +138,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM schema_migrations").Scan(&newest); err != nil {
 		return err
 	}
-	if newest > 2 {
+	if newest > len(migrations) {
 		return fmt.Errorf("history database schema %d is newer than this binary", newest)
 	}
 	return tx.Commit()

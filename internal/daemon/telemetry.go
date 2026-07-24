@@ -224,15 +224,20 @@ func (s *Server) sampleTelemetryMetrics(ctx context.Context, start, end time.Tim
 		}
 		groupByGPU[reservation.GPU] = reservationTelemetryGroup(reservation, "")
 	}
-	if len(groupByGPU) == 0 {
-		return
-	}
 	metricByGPU := make(map[int]model.GPUMetric, len(metrics))
+	gpuSet := make(map[int]bool, len(metrics)+len(groupByGPU))
 	for _, metric := range metrics {
 		metricByGPU[metric.GPU] = metric
+		gpuSet[metric.GPU] = true
 	}
-	gpus := make([]int, 0, len(groupByGPU))
 	for gpu := range groupByGPU {
+		gpuSet[gpu] = true
+	}
+	if len(gpuSet) == 0 {
+		return
+	}
+	gpus := make([]int, 0, len(gpuSet))
+	for gpu := range gpuSet {
 		gpus = append(gpus, gpu)
 	}
 	sort.Ints(gpus)
@@ -276,7 +281,10 @@ func (s *Server) trackObservedTelemetryJobs(state model.State, decisions []enfor
 			continue
 		}
 		authorization, ok := authorizations[decision.AuthID]
-		if !ok || authorization.Mode == model.ModeBare || (authorization.TokenMode != model.TokenModeReserved && authorization.TokenMode != model.TokenModeManaged) {
+		if !ok || authorization.Mode == model.ModeBare ||
+			(authorization.TokenMode != model.TokenModeReserved &&
+				authorization.TokenMode != model.TokenModeManaged &&
+				authorization.TokenMode != model.TokenModeClaimed) {
 			continue
 		}
 		token, ok := tokens[authorization.TokenHash]
@@ -287,7 +295,7 @@ func (s *Server) trackObservedTelemetryJobs(state model.State, decisions []enfor
 		if len(groupIDs) == 0 && authorization.TokenMode == model.TokenModeReserved {
 			groupIDs = []string{token.ID}
 		}
-		if len(groupIDs) == 0 {
+		if len(groupIDs) == 0 && authorization.TokenMode == model.TokenModeReserved {
 			continue
 		}
 		key := fmt.Sprintf("%s/%d/%d", authorization.ID, decision.Process.PID, decision.Info.StartTime)
@@ -298,8 +306,8 @@ func (s *Server) trackObservedTelemetryJobs(state model.State, decisions []enfor
 			event := telemetry.JobEvent{
 				ExecutionID:     observedExecutionID(s.bootID, authorization.ID, decision.Process.PID, decision.Info.StartTime),
 				AuthorizationID: authorization.ID,
-				GroupID:         groupIDs[0],
 				GroupIDs:        append([]string(nil), groupIDs...),
+				TokenMode:       authorization.TokenMode,
 				Source:          "authorized_process",
 				Mode:            authorization.Mode,
 				Holder:          authorization.Holder,
@@ -309,6 +317,9 @@ func (s *Server) trackObservedTelemetryJobs(state model.State, decisions []enfor
 				GPUs:            []int{decision.Process.GPU},
 				StartedAt:       &started,
 				StartPrecision:  "observed",
+			}
+			if len(groupIDs) > 0 {
+				event.GroupID = groupIDs[0]
 			}
 			job = &observedTelemetryJob{event: event, lastSeen: now}
 			s.observedJobs[key] = job
@@ -355,6 +366,7 @@ func (s *Server) rememberRunJob(token model.Token, authorization model.Authoriza
 		ExecutionID:     "exec_" + authorization.ID,
 		AuthorizationID: authorization.ID,
 		GroupIDs:        groupIDs,
+		TokenMode:       authorization.TokenMode,
 		Source:          "gpuardian_run",
 		Mode:            authorization.Mode,
 		Holder:          authorization.Holder,

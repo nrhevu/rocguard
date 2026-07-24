@@ -517,6 +517,48 @@ func TestObservedTelemetryJobGroupsGPUsAndDebouncesFinish(t *testing.T) {
 	if started.ExecutionID == "" || updated.ExecutionID != started.ExecutionID || finished.ExecutionID != started.ExecutionID || len(updated.GPUs) != 2 || finished.FinishedAt == nil {
 		t.Fatalf("unexpected observed lifecycle: started=%+v updated=%+v finished=%+v", started, updated, finished)
 	}
+	if started.TokenMode != model.TokenModeReserved {
+		t.Fatalf("token mode = %q, want reserved", started.TokenMode)
+	}
+}
+
+func TestObservedTelemetryRecordsClaimedJobWithoutReservation(t *testing.T) {
+	server := testServer(t)
+	dir := t.TempDir()
+	box, err := telemetry.Open(filepath.Join(dir, "node.id"), filepath.Join(dir, "outbox"), "boot-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer box.Close()
+	server.Telemetry = box
+	server.bootID = "boot-test"
+	state := model.State{
+		Tokens: []model.Token{{ID: "tok_claimed", Hash: "hash", Mode: model.TokenModeClaimed}},
+		Authorizations: []model.Authorization{{
+			ID: "auth_claimed", TokenHash: "hash", TokenMode: model.TokenModeClaimed, Mode: model.ModeUser, Holder: "alice",
+		}},
+	}
+	info := model.ProcInfo{PID: 42, StartTime: 99, Cmdline: []string{"python", "train.py"}}
+	now := time.Now().UTC()
+	server.trackObservedTelemetryJobs(state, []enforce.Decision{{
+		Action: "allow", AuthID: "auth_claimed", Process: model.GPUProcess{PID: 42, GPU: 3}, Info: info,
+	}}, now)
+	page, err := box.Page("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var started telemetry.JobEvent
+	for _, event := range page.Events {
+		if event.Type == telemetry.EventJobStarted {
+			if err := json.Unmarshal(event.Payload, &started); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if started.ExecutionID == "" || started.TokenMode != model.TokenModeClaimed || started.GroupID != "" ||
+		len(started.GroupIDs) != 0 || len(started.GPUs) != 1 || started.GPUs[0] != 3 {
+		t.Fatalf("unexpected claimed job: %+v", started)
+	}
 }
 
 func TestNodeHTTPReservationPreservesOwner(t *testing.T) {
@@ -847,6 +889,21 @@ func TestBypassAddSerializesWithEnforcement(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("bypass add remained blocked after enforcement completed")
+	}
+}
+
+func TestBypassTTLHasNoConfiguredMaximum(t *testing.T) {
+	server := testServer(t)
+	server.Proc = daemonFakeProc{infos: map[int]model.ProcInfo{123: {PID: 123, StartTime: 42}}}
+	now := time.Now().UTC()
+	rule, err := server.addBypass(protocol.BypassAddArgs{
+		Type: model.BypassPID, PID: 123, TTL: "8760h", Reason: "long maintenance",
+	}, now)
+	if err != nil {
+		t.Fatalf("one-year bypass should be accepted: %v", err)
+	}
+	if want := now.Add(8760 * time.Hour); !rule.ExpiresAt.Equal(want) {
+		t.Fatalf("bypass expires at %s, want %s", rule.ExpiresAt, want)
 	}
 }
 

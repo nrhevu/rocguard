@@ -228,13 +228,13 @@ func TestHardRegisterTTLMax(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)
-	if _, token, reservations, err := st.RegisterHardReservations(key, "alice", []int{0}, "24h", now); err != nil {
-		t.Fatalf("24h reserved reservation should be accepted: %v", err)
+	if _, token, reservations, err := st.RegisterHardReservations(key, "alice", []int{0}, "720h", now); err != nil {
+		t.Fatalf("30-day reserved reservation should be accepted: %v", err)
 	} else if token.Mode != model.TokenModeReserved || len(reservations) != 1 || reservations[0].GPU != 0 {
 		t.Fatalf("unexpected reserved token/reservations: token=%+v reservations=%+v", token, reservations)
 	}
-	if _, _, _, err := st.RegisterHardReservations(key, "bob", []int{1}, "24h1s", now); err == nil {
-		t.Fatal("expected reserved ttl above 24h to fail")
+	if _, _, _, err := st.RegisterHardReservations(key, "bob", []int{1}, "720h1s", now); err == nil {
+		t.Fatal("expected reserved ttl above 30 days to fail")
 	}
 }
 
@@ -652,9 +652,12 @@ func TestManagedKeyReservationsHaveIndependentGroupsAndRevokeKeepsKey(t *testing
 	if _, err := st.SyncManagedUserKeys(rootKey, snapshot, now); err != nil {
 		t.Fatal(err)
 	}
-	_, firstGroup, first, err := st.RegisterManagedReservations(rootKey, "uk_alice", "first", "sess_first", []int{0}, now, now.Add(time.Hour), now)
+	_, firstGroup, first, err := st.RegisterManagedReservations(rootKey, "uk_alice", "first", "sess_first", []int{0}, now, now.Add(30*24*time.Hour), now)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("30-day managed reservation should be accepted: %v", err)
+	}
+	if _, _, _, err := st.RegisterManagedReservations(rootKey, "uk_alice", "too long", "sess_too_long", []int{1}, now, now.Add(30*24*time.Hour+time.Second), now); err == nil {
+		t.Fatal("expected managed reservation above 30 days to fail")
 	}
 	_, secondGroup, _, err := st.RegisterManagedReservations(rootKey, "uk_alice", "second", "sess_second", []int{1}, now, now.Add(time.Hour), now)
 	if err != nil {

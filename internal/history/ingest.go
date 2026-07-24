@@ -63,6 +63,9 @@ func (s *Store) ApplyPageWithOwners(ctx context.Context, serverID, serverName st
 	if _, err := tx.ExecContext(ctx, "DELETE FROM gpu_minute_rollups WHERE minute_ms < ?", time.Now().Add(-90*24*time.Hour).UnixMilli()); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM node_gpu_minute_rollups WHERE minute_ms < ?", time.Now().Add(-90*24*time.Hour).UnixMilli()); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -146,7 +149,7 @@ func applyEvent(ctx context.Context, tx *sql.Tx, nodeID, serverID, serverName st
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {
 			return err
 		}
-		return applyJob(ctx, tx, nodeID, payload, event.OccurredAt)
+		return applyJob(ctx, tx, nodeID, serverID, serverName, payload, event.OccurredAt)
 	case telemetry.EventGPUSample:
 		var payload telemetry.GPUSample
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {
@@ -263,8 +266,9 @@ func applyAuthorization(ctx context.Context, tx *sql.Tx, nodeID string, payload 
 	return nil
 }
 
-func applyJob(ctx context.Context, tx *sql.Tx, nodeID string, payload telemetry.JobEvent, occurredAt time.Time) error {
+func applyJob(ctx context.Context, tx *sql.Tx, nodeID, serverID, serverName string, payload telemetry.JobEvent, occurredAt time.Time) error {
 	var session string
+	var kind string
 	var expiresMS int64
 	var revoked sql.NullInt64
 	groups := telemetryGroups(payload.GroupID, payload.GroupIDs)
@@ -273,7 +277,8 @@ func applyJob(ctx context.Context, tx *sql.Tx, nodeID string, payload telemetry.
 		var candidate string
 		var candidateExpires int64
 		var candidateRevoked sql.NullInt64
-		if err := tx.QueryRowContext(ctx, "SELECT session_id,expires_at_ms,revoked_at_ms FROM reservation_sessions WHERE node_id=? AND group_id=?", nodeID, groupID).Scan(&candidate, &candidateExpires, &candidateRevoked); err != nil {
+		var candidateKind string
+		if err := tx.QueryRowContext(ctx, "SELECT session_id,kind,expires_at_ms,revoked_at_ms FROM reservation_sessions WHERE node_id=? AND group_id=?", nodeID, groupID).Scan(&candidate, &candidateKind, &candidateExpires, &candidateRevoked); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				continue
 			}
@@ -281,18 +286,59 @@ func applyJob(ctx context.Context, tx *sql.Tx, nodeID string, payload telemetry.
 		}
 		sessions = append(sessions, candidate)
 		if session == "" {
-			session, expiresMS, revoked = candidate, candidateExpires, candidateRevoked
+			session, kind, expiresMS, revoked = candidate, candidateKind, candidateExpires, candidateRevoked
+		}
+	}
+	if session == "" && len(groups) == 0 && isClaimedRun(payload.TokenMode) {
+		if strings.TrimSpace(payload.ExecutionID) == "" {
+			return nil
+		}
+		startedAt := occurredAt.UTC()
+		if payload.StartedAt != nil {
+			startedAt = payload.StartedAt.UTC()
+		}
+		endAt := occurredAt.UTC()
+		if payload.RootExitedAt != nil && payload.RootExitedAt.After(endAt) {
+			endAt = payload.RootExitedAt.UTC()
+		}
+		if payload.FinishedAt != nil && payload.FinishedAt.After(endAt) {
+			endAt = payload.FinishedAt.UTC()
+		}
+		if !endAt.After(startedAt) {
+			endAt = startedAt.Add(time.Millisecond)
+		}
+		groupID := "claimed:" + payload.ExecutionID
+		session = sessionID(nodeID, groupID)
+		kind = "claimed_run"
+		expiresMS = millis(endAt)
+		_, err := tx.ExecContext(ctx, `INSERT INTO reservation_sessions(session_id,node_id,server_id,server_name,group_id,kind,owner_username,owner_editable,purpose,source,
+			created_at_ms,starts_at_ms,expires_at_ms,finalized_at_ms,history_quality,provisioning,updated_at_ms)
+			VALUES(?,?,?,?,?,'claimed_run',?,0,'Claimed run','cli',?,?,?,?, 'complete',0,?)
+			ON CONFLICT(node_id,group_id) DO UPDATE SET server_id=excluded.server_id,server_name=excluded.server_name,
+			owner_username=excluded.owner_username,starts_at_ms=MIN(reservation_sessions.starts_at_ms,excluded.starts_at_ms),
+			expires_at_ms=MAX(reservation_sessions.expires_at_ms,excluded.expires_at_ms),
+			finalized_at_ms=COALESCE(excluded.finalized_at_ms,reservation_sessions.finalized_at_ms),updated_at_ms=excluded.updated_at_ms`,
+			session, nodeID, serverID, serverName, groupID, payload.Holder, millis(startedAt), millis(startedAt), expiresMS,
+			nullableMillis(payload.FinishedAt), millis(occurredAt))
+		if err != nil {
+			return err
+		}
+		sessions = []string{session}
+		if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO session_results(session_id) VALUES(?)", session); err != nil {
+			return err
 		}
 	}
 	if session == "" {
 		return nil
 	}
-	effectiveEnd := timeFromMillis(expiresMS)
-	if revoked.Valid && timeFromMillis(revoked.Int64).Before(effectiveEnd) {
-		effectiveEnd = timeFromMillis(revoked.Int64)
+	if kind != "claimed_run" {
+		effectiveEnd := timeFromMillis(expiresMS)
+		if revoked.Valid && timeFromMillis(revoked.Int64).Before(effectiveEnd) {
+			effectiveEnd = timeFromMillis(revoked.Int64)
+		}
+		payload.RootExitedAt = clampTime(payload.RootExitedAt, effectiveEnd)
+		payload.FinishedAt = clampTime(payload.FinishedAt, effectiveEnd)
 	}
-	payload.RootExitedAt = clampTime(payload.RootExitedAt, effectiveEnd)
-	payload.FinishedAt = clampTime(payload.FinishedAt, effectiveEnd)
 	command, _ := json.Marshal(payload.Command)
 	_, err := tx.ExecContext(ctx, `INSERT INTO jobs(node_id,job_id,session_id,authorization_id,source,mode,holder,command_json,started_at_ms,
 		root_exited_at_ms,finished_at_ms,start_precision,finish_precision,exit_code,end_reason,updated_at_ms)
@@ -322,8 +368,24 @@ func applyJob(ctx context.Context, tx *sql.Tx, nodeID string, payload telemetry.
 		if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO job_gpus(node_id,job_id,gpu) VALUES(?,?,?)", nodeID, payload.ExecutionID, gpu); err != nil {
 			return err
 		}
+		if kind == "claimed_run" {
+			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO session_gpus(session_id,gpu,reservation_id) VALUES(?,?,?)`,
+				session, gpu, fmt.Sprintf("claimed:%s:%d", payload.ExecutionID, gpu)); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO session_gpu_summaries(session_id,gpu) VALUES(?,?)", session, gpu); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+func isClaimedRun(tokenMode string) bool {
+	// Older daemons did not include token_mode. An ungrouped job could only
+	// come from claimed or managed fixed-key execution because reserved
+	// jobs always carry their reservation group.
+	return tokenMode == "" || tokenMode == "claimed" || tokenMode == "managed"
 }
 
 func telemetryGroups(primary string, additional []string) []string {
@@ -351,6 +413,9 @@ func applyGPUSample(ctx context.Context, tx *sql.Tx, nodeID string, payload tele
 		return nil
 	}
 	for _, gpu := range payload.GPUs {
+		if err := applyNodeGPUIntervals(ctx, tx, nodeID, gpu, payload.WindowStart, payload.WindowEnd); err != nil {
+			return err
+		}
 		if gpu.GroupID == "" {
 			continue
 		}
@@ -387,6 +452,41 @@ func applyGPUSample(ctx context.Context, tx *sql.Tx, nodeID string, payload tele
 		if err := applyGPUIntervals(ctx, tx, session, gpu, start, end); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func applyNodeGPUIntervals(ctx context.Context, tx *sql.Tx, nodeID string, gpu telemetry.GPUSampleEntry, start, end time.Time) error {
+	valid := gpu.UtilizationPct != nil && !math.IsNaN(*gpu.UtilizationPct) && *gpu.UtilizationPct >= 0 && *gpu.UtilizationPct <= 100
+	for cursor := start; cursor.Before(end); {
+		minute := cursor.Truncate(time.Minute)
+		partEnd := minute.Add(time.Minute)
+		if partEnd.After(end) {
+			partEnd = end
+		}
+		duration := partEnd.Sub(cursor).Milliseconds()
+		if duration <= 0 {
+			break
+		}
+		if valid {
+			busy := int64(0)
+			if *gpu.UtilizationPct >= 5 {
+				busy = duration
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO node_gpu_minute_rollups(
+				node_id,gpu,minute_ms,observed_ms,busy_ms,utilization_integral,valid_samples)
+				VALUES(?,?,?,?,?,?,1) ON CONFLICT(node_id,gpu,minute_ms) DO UPDATE SET
+				observed_ms=observed_ms+excluded.observed_ms,busy_ms=busy_ms+excluded.busy_ms,
+				utilization_integral=utilization_integral+excluded.utilization_integral,valid_samples=valid_samples+1`,
+				nodeID, gpu.GPU, millis(minute), duration, busy, *gpu.UtilizationPct*float64(duration)); err != nil {
+				return err
+			}
+		} else if _, err := tx.ExecContext(ctx, `INSERT INTO node_gpu_minute_rollups(node_id,gpu,minute_ms,missing_samples)
+			VALUES(?,?,?,1) ON CONFLICT(node_id,gpu,minute_ms) DO UPDATE SET missing_samples=missing_samples+1`,
+			nodeID, gpu.GPU, millis(minute)); err != nil {
+			return err
+		}
+		cursor = partEnd
 	}
 	return nil
 }

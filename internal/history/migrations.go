@@ -174,3 +174,33 @@ CREATE TABLE IF NOT EXISTS managed_key_sync_state (
   sync_error TEXT NOT NULL DEFAULT ''
 );
 `
+
+const migrationV3 = `
+ALTER TABLE reservation_sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'reservation'
+  CHECK(kind IN ('reservation','claimed_run'));
+CREATE INDEX IF NOT EXISTS sessions_kind_idx ON reservation_sessions(kind, starts_at_ms DESC);
+`
+
+const migrationV4 = `
+CREATE TABLE IF NOT EXISTS node_gpu_minute_rollups (
+  node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+  gpu INTEGER NOT NULL,
+  minute_ms INTEGER NOT NULL,
+  observed_ms INTEGER NOT NULL DEFAULT 0,
+  busy_ms INTEGER NOT NULL DEFAULT 0,
+  utilization_integral REAL NOT NULL DEFAULT 0,
+  valid_samples INTEGER NOT NULL DEFAULT 0,
+  missing_samples INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(node_id, gpu, minute_ms)
+);
+INSERT OR IGNORE INTO node_gpu_minute_rollups(
+  node_id,gpu,minute_ms,observed_ms,busy_ms,utilization_integral,valid_samples,missing_samples
+)
+SELECT r.node_id,g.gpu,g.minute_ms,SUM(g.observed_ms),SUM(g.busy_ms),SUM(g.utilization_integral),
+  SUM(g.valid_samples),SUM(g.missing_samples)
+FROM gpu_minute_rollups g
+JOIN reservation_sessions r ON r.session_id=g.session_id
+WHERE r.kind='reservation'
+GROUP BY r.node_id,g.gpu,g.minute_ms;
+CREATE INDEX IF NOT EXISTS node_gpu_rollups_time_idx ON node_gpu_minute_rollups(minute_ms);
+`

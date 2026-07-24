@@ -58,6 +58,7 @@ type AuthorizationScope struct {
 
 type Session struct {
 	ID             string               `json:"id"`
+	Kind           string               `json:"kind"`
 	ServerID       string               `json:"server_id"`
 	ServerName     string               `json:"server_name"`
 	NodeID         string               `json:"-"`
@@ -101,6 +102,8 @@ type Job struct {
 
 type DashboardSummary struct {
 	Sessions           int64    `json:"sessions"`
+	Reservations       int64    `json:"reservations"`
+	ClaimedRuns        int64    `json:"claimed_runs"`
 	ReservedGPUHours   float64  `json:"reserved_gpu_hours"`
 	BusyGPUHours       float64  `json:"busy_gpu_hours"`
 	BusyRatio          float64  `json:"busy_ratio"`

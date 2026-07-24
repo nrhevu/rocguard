@@ -25,7 +25,7 @@ func (s *Store) ListSessions(ctx context.Context, filter SessionFilter) ([]Sessi
 		limit = 100
 	}
 	now := time.Now().UTC().UnixMilli()
-	query := `SELECT r.session_id,r.server_id,r.server_name,r.node_id,r.owner_username,r.owner_editable,r.purpose,r.source,r.created_at_ms,r.starts_at_ms,
+	query := `SELECT r.session_id,r.kind,r.server_id,r.server_name,r.node_id,r.owner_username,r.owner_editable,r.purpose,r.source,r.created_at_ms,r.starts_at_ms,
 		r.expires_at_ms,r.revoked_at_ms,r.finalized_at_ms,r.history_quality,
 		(SELECT COUNT(*) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)),
 		(SELECT MIN(j.started_at_ms) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)),
@@ -54,16 +54,16 @@ func (s *Store) ListSessions(ctx context.Context, filter SessionFilter) ([]Sessi
 	}
 	switch filter.Status {
 	case "scheduled":
-		query += " AND r.revoked_at_ms IS NULL AND r.starts_at_ms>?"
+		query += " AND r.kind='reservation' AND r.revoked_at_ms IS NULL AND r.starts_at_ms>?"
 		args = append(args, now)
 	case "active":
-		query += " AND r.revoked_at_ms IS NULL AND r.starts_at_ms<=? AND r.expires_at_ms>?"
+		query += " AND ((r.kind='claimed_run' AND r.finalized_at_ms IS NULL) OR (r.kind='reservation' AND r.revoked_at_ms IS NULL AND r.starts_at_ms<=? AND r.expires_at_ms>?))"
 		args = append(args, now, now)
 	case "completed":
-		query += " AND r.revoked_at_ms IS NULL AND r.expires_at_ms<=?"
+		query += " AND ((r.kind='claimed_run' AND r.finalized_at_ms IS NOT NULL) OR (r.kind='reservation' AND r.revoked_at_ms IS NULL AND r.expires_at_ms<=?))"
 		args = append(args, now)
 	case "revoked":
-		query += " AND r.revoked_at_ms IS NOT NULL"
+		query += " AND r.kind='reservation' AND r.revoked_at_ms IS NOT NULL"
 	}
 	query += ` GROUP BY r.session_id ORDER BY r.starts_at_ms DESC,r.session_id DESC LIMIT ?`
 	args = append(args, limit)
@@ -94,7 +94,7 @@ func (s *Store) ListSessions(ctx context.Context, filter SessionFilter) ([]Sessi
 }
 
 func (s *Store) GetSession(ctx context.Context, id string) (Session, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT r.session_id,r.server_id,r.server_name,r.node_id,r.owner_username,r.owner_editable,r.purpose,r.source,r.created_at_ms,r.starts_at_ms,
+	row := s.db.QueryRowContext(ctx, `SELECT r.session_id,r.kind,r.server_id,r.server_name,r.node_id,r.owner_username,r.owner_editable,r.purpose,r.source,r.created_at_ms,r.starts_at_ms,
 		r.expires_at_ms,r.revoked_at_ms,r.finalized_at_ms,r.history_quality,
 		(SELECT COUNT(*) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)),
 		(SELECT MIN(j.started_at_ms) FROM jobs j WHERE j.session_id=r.session_id OR EXISTS (SELECT 1 FROM job_sessions js WHERE js.node_id=j.node_id AND js.job_id=j.job_id AND js.session_id=r.session_id)),
@@ -233,27 +233,33 @@ func (s *Store) Summary(ctx context.Context, filter SessionFilter) (DashboardSum
 	now := time.Now().UTC().UnixMilli()
 	switch filter.Status {
 	case "scheduled":
-		where += " AND r.revoked_at_ms IS NULL AND r.starts_at_ms>?"
+		where += " AND r.kind='reservation' AND r.revoked_at_ms IS NULL AND r.starts_at_ms>?"
 		args = append(args, now)
 	case "active":
-		where += " AND r.revoked_at_ms IS NULL AND r.starts_at_ms<=? AND r.expires_at_ms>?"
+		where += " AND ((r.kind='claimed_run' AND r.finalized_at_ms IS NULL) OR (r.kind='reservation' AND r.revoked_at_ms IS NULL AND r.starts_at_ms<=? AND r.expires_at_ms>?))"
 		args = append(args, now, now)
 	case "completed":
-		where += " AND r.revoked_at_ms IS NULL AND r.expires_at_ms<=?"
+		where += " AND ((r.kind='claimed_run' AND r.finalized_at_ms IS NOT NULL) OR (r.kind='reservation' AND r.revoked_at_ms IS NULL AND r.expires_at_ms<=?))"
 		args = append(args, now)
 	case "revoked":
-		where += " AND r.revoked_at_ms IS NOT NULL"
+		where += " AND r.kind='reservation' AND r.revoked_at_ms IS NOT NULL"
 	}
 	var out DashboardSummary
 	var reservedMS sql.NullFloat64
-	query := `SELECT COUNT(DISTINCT r.session_id),SUM(MAX(0,MIN(r.expires_at_ms,COALESCE(r.revoked_at_ms,r.expires_at_ms))-r.starts_at_ms))
-		FROM reservation_sessions r JOIN session_gpus g ON g.session_id=r.session_id` + where
-	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&out.Sessions, &reservedMS); err != nil {
+	query := `SELECT COUNT(DISTINCT r.session_id),
+		COUNT(DISTINCT CASE WHEN r.kind='reservation' THEN r.session_id END),
+		COUNT(DISTINCT CASE WHEN r.kind='claimed_run' THEN r.session_id END),
+		SUM(CASE WHEN r.kind='reservation' THEN MAX(0,MIN(r.expires_at_ms,COALESCE(r.revoked_at_ms,r.expires_at_ms),?)-r.starts_at_ms) ELSE 0 END)
+		FROM reservation_sessions r LEFT JOIN session_gpus g ON g.session_id=r.session_id` + where
+	summaryArgs := append([]any{now}, args...)
+	if err := s.db.QueryRowContext(ctx, query, summaryArgs...).Scan(&out.Sessions, &out.Reservations, &out.ClaimedRuns, &reservedMS); err != nil {
 		return out, err
 	}
 	var observed, busy int64
 	var integral sql.NullFloat64
-	metricQuery := `SELECT COALESCE(SUM(s.observed_ms),0),COALESCE(SUM(s.busy_ms),0),SUM(s.utilization_integral)
+	metricQuery := `SELECT COALESCE(SUM(CASE WHEN r.kind='reservation' THEN s.observed_ms ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN r.kind='reservation' THEN s.busy_ms ELSE 0 END),0),
+		SUM(CASE WHEN r.kind='reservation' THEN s.utilization_integral ELSE 0 END)
 		FROM session_gpu_summaries s JOIN reservation_sessions r ON r.session_id=s.session_id` + where
 	if err := s.db.QueryRowContext(ctx, metricQuery, args...).Scan(&observed, &busy, &integral); err != nil {
 		return out, err
@@ -269,6 +275,13 @@ func (s *Store) Summary(ctx context.Context, filter SessionFilter) (DashboardSum
 		out.ReservedGPUHours = reservedMS.Float64 / float64(time.Hour/time.Millisecond)
 		out.TelemetryCoverage = float64(observed) / reservedMS.Float64
 	}
+	globalObserved, globalBusy, globalIntegral, hasGlobalMetrics, err := nodeWideGPUMetrics(ctx, s.db, filter.ServerID)
+	if err != nil {
+		return out, err
+	}
+	if hasGlobalMetrics {
+		observed, busy, integral = globalObserved, globalBusy, globalIntegral
+	}
 	out.BusyGPUHours = float64(busy) / float64(time.Hour/time.Millisecond)
 	if observed > 0 {
 		out.BusyRatio = float64(busy) / float64(observed)
@@ -276,6 +289,26 @@ func (s *Store) Summary(ctx context.Context, filter SessionFilter) (DashboardSum
 		out.AverageUtilization = &value
 	}
 	return out, nil
+}
+
+type queryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func nodeWideGPUMetrics(ctx context.Context, queryer queryRower, serverID string) (int64, int64, sql.NullFloat64, bool, error) {
+	query := `SELECT COALESCE(SUM(r.observed_ms),0),COALESCE(SUM(r.busy_ms),0),SUM(r.utilization_integral),COUNT(*)
+		FROM node_gpu_minute_rollups r JOIN nodes n ON n.node_id=r.node_id`
+	var args []any
+	if strings.TrimSpace(serverID) != "" {
+		query += " WHERE n.last_server_id=?"
+		args = append(args, serverID)
+	}
+	var observed, busy, rows int64
+	var integral sql.NullFloat64
+	if err := queryer.QueryRowContext(ctx, query, args...).Scan(&observed, &busy, &integral, &rows); err != nil {
+		return 0, 0, sql.NullFloat64{}, false, err
+	}
+	return observed, busy, integral, rows > 0, nil
 }
 
 func (s *Store) PutResult(ctx context.Context, sessionID, user, outcome, note string, artifacts []Artifact, expectedVersion int) (Result, error) {
@@ -412,7 +445,7 @@ func (s *Store) ReconcileOpenSessions(ctx context.Context, serverID string, live
 	defer tx.Rollback()
 	at := millis(observedAt.UTC())
 	rows, err := tx.QueryContext(ctx, `SELECT session_id,group_id FROM reservation_sessions
-		WHERE server_id=? AND provisioning=0 AND revoked_at_ms IS NULL AND finalized_at_ms IS NULL AND expires_at_ms>?`, serverID, at)
+		WHERE server_id=? AND kind='reservation' AND provisioning=0 AND revoked_at_ms IS NULL AND finalized_at_ms IS NULL AND expires_at_ms>?`, serverID, at)
 	if err != nil {
 		return err
 	}
@@ -449,7 +482,7 @@ func scanSession(scanner interface{ Scan(...any) error }) (Session, error) {
 	var ownerEditable bool
 	var created, starts, expires int64
 	var revoked, finalized, firstJob, lastJob sql.NullInt64
-	if err := scanner.Scan(&item.ID, &item.ServerID, &item.ServerName, &item.NodeID, &item.Owner, &ownerEditable, &item.Purpose, &item.Source,
+	if err := scanner.Scan(&item.ID, &item.Kind, &item.ServerID, &item.ServerName, &item.NodeID, &item.Owner, &ownerEditable, &item.Purpose, &item.Source,
 		&created, &starts, &expires, &revoked, &finalized, &item.HistoryQuality, &item.JobCount, &firstJob, &lastJob); err != nil {
 		return Session{}, err
 	}
@@ -486,6 +519,12 @@ func (s *Store) enrichSessions(ctx context.Context, sessions []Session) error {
 }
 
 func sessionStatus(item Session, now time.Time) string {
+	if item.Kind == "claimed_run" {
+		if item.FinalizedAt == nil {
+			return "active"
+		}
+		return "completed"
+	}
 	if item.RevokedAt != nil {
 		return "revoked"
 	}
@@ -523,8 +562,17 @@ func (s *Store) gpuSummaries(ctx context.Context, session Session) ([]GPUSummary
 	}
 	defer rows.Close()
 	effectiveEnd := session.ExpiresAt
+	if session.Kind == "claimed_run" && session.FinalizedAt != nil {
+		effectiveEnd = *session.FinalizedAt
+	}
 	if session.RevokedAt != nil && session.RevokedAt.Before(effectiveEnd) {
 		effectiveEnd = *session.RevokedAt
+	}
+	if session.Kind == "reservation" {
+		now := time.Now().UTC()
+		if now.Before(effectiveEnd) {
+			effectiveEnd = now
+		}
 	}
 	reserved := max(int64(0), effectiveEnd.Sub(session.StartsAt).Milliseconds())
 	var values []GPUSummary

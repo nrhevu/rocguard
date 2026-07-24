@@ -133,6 +133,7 @@ type JobEvent struct {
 	AuthorizationID string     `json:"authorization_id"`
 	GroupID         string     `json:"group_id"`
 	GroupIDs        []string   `json:"group_ids,omitempty"`
+	TokenMode       string     `json:"token_mode,omitempty"`
 	Source          string     `json:"source"`
 	Mode            string     `json:"mode"`
 	Holder          string     `json:"holder"`

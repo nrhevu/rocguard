@@ -25,7 +25,8 @@ const (
 	DefaultTokenTTL   = 2 * time.Hour
 	MaxTokenTTL       = 24 * time.Hour
 	DefaultHardTTL    = 2 * time.Hour
-	MaxHardTTL        = 24 * time.Hour
+	MaxHardTTL        = 30 * 24 * time.Hour
+	NoTTLMaximum      = time.Duration(0)
 	maxAuditEvents    = 1000
 	maxAuditLogBytes  = 10 << 20
 	maxStateFileBytes = 64 << 20
@@ -189,7 +190,7 @@ func ParseTTL(value string, def, max time.Duration) (time.Duration, error) {
 	if ttl <= 0 {
 		return 0, fmt.Errorf("ttl must be positive")
 	}
-	if ttl > max {
+	if max > NoTTLMaximum && ttl > max {
 		return 0, fmt.Errorf("ttl exceeds max %s", max)
 	}
 	return ttl, nil

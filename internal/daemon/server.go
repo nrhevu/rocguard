@@ -1437,7 +1437,7 @@ func (s *Server) addBypassLocked(args protocol.BypassAddArgs, now time.Time) (mo
 	if (args.PID > 0) == (strings.TrimSpace(args.Command) != "") {
 		return model.BypassRule{}, errors.New("exactly one pid or command bypass selector is required")
 	}
-	ttl, err := store.ParseTTL(args.TTL, store.DefaultTokenTTL, 30*24*time.Hour)
+	ttl, err := store.ParseTTL(args.TTL, store.DefaultTokenTTL, store.NoTTLMaximum)
 	if err != nil {
 		return model.BypassRule{}, err
 	}

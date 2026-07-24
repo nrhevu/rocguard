@@ -21,7 +21,7 @@ func TestApplyPageAggregatesAndDeduplicates(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	start := time.Now().UTC().Truncate(time.Minute).Add(-10 * time.Second)
+	start := time.Now().UTC().Truncate(time.Minute).Add(-2*time.Minute - 10*time.Second)
 	end := start.Add(time.Minute)
 	util := 5.0
 	memory := uint64(1024)
@@ -113,6 +113,196 @@ func TestApplyPageAggregatesAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestSummaryCountsOnlyElapsedReservedGPUTime(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	activeStart := now.Add(-time.Hour)
+	activeEnd := now.Add(9 * time.Hour)
+	revokedStart := now.Add(-3 * time.Hour)
+	revokedAt := revokedStart.Add(30 * time.Minute)
+	scheduledStart := now.Add(2 * time.Hour)
+	utilization := 10.0
+	page := telemetry.Page{NodeID: "node-a", StreamID: "stream-a", NextCursor: "cursor-5", Events: []telemetry.Event{
+		event(t, 1, telemetry.EventReservationUpsert, activeStart, telemetry.ReservationUpsert{
+			GroupID: "group-active", Holder: "alice", Purpose: "active", CreatedAt: activeStart, StartsAt: activeStart, ExpiresAt: activeEnd,
+			Members: []telemetry.ReservationMember{{ReservationID: "active-0", GPU: 0}, {ReservationID: "active-1", GPU: 1}},
+		}),
+		event(t, 2, telemetry.EventGPUSample, activeStart.Add(30*time.Minute), telemetry.GPUSample{
+			WindowStart: activeStart, WindowEnd: activeStart.Add(30 * time.Minute), Status: "ok",
+			GPUs: []telemetry.GPUSampleEntry{
+				{GPU: 0, GroupID: "group-active", UtilizationPct: &utilization},
+				{GPU: 1, GroupID: "group-active", UtilizationPct: &utilization},
+			},
+		}),
+		event(t, 3, telemetry.EventReservationUpsert, revokedStart, telemetry.ReservationUpsert{
+			GroupID: "group-revoked", Holder: "bob", Purpose: "revoked", CreatedAt: revokedStart, StartsAt: revokedStart, ExpiresAt: now.Add(7 * time.Hour),
+			Members: []telemetry.ReservationMember{{ReservationID: "revoked-0", GPU: 2}},
+		}),
+		event(t, 4, telemetry.EventReservationEnded, revokedAt, telemetry.ReservationEnded{
+			GroupID: "group-revoked", EndedAt: revokedAt, Reason: "revoked",
+		}),
+		event(t, 5, telemetry.EventReservationUpsert, now, telemetry.ReservationUpsert{
+			GroupID: "group-scheduled", Holder: "carol", Purpose: "scheduled", CreatedAt: now, StartsAt: scheduledStart, ExpiresAt: scheduledStart.Add(2 * time.Hour),
+			Members: []telemetry.ReservationMember{{ReservationID: "scheduled-0", GPU: 3}},
+		}),
+	}}
+	if err := store.ApplyPage(ctx, "server-a", "GPU node", page); err != nil {
+		t.Fatal(err)
+	}
+
+	searchSummary, sessions, _, err := store.Search(ctx, SearchExpression{}, SearchSort{}, 10, SearchCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySummary, err := store.Summary(ctx, SessionFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, summary := range map[string]DashboardSummary{"search": searchSummary, "legacy": legacySummary} {
+		if summary.Reservations != 3 || math.Abs(summary.ReservedGPUHours-2.5) > 0.01 {
+			t.Fatalf("%s summary counted scheduled or post-revoke time: %+v", name, summary)
+		}
+		if math.Abs(summary.TelemetryCoverage-0.4) > 0.01 {
+			t.Fatalf("%s telemetry coverage did not use elapsed reserved time: %+v", name, summary)
+		}
+	}
+	for _, session := range sessions {
+		if session.Purpose != "active" {
+			continue
+		}
+		if len(session.GPUSummaries) != 2 {
+			t.Fatalf("active GPU summaries = %+v", session.GPUSummaries)
+		}
+		for _, gpu := range session.GPUSummaries {
+			if math.Abs(gpu.Coverage-0.5) > 0.01 {
+				t.Fatalf("active GPU %d coverage = %v, want about 0.5", gpu.GPU, gpu.Coverage)
+			}
+		}
+		return
+	}
+	t.Fatal("active reservation was not returned")
+}
+
+func TestSummaryIncludesBusyGPUTimeOutsideReservations(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	start := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Minute)
+	reservationEnd := start.Add(time.Minute)
+	reservedUtilization := 10.0
+	unreservedUtilization := 20.0
+	idleUtilization := 0.0
+	page := telemetry.Page{NodeID: "node-a", StreamID: "stream-a", NextCursor: "cursor-4", Events: []telemetry.Event{
+		event(t, 1, telemetry.EventReservationUpsert, start, telemetry.ReservationUpsert{
+			GroupID: "group-a", Holder: "alice", Purpose: "training", CreatedAt: start, StartsAt: start, ExpiresAt: reservationEnd,
+			Members: []telemetry.ReservationMember{{ReservationID: "r0", GPU: 0}},
+		}),
+		event(t, 2, telemetry.EventGPUSample, start.Add(10*time.Second), telemetry.GPUSample{
+			WindowStart: start, WindowEnd: start.Add(10 * time.Second), Status: "ok",
+			GPUs: []telemetry.GPUSampleEntry{{GPU: 0, GroupID: "group-a", UtilizationPct: &reservedUtilization}},
+		}),
+		event(t, 3, telemetry.EventGPUSample, start.Add(30*time.Second), telemetry.GPUSample{
+			WindowStart: start.Add(10 * time.Second), WindowEnd: start.Add(30 * time.Second), Status: "ok",
+			GPUs: []telemetry.GPUSampleEntry{{GPU: 1, UtilizationPct: &unreservedUtilization}},
+		}),
+		event(t, 4, telemetry.EventGPUSample, start.Add(40*time.Second), telemetry.GPUSample{
+			WindowStart: start.Add(30 * time.Second), WindowEnd: start.Add(40 * time.Second), Status: "ok",
+			GPUs: []telemetry.GPUSampleEntry{{GPU: 1, UtilizationPct: &idleUtilization}},
+		}),
+	}}
+	if err := store.ApplyPage(ctx, "server-a", "GPU node", page); err != nil {
+		t.Fatal(err)
+	}
+	otherNodeUtilization := 100.0
+	otherPage := telemetry.Page{NodeID: "node-b", StreamID: "stream-b", NextCursor: "cursor-1", Events: []telemetry.Event{
+		event(t, 1, telemetry.EventGPUSample, start.Add(time.Minute), telemetry.GPUSample{
+			WindowStart: start, WindowEnd: start.Add(time.Minute), Status: "ok",
+			GPUs: []telemetry.GPUSampleEntry{{GPU: 0, UtilizationPct: &otherNodeUtilization}},
+		}),
+	}}
+	if err := store.ApplyPage(ctx, "server-b", "Other GPU node", otherPage); err != nil {
+		t.Fatal(err)
+	}
+
+	searchSummary, sessions, _, err := store.Search(ctx, SearchExpression{ServerID: "server-a"}, SearchSort{}, 10, SearchCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySummary, err := store.Summary(ctx, SessionFilter{ServerID: "server-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, summary := range map[string]DashboardSummary{"search": searchSummary, "legacy": legacySummary} {
+		if math.Abs(summary.ReservedGPUHours-1.0/60.0) > 0.0001 ||
+			math.Abs(summary.TelemetryCoverage-1.0/6.0) > 0.0001 {
+			t.Fatalf("%s reservation metrics changed: %+v", name, summary)
+		}
+		if math.Abs(summary.BusyGPUHours-30.0/3600.0) > 0.0001 ||
+			math.Abs(summary.BusyRatio-0.75) > 0.0001 ||
+			summary.AverageUtilization == nil || math.Abs(*summary.AverageUtilization-12.5) > 0.0001 {
+			t.Fatalf("%s node-wide busy metrics = %+v", name, summary)
+		}
+	}
+	if len(sessions) != 1 || sessions[0].Purpose != "training" {
+		t.Fatalf("unreserved samples created a session: %+v", sessions)
+	}
+}
+
+func TestNodeGPURollupMigrationPreservesReservationMetrics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	start := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+	utilization := 25.0
+	page := telemetry.Page{NodeID: "node-a", StreamID: "stream-a", NextCursor: "cursor-2", Events: []telemetry.Event{
+		event(t, 1, telemetry.EventReservationUpsert, start, telemetry.ReservationUpsert{
+			GroupID: "group-a", Holder: "alice", CreatedAt: start, StartsAt: start, ExpiresAt: start.Add(time.Minute),
+			Members: []telemetry.ReservationMember{{ReservationID: "r0", GPU: 0}},
+		}),
+		event(t, 2, telemetry.EventGPUSample, start.Add(10*time.Second), telemetry.GPUSample{
+			WindowStart: start, WindowEnd: start.Add(10 * time.Second), Status: "ok",
+			GPUs: []telemetry.GPUSampleEntry{{GPU: 0, GroupID: "group-a", UtilizationPct: &utilization}},
+		}),
+	}}
+	if err := store.ApplyPage(ctx, "server-a", "GPU node", page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec("DROP TABLE node_gpu_minute_rollups"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec("DELETE FROM schema_migrations WHERE version=4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	summary, _, _, err := store.Search(ctx, SearchExpression{ServerID: "server-a"}, SearchSort{}, 10, SearchCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(summary.BusyGPUHours-10.0/3600.0) > 0.0001 || summary.BusyRatio != 1 ||
+		summary.AverageUtilization == nil || *summary.AverageUtilization != utilization {
+		t.Fatalf("migrated node metrics = %+v", summary)
+	}
+}
+
 func TestOneJobCanBelongToMultipleReservationSessionsWithoutInflatingSummary(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "history.db"))
 	if err != nil {
@@ -143,6 +333,60 @@ func TestOneJobCanBelongToMultipleReservationSessionsWithoutInflatingSummary(t *
 	}
 	if summary.Sessions != 2 || summary.Jobs != 1 {
 		t.Fatalf("shared job inflated search summary: %+v", summary)
+	}
+}
+
+func TestClaimedJobCreatesDashboardActivityWithoutReservationHours(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	started := time.Now().UTC().Truncate(time.Millisecond).Add(-time.Minute)
+	finished := started.Add(10 * time.Second)
+	startPage := telemetry.Page{NodeID: "node-a", StreamID: "stream-a", NextCursor: "cursor-1", Events: []telemetry.Event{
+		event(t, 1, telemetry.EventJobStarted, started, telemetry.JobEvent{
+			ExecutionID: "job-claimed", AuthorizationID: "auth-claimed", Source: "authorized_process",
+			Mode: "user", Holder: "alice", Command: []string{"python", "train.py"}, GPUs: []int{3}, StartedAt: &started, StartPrecision: "observed",
+		}),
+	}}
+	if err := store.ApplyPage(ctx, "server-a", "GPU node", startPage); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileOpenSessions(ctx, "server-a", nil, started.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.ListSessions(ctx, SessionFilter{Status: "active", Limit: 10})
+	if err != nil || len(active) != 1 || active[0].Kind != "claimed_run" {
+		t.Fatalf("active claimed activity = %+v, error = %v", active, err)
+	}
+
+	finishPage := telemetry.Page{NodeID: "node-a", StreamID: "stream-a", NextCursor: "cursor-2", Events: []telemetry.Event{
+		event(t, 2, telemetry.EventJobFinished, finished, telemetry.JobEvent{
+			ExecutionID: "job-claimed", AuthorizationID: "auth-claimed", Source: "authorized_process",
+			Mode: "user", Holder: "alice", Command: []string{"python", "train.py"}, GPUs: []int{3}, StartedAt: &started,
+			FinishedAt: &finished, StartPrecision: "observed", FinishPrecision: "observed", Reason: "process_gone",
+		}),
+	}}
+	if err := store.ApplyPage(ctx, "server-a", "GPU node", finishPage); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := store.ListSessions(ctx, SessionFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].Kind != "claimed_run" || sessions[0].Status != "completed" ||
+		sessions[0].Purpose != "Claimed run" || sessions[0].JobCount != 1 || len(sessions[0].GPUs) != 1 || sessions[0].GPUs[0] != 3 {
+		t.Fatalf("claimed activity = %+v", sessions)
+	}
+	summary, _, _, err := store.Search(ctx, SearchExpression{}, SearchSort{}, 10, SearchCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Sessions != 1 || summary.Reservations != 0 || summary.ClaimedRuns != 1 ||
+		summary.ReservedGPUHours != 0 || summary.Jobs != 1 {
+		t.Fatalf("claimed summary = %+v", summary)
 	}
 }
 
@@ -322,7 +566,7 @@ func TestMigrationReopenWALAndRejectNewerSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
-	if _, err := store.DB().Exec("INSERT INTO schema_migrations(version,checksum,applied_at_ms) VALUES(3,'future',?)", time.Now().UnixMilli()); err != nil {
+	if _, err := store.DB().Exec("INSERT INTO schema_migrations(version,checksum,applied_at_ms) VALUES(5,'future',?)", time.Now().UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
